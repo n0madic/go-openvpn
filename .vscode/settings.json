@@ -1,0 +1,12 @@
+{
+  // The repo's integration tests are gated behind `//go:build integration`.
+  // Tell gopls (and the VS Code Go extension) to include them when indexing
+  // so they get full LSP support and don't show "No packages found".
+  //
+  // To run them, see test/integration/Makefile.
+  "gopls": {
+    "build.buildFlags": ["-tags=integration"]
+  },
+  "go.buildTags": "integration",
+  "go.testTags": "integration"
+}
