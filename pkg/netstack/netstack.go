@@ -376,19 +376,27 @@ func (n *Net) applyPushReply(pr openvpn.PushReply) error {
 		n.localV4 = pr.LocalIP
 		n.hasV4 = true
 	}
-	if pr.LocalIP.IsValid() && pr.LocalIP.Is6() && (!oldHasV6 || oldV6 != pr.LocalIP) {
-		ip := pr.LocalIP.As16()
+	// IPv6 NIC address comes from "ifconfig-ipv6 <local>/<plen> <peer>" and
+	// is parsed into pr.LocalIP6 (a Prefix). The peer address is RemoteIP6
+	// and serves as the default v6 gateway, mirroring how "route-gateway"
+	// supplies the IPv4 default.
+	if v6 := pr.LocalIP6; v6.IsValid() && v6.Addr().Is6() && (!oldHasV6 || oldV6 != v6.Addr()) {
+		ip := v6.Addr().As16()
+		prefixLen := v6.Bits()
+		if prefixLen < 0 || prefixLen > 128 {
+			prefixLen = 128
+		}
 		addrProto := tcpip.ProtocolAddress{
 			Protocol: ipv6.ProtocolNumber,
 			AddressWithPrefix: tcpip.AddressWithPrefix{
 				Address:   tcpip.AddrFrom16(ip),
-				PrefixLen: 128,
+				PrefixLen: prefixLen,
 			},
 		}
 		if err := n.stack.AddProtocolAddress(nicID, addrProto, stack.AddressProperties{}); err != nil {
 			return fmt.Errorf("AddProtocolAddress v6: %s", err)
 		}
-		n.localV6 = pr.LocalIP
+		n.localV6 = v6.Addr()
 		n.hasV6 = true
 	}
 
@@ -419,6 +427,19 @@ func buildRoutes(pr openvpn.PushReply) []tcpip.Route {
 		routes = append(routes, tcpip.Route{
 			Destination: header.IPv4EmptySubnet,
 			Gateway:     tcpip.AddrFrom4(gw),
+			NIC:         nicID,
+		})
+	}
+	// IPv6 has no dedicated "route-gateway" directive; the standard OpenVPN
+	// behaviour is to use the peer address from "ifconfig-ipv6" as the v6
+	// default next-hop unless the server pushes an explicit "route-ipv6 ::/0".
+	// gVisor's destination-match is first-hit, so synthesising the default
+	// here is safe even when Routes6 also contains ::/0.
+	if pr.RemoteIP6.IsValid() && pr.RemoteIP6.Is6() {
+		gw := pr.RemoteIP6.As16()
+		routes = append(routes, tcpip.Route{
+			Destination: header.IPv6EmptySubnet,
+			Gateway:     tcpip.AddrFrom16(gw),
 			NIC:         nicID,
 		})
 	}
@@ -462,6 +483,33 @@ func (n *Net) LocalIP() netip.Addr {
 	n.nicMu.Lock()
 	defer n.nicMu.Unlock()
 	return n.localV4
+}
+
+// LocalIP6 returns the IPv6 address assigned to the tunnel (from PUSH_REPLY's
+// "ifconfig-ipv6" directive). Returns a zero value when the server did not
+// push an IPv6 address.
+func (n *Net) LocalIP6() netip.Addr {
+	n.nicMu.Lock()
+	defer n.nicMu.Unlock()
+	return n.localV6
+}
+
+// HasIPv4 reports whether the NIC has an IPv4 address from the latest
+// PUSH_REPLY. Callers use this to skip v4 dials when no v4 is configured.
+func (n *Net) HasIPv4() bool {
+	n.nicMu.Lock()
+	defer n.nicMu.Unlock()
+	return n.hasV4
+}
+
+// HasIPv6 reports whether the NIC has an IPv6 address from the latest
+// PUSH_REPLY. Callers use this to fail fast on v6 dials when the server
+// did not push an IPv6 address — gVisor would otherwise spend a route
+// lookup and return ErrHostUnreachable, which is slower and noisier.
+func (n *Net) HasIPv6() bool {
+	n.nicMu.Lock()
+	defer n.nicMu.Unlock()
+	return n.hasV6
 }
 
 // Close tears down the netstack but leaves the underlying openvpn.Client

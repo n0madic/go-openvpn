@@ -12,6 +12,7 @@ import (
 
 	"github.com/n0madic/go-openvpn"
 
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -155,6 +156,96 @@ func TestPostReconnectDialUsesNewIP(t *testing.T) {
 	_ = c2.Close()
 	if !strings.HasPrefix(addr2, "10.0.0.99:") {
 		t.Fatalf("addr2 = %q, want 10.0.0.99:... — NIC IP was not refreshed on reconnect", addr2)
+	}
+}
+
+// TestApplyPushReplyInstallsIPv6Address verifies that when the server pushes
+// "ifconfig-ipv6 <addr>/<plen> <peer>" we (a) install the v6 address with the
+// pushed prefix length, (b) record it for currentLocalFullAddress(v6=false),
+// and (c) synthesise a ::/0 → RemoteIP6 default route. Regression for the
+// "no route to host" failure on IPv6 destinations.
+func TestApplyPushReplyInstallsIPv6Address(t *testing.T) {
+	t.Parallel()
+	n, cleanup := newTestNet(t)
+	defer cleanup()
+
+	pr := openvpn.PushReply{
+		LocalIP:   netip.MustParseAddr("10.0.0.5"),
+		Netmask:   netip.MustParseAddr("255.255.255.0"),
+		Gateway:   netip.MustParseAddr("10.0.0.1"),
+		LocalIP6:  netip.MustParsePrefix("2001:db8:abcd::7/64"),
+		RemoteIP6: netip.MustParseAddr("fe80::1"),
+	}
+	if err := n.applyPushReply(pr); err != nil {
+		t.Fatalf("applyPushReply: %v", err)
+	}
+	if got := n.LocalIP6().String(); got != "2001:db8:abcd::7" {
+		t.Errorf("LocalIP6 = %q, want 2001:db8:abcd::7", got)
+	}
+
+	addrs := n.stack.NICInfo()[nicID].ProtocolAddresses
+	var v6 *tcpip.AddressWithPrefix
+	for i, a := range addrs {
+		if a.Protocol == ipv6.ProtocolNumber && a.AddressWithPrefix.Address.String() == "2001:db8:abcd::7" {
+			v6 = &addrs[i].AddressWithPrefix
+			break
+		}
+	}
+	if v6 == nil {
+		t.Fatalf("v6 address not installed; got addrs=%v", addrs)
+	}
+	if v6.PrefixLen != 64 {
+		t.Errorf("v6 PrefixLen = %d, want 64", v6.PrefixLen)
+	}
+
+	// Default v6 route must exist with gateway = RemoteIP6.
+	var sawDefault6 bool
+	for _, r := range n.stack.GetRouteTable() {
+		if r.Destination.Prefix() == 0 && r.Destination.ID().Len() == 16 {
+			if r.Gateway.String() == "fe80::1" {
+				sawDefault6 = true
+			}
+		}
+	}
+	if !sawDefault6 {
+		t.Errorf("default v6 route via fe80::1 missing; got routes=%v", n.stack.GetRouteTable())
+	}
+}
+
+// TestDialContextIPv6UsesNICAddress confirms that an outgoing v6 dial after
+// applyPushReply binds to the NIC's v6 source address (not "auto-pick" /
+// "nil laddr"). If the NIC v6 path is broken the dial fails with
+// ErrHostUnreachable, mirroring the production "no route to host" symptom.
+func TestDialContextIPv6UsesNICAddress(t *testing.T) {
+	t.Parallel()
+	n, cleanup := newTestNet(t)
+	defer cleanup()
+
+	pr := openvpn.PushReply{
+		LocalIP:   netip.MustParseAddr("10.0.0.5"),
+		Netmask:   netip.MustParseAddr("255.255.255.0"),
+		Gateway:   netip.MustParseAddr("10.0.0.1"),
+		LocalIP6:  netip.MustParsePrefix("2001:db8:abcd::7/64"),
+		RemoteIP6: netip.MustParseAddr("fe80::1"),
+	}
+	if err := n.applyPushReply(pr); err != nil {
+		t.Fatalf("applyPushReply: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	// UDP because gonet.DialUDP is non-blocking — we don't need a server to
+	// observe a successful bind. TCP would attempt SYN which the test
+	// endpoint can't ACK.
+	c, err := n.DialContext(ctx, "udp", "[2001:db8:abcd::1]:53")
+	if err != nil {
+		t.Fatalf("DialContext v6: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	addr := c.LocalAddr().String()
+	if !strings.HasPrefix(addr, "[2001:db8:abcd::7]:") {
+		t.Fatalf("LocalAddr = %q, want [2001:db8:abcd::7]:... — NIC v6 source not bound", addr)
 	}
 }
 

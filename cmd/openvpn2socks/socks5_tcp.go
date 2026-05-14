@@ -30,7 +30,21 @@ func (s *socks5Server) handleConnect(ctx context.Context, client net.Conn, br *b
 		return
 	}
 
-	addr := net.JoinHostPort(ips[0].String(), strconv.Itoa(int(req.port)))
+	// Filter candidates to address families the tunnel actually supports.
+	// Many providers push only IPv4 (no `ifconfig-ipv6`), so a v6 address in
+	// the resolver output would invariably fail with "no route to host"
+	// after a wasted gVisor round trip. For hostnames this transparently
+	// prefers v4; for direct v6 literals it short-circuits to host-unreach.
+	usable := filterUsableIPs(ips, s.ns.HasIPv4(), s.ns.HasIPv6())
+	if len(usable) == 0 {
+		s.log.Debug("CONNECT: no usable address family",
+			"host", req.host, "ips", ips,
+			"have_v4", s.ns.HasIPv4(), "have_v6", s.ns.HasIPv6())
+		_ = writeReply(client, repHostUnreach, netip.AddrPortFrom(netip.IPv4Unspecified(), 0))
+		return
+	}
+
+	addr := net.JoinHostPort(usable[0].String(), strconv.Itoa(int(req.port)))
 	remote, err := s.ns.DialContext(dialCtx, "tcp", addr)
 	if err != nil {
 		s.log.Debug("CONNECT: dial failed", "addr", addr, "err", err)
@@ -161,6 +175,24 @@ func mapDialError(err error) byte {
 	default:
 		return repGeneralFailure
 	}
+}
+
+// filterUsableIPs returns the entries of ips whose address family the tunnel
+// can actually carry. Preserves input order, so a resolver result like
+// [v4, v6, v4] with v6-only support yields [v6]; with v4-only support yields
+// [v4, v4]. Pure function — easier to unit-test than inlining the predicate.
+func filterUsableIPs(ips []netip.Addr, haveV4, haveV6 bool) []netip.Addr {
+	out := ips[:0:0] // fresh backing array; never alias caller's slice
+	for _, ip := range ips {
+		if ip.Is4() && haveV4 {
+			out = append(out, ip)
+			continue
+		}
+		if ip.Is6() && haveV6 {
+			out = append(out, ip)
+		}
+	}
+	return out
 }
 
 // localAddrPort returns the conn's LocalAddr as a netip.AddrPort. Used for the

@@ -383,6 +383,8 @@ func (c *Client) PushedOptions() PushReply {
 		LocalIP:      pr.LocalIP,
 		Netmask:      pr.Netmask,
 		Gateway:      pr.Gateway,
+		LocalIP6:     pr.LocalIP6,
+		RemoteIP6:    pr.RemoteIP6,
 		Routes:       pr.Routes,
 		Routes6:      pr.Routes6,
 		DNS:          pr.DNS,

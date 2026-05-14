@@ -20,6 +20,8 @@ type PushReply struct {
 	LocalIP      netip.Addr
 	Netmask      netip.Addr
 	Gateway      netip.Addr
+	LocalIP6     netip.Prefix // from "ifconfig-ipv6": local address + prefix length
+	RemoteIP6    netip.Addr   // from "ifconfig-ipv6": peer address, used as v6 default gateway
 	Routes       []netip.Prefix
 	Routes6      []netip.Prefix
 	DNS          []netip.Addr

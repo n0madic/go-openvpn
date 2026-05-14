@@ -311,6 +311,35 @@ func TestParsePushReply(t *testing.T) {
 	}
 }
 
+func TestParsePushReplyIPv6(t *testing.T) {
+	t.Parallel()
+	// Real-world dual-stack PUSH_REPLY shape: ifconfig + ifconfig-ipv6 +
+	// per-family default routes (or route-ipv6 ::/0 alternatives).
+	s := "PUSH_REPLY,ifconfig 10.8.0.6 255.255.255.0,ifconfig-ipv6 2001:db8:abcd::7/64 fe80::1,topology subnet,peer-id 0,cipher AES-256-GCM,tun-mtu 1500,route-gateway 10.8.0.1,route-ipv6 ::/0,route-ipv6 2000::/3,dhcp-option DNS 2001:db8::53"
+	pr, err := ParsePushReply(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := pr.LocalIP6.String(), "2001:db8:abcd::7/64"; got != want {
+		t.Errorf("LocalIP6 = %q, want %q", got, want)
+	}
+	if got, want := pr.RemoteIP6.String(), "fe80::1"; got != want {
+		t.Errorf("RemoteIP6 = %q, want %q", got, want)
+	}
+	if len(pr.Routes6) != 2 {
+		t.Fatalf("Routes6 len %d, want 2", len(pr.Routes6))
+	}
+	if got, want := pr.Routes6[0].String(), "::/0"; got != want {
+		t.Errorf("Routes6[0] = %q, want %q", got, want)
+	}
+	if got, want := pr.Routes6[1].String(), "2000::/3"; got != want {
+		t.Errorf("Routes6[1] = %q, want %q", got, want)
+	}
+	if len(pr.DNS) != 1 || !pr.DNS[0].Is6() {
+		t.Errorf("DNS = %v, want one IPv6 entry", pr.DNS)
+	}
+}
+
 func TestParsePushReplyWithRouteMask(t *testing.T) {
 	t.Parallel()
 	pr, err := ParsePushReply("PUSH_REPLY,route 10.0.0.0 255.255.0.0")

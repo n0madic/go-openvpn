@@ -230,10 +230,21 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 		s.wg.Go(func() { s.pingRestartWatch(s.ctx) })
 	}
 
+	// Surface the full server-pushed option set for diagnostics. PUSH_REPLY
+	// carries no credentials (auth precedes it on the control channel), so
+	// logging the raw body is safe.
+	log.Debug("openvpn pushed options", "raw", result.PushReply.Raw)
+
 	log.Info("openvpn session up",
 		"cipher", result.Cipher,
 		"peer_id", result.PeerID,
 		"local_ip", result.PushReply.LocalIP.String(),
+		"local_ip6", result.PushReply.LocalIP6.String(),
+		"gateway", result.PushReply.Gateway.String(),
+		"remote_ip6", result.PushReply.RemoteIP6.String(),
+		"routes", result.PushReply.Routes,
+		"routes6", result.PushReply.Routes6,
+		"dns", result.PushReply.DNS,
 		"mtu", result.PushReply.MTU,
 		"ping", s.pushReply.PingInterval,
 		"ping_restart", s.pushReply.PingRestart,

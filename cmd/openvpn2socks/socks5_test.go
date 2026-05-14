@@ -282,6 +282,61 @@ type errString string
 
 func (e errString) Error() string { return string(e) }
 
+// TestFilterUsableIPs covers the family-filtering helper used to skip
+// resolver candidates the tunnel can't actually dial.
+func TestFilterUsableIPs(t *testing.T) {
+	t.Parallel()
+	v4a := netip.MustParseAddr("1.2.3.4")
+	v4b := netip.MustParseAddr("5.6.7.8")
+	v6a := netip.MustParseAddr("2001:db8::1")
+	v6b := netip.MustParseAddr("2001:db8::2")
+
+	for _, tc := range []struct {
+		name              string
+		ips               []netip.Addr
+		haveV4, haveV6    bool
+		want              []netip.Addr
+	}{
+		{
+			name: "v4-only tunnel drops v6 candidates",
+			ips:  []netip.Addr{v6a, v4a, v6b, v4b}, haveV4: true, haveV6: false,
+			want: []netip.Addr{v4a, v4b},
+		},
+		{
+			name: "v6-only tunnel drops v4 candidates",
+			ips:  []netip.Addr{v6a, v4a, v6b, v4b}, haveV4: false, haveV6: true,
+			want: []netip.Addr{v6a, v6b},
+		},
+		{
+			name: "dual-stack preserves order",
+			ips:  []netip.Addr{v6a, v4a, v6b}, haveV4: true, haveV6: true,
+			want: []netip.Addr{v6a, v4a, v6b},
+		},
+		{
+			name: "no families configured yields empty",
+			ips:  []netip.Addr{v4a, v6a}, haveV4: false, haveV6: false,
+			want: nil,
+		},
+		{
+			name: "v4-only tunnel, v6-only resolver yields empty (fast-fail)",
+			ips:  []netip.Addr{v6a, v6b}, haveV4: true, haveV6: false,
+			want: nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := filterUsableIPs(tc.ips, tc.haveV4, tc.haveV6)
+			if len(got) != len(tc.want) {
+				t.Fatalf("len(got)=%d, want %d (got=%v)", len(got), len(tc.want), got)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("got[%d]=%v, want %v", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
 // TestParseDNSFlag covers the three accepted shapes and one rejected one
 // for the -dns command-line flag.
 func TestParseDNSFlag(t *testing.T) {

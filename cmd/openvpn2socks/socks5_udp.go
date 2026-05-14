@@ -237,6 +237,14 @@ func (m *udpRelayMgr) pumpClientToTunnel(ctx context.Context) {
 			m.s.log.Debug("UDP relay: resolve failed", "host", host, "err", err)
 			continue
 		}
+		// Drop entries the tunnel can't carry (e.g. v6 when the server
+		// pushed only IPv4). Same rationale as handleConnect's filter.
+		ips = filterUsableIPs(ips, m.s.ns.HasIPv4(), m.s.ns.HasIPv6())
+		if len(ips) == 0 {
+			m.s.log.Debug("UDP relay: no usable address family",
+				"host", host, "have_v4", m.s.ns.HasIPv4(), "have_v6", m.s.ns.HasIPv6())
+			continue
+		}
 		targetAddr := net.JoinHostPort(ips[0].String(), strconv.Itoa(int(port)))
 
 		relay, err := m.getOrCreate(ctx, host, port, targetAddr, client)

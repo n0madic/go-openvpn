@@ -217,6 +217,21 @@ endpoint MTU. Existing TCP/UDP gVisor connections bound to the old
 address become zombies and time out naturally — client apps retry and
 fresh conns bind to the new local IP.
 
+**IPv6 plumbing:** the parser splits dual-stack data into separate
+fields — `PushReply.LocalIP6` (a `netip.Prefix` from `ifconfig-ipv6
+<addr>/<plen> <peer>`) and `PushReply.RemoteIP6` (the peer side of
+that same directive). `LocalIP` always stays IPv4 (from `ifconfig`),
+so do NOT test `LocalIP.Is6()` to decide whether to configure the v6
+NIC — read `LocalIP6` instead. OpenVPN has no `route-gateway-ipv6`
+directive: standard practice is to use `RemoteIP6` as the v6 default
+next-hop, so `buildRoutes` synthesises `::/0 → RemoteIP6` whenever
+`RemoteIP6` is valid (symmetric to the v4 `route-gateway` path). An
+explicit server-pushed `route-ipv6 ::/0` is harmless — gVisor's
+first-hit route matching tolerates the duplicate. Without this
+synthesis, providers that push only `ifconfig-ipv6` (no `route-ipv6
+::/0`) get a v6 NIC address but no way out, which surfaces as
+`"connect tcp [...]: no route to host"` on every v6 dial.
+
 ### SOCKS5 daemon (`cmd/openvpn2socks/`)
 
 `socks5Server` accepts a `net.Listener` via `Serve(ctx, ln)`
@@ -226,6 +241,16 @@ bind `127.0.0.1:0` and discover the port. `main.go` uses
 supported; BIND returns `REP=0x07`. DNS resolution order: `-dns` override
 → `PUSH_REPLY` DNS via tunnel UDP → system resolver (with a one-time
 leak warning).
+
+**Address-family filter:** `handleConnect` and the UDP relay funnel the
+resolver output through `filterUsableIPs(ips, ns.HasIPv4(), ns.HasIPv6())`
+before dialing. This is the fast-fail path for providers that don't push
+IPv6 (no `ifconfig-ipv6`): without filtering, a v6 candidate goes through
+gVisor, eats a route lookup, and returns `ErrHostUnreachable`. Apps then
+do happy-eyeballs through *another* SOCKS5 connection, doubling the log
+spam. The filter short-circuits to `REP=0x04 host unreachable` (or a
+silent drop on UDP) when the tunnel can't carry the requested family, so
+clients fall back to v4 inside the same connection.
 
 ## Testing approach
 
