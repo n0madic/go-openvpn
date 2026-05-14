@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/n0madic/go-openvpn/internal/data"
 	"github.com/n0madic/go-openvpn/internal/proto"
 )
 
@@ -118,8 +119,10 @@ func (s *Session) keepaliveLoop(ctx context.Context) {
 				s.log.Debug("keepalive seal failed", "err", err)
 				continue
 			}
-			if err := s.transport.WritePacket(ctx, wire); err != nil {
-				s.log.Debug("keepalive write failed (will retry next tick)", "err", err)
+			werr := s.transport.WritePacket(ctx, wire)
+			data.ReleaseSealedBuf(wire)
+			if werr != nil {
+				s.log.Debug("keepalive write failed (will retry next tick)", "err", werr)
 				continue
 			}
 			lastPingSent = now

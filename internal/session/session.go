@@ -198,6 +198,14 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 	}
 	s.layers.Install(0, initialLayer)
 
+	// Bind the session lifetime ctx to the transport once, so per-call
+	// ReadPacket/WritePacket don't spawn a watcher goroutine every packet.
+	// Transports that don't implement the optional interface (e.g. memory
+	// transport in tests) keep their per-call behaviour.
+	if br, ok := tr.(interface{ BindLifetimeCtx(context.Context) }); ok {
+		br.BindLifetimeCtx(sCtx)
+	}
+
 	// Start the read loop (demuxes by opcode + key-id across all layers).
 	s.wg.Go(s.readLoop)
 	// Per-layer write+tick loops for key-id 0.
@@ -367,8 +375,16 @@ func (s *Session) WriteCtx(ctx context.Context, p []byte) (int, error) {
 		writeCtx, cancel = mergedContext(s.ctx, ctx)
 		defer cancel()
 	}
-	if err := s.transport.WritePacket(writeCtx, wire); err != nil {
-		return 0, err
+	werr := s.transport.WritePacket(writeCtx, wire)
+	// Return the Seal output buffer to the pool regardless of write
+	// outcome. The transport's WritePacket synchronously hands wire to
+	// either net.Conn.Write (UDP, single syscall) or net.Buffers.WriteTo
+	// (TCP, writev — also synchronous wrt the input slice). Once it
+	// returns the kernel has copied out the bytes and we own the memory
+	// again.
+	data.ReleaseSealedBuf(wire)
+	if werr != nil {
+		return 0, werr
 	}
 	// Track real-user activity so dataActivityWatch can tell "user
 	// actively sending but nothing coming back" apart from "session idle".

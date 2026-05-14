@@ -3,3 +3,9 @@ examples/netstack-http/netstack-http
 *PLAN*
 *.ovpn
 *.log
+
+# Local benchmark artifacts (perf comparison scratch space).
+bench-artifacts/
+
+# Go test binaries produced by `go test -c` and stray harness artifacts.
+*.test
