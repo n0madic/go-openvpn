@@ -28,6 +28,7 @@ import (
 	"github.com/n0madic/go-openvpn/internal/proto"
 	"github.com/n0madic/go-openvpn/internal/reliable"
 	"github.com/n0madic/go-openvpn/internal/tlscrypt"
+	"github.com/n0madic/go-openvpn/internal/trace"
 	"github.com/n0madic/go-openvpn/internal/transport"
 	"github.com/n0madic/go-openvpn/internal/workers"
 )
@@ -70,6 +71,12 @@ type Config struct {
 	// PeerInfoVersion overrides the IV_VER field advertised in peer-info.
 	// Empty defaults to "2.6.0".
 	PeerInfoVersion string
+
+	// HandshakeTracer, when non-nil, receives a HandshakeEvent at the
+	// start of every control-channel handshake stage. Useful for
+	// production timing/observability and integration tests. nil means
+	// no tracing (zero overhead beyond an unused interface field).
+	HandshakeTracer trace.HandshakeTracer
 
 	Logger *slog.Logger
 }
@@ -235,6 +242,7 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 		Ciphers:         cfg.Ciphers,
 		HardResetOpcode: hardResetOp,
 		PeerInfoVersion: cfg.PeerInfoVersion,
+		Tracer:          cfg.HandshakeTracer,
 	})
 	if err != nil {
 		s.shutdown()

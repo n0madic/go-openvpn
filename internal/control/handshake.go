@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/n0madic/go-openvpn/internal/proto"
 	"github.com/n0madic/go-openvpn/internal/reliable"
+	"github.com/n0madic/go-openvpn/internal/trace"
 )
 
 // ErrAuthFailed is returned when the server responds AUTH_FAILED to our
@@ -47,6 +49,12 @@ type Config struct {
 
 	// PeerInfoVersion overrides IV_VER. Empty ⇒ proto.DefaultPeerInfo default.
 	PeerInfoVersion string
+
+	// Tracer, when non-nil, receives one HandshakeEvent at the start of
+	// each handshake stage (nil Err) and one extra event with err!=nil
+	// if the stage fails. A final StageComplete is emitted on success.
+	// nil treated as a NoopTracer (zero overhead).
+	Tracer trace.HandshakeTracer
 }
 
 // Result is what a successful Run returns.
@@ -78,20 +86,38 @@ func Run(ctx context.Context, layer *reliable.Layer, localAddr, remoteAddr net.A
 	if cfg.Proto == "" {
 		cfg.Proto = "UDPv4"
 	}
+	tracer := cfg.Tracer
+	if tracer == nil {
+		tracer = trace.NoopTracer{}
+	}
+	emit := func(stage trace.HandshakeStage, err error) {
+		tracer.OnHandshakeEvent(trace.HandshakeEvent{
+			Stage: stage,
+			Time:  time.Now(),
+			Err:   err,
+		})
+	}
 
 	// 1. Send P_CONTROL_HARD_RESET_CLIENT_V2/V3.
+	emit(trace.StageHardReset, nil)
 	if err := layer.SendHardReset(cfg.HardResetOpcode); err != nil {
-		return nil, fmt.Errorf("control: send hard reset: %w", err)
+		err = fmt.Errorf("control: send hard reset: %w", err)
+		emit(trace.StageHardReset, err)
+		return nil, err
 	}
 
 	// 2. Run TLS handshake over the reliable layer.
+	emit(trace.StageTLSHandshake, nil)
 	adapter := reliable.NewAdapter(layer, localAddr, remoteAddr)
 	tlsConn := tls.Client(adapter, cfg.TLSConfig)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		return nil, fmt.Errorf("control: TLS handshake: %w", err)
+		err = fmt.Errorf("control: TLS handshake: %w", err)
+		emit(trace.StageTLSHandshake, err)
+		return nil, err
 	}
 
 	// 3. Build & send client KEY_METHOD 2.
+	emit(trace.StageKeyMethod2Send, nil)
 	authUserPass := cfg.Username != "" || cfg.Password != ""
 	ciphersStr := strings.Join(cfg.Ciphers, ":")
 
@@ -104,20 +130,30 @@ func Run(ctx context.Context, layer *reliable.Layer, localAddr, remoteAddr net.A
 		PeerInfo:     buildPeerInfo(ciphersStr, cfg.PeerInfoVersion, cfg.PeerInfoExtra),
 	}
 	if _, err := rand.Read(clientKM.PreMaster[:]); err != nil {
-		return nil, fmt.Errorf("control: gen pre_master: %w", err)
+		err = fmt.Errorf("control: gen pre_master: %w", err)
+		emit(trace.StageKeyMethod2Send, err)
+		return nil, err
 	}
 	if _, err := rand.Read(clientKM.Random1[:]); err != nil {
-		return nil, fmt.Errorf("control: gen random1: %w", err)
+		err = fmt.Errorf("control: gen random1: %w", err)
+		emit(trace.StageKeyMethod2Send, err)
+		return nil, err
 	}
 	if _, err := rand.Read(clientKM.Random2[:]); err != nil {
-		return nil, fmt.Errorf("control: gen random2: %w", err)
+		err = fmt.Errorf("control: gen random2: %w", err)
+		emit(trace.StageKeyMethod2Send, err)
+		return nil, err
 	}
 	clientKMBytes, err := proto.MarshalKeyMethod2(clientKM)
 	if err != nil {
-		return nil, fmt.Errorf("control: marshal client KEY_METHOD 2: %w", err)
+		err = fmt.Errorf("control: marshal client KEY_METHOD 2: %w", err)
+		emit(trace.StageKeyMethod2Send, err)
+		return nil, err
 	}
 	if _, err := tlsConn.Write(clientKMBytes); err != nil {
-		return nil, fmt.Errorf("control: send client KEY_METHOD 2: %w", err)
+		err = fmt.Errorf("control: send client KEY_METHOD 2: %w", err)
+		emit(trace.StageKeyMethod2Send, err)
+		return nil, err
 	}
 	// pre_master is now embedded in the marshalled buffer (which crypto/tls
 	// owns) and the struct copy in the goroutine stack. Zero both so a heap
@@ -126,42 +162,61 @@ func Run(ctx context.Context, layer *reliable.Layer, localAddr, remoteAddr net.A
 	clear(clientKMBytes)
 
 	// 4. Receive server's KEY_METHOD 2.
+	emit(trace.StageKeyMethod2Recv, nil)
 	serverKM, err := ReadKeyMethod2(tlsConn, true, false)
 	if err != nil {
-		return nil, fmt.Errorf("control: read server KEY_METHOD 2: %w", err)
+		err = fmt.Errorf("control: read server KEY_METHOD 2: %w", err)
+		emit(trace.StageKeyMethod2Recv, err)
+		return nil, err
 	}
 
 	// 5. Send PUSH_REQUEST.
+	emit(trace.StagePushRequest, nil)
 	if err := WriteControlMessage(tlsConn, "PUSH_REQUEST"); err != nil {
-		return nil, fmt.Errorf("control: send PUSH_REQUEST: %w", err)
+		err = fmt.Errorf("control: send PUSH_REQUEST: %w", err)
+		emit(trace.StagePushRequest, err)
+		return nil, err
 	}
 
 	// 6. Read response — PUSH_REPLY or AUTH_FAILED.
+	emit(trace.StagePushReply, nil)
 	msg, err := ReadControlMessage(tlsConn)
 	if err != nil {
-		return nil, fmt.Errorf("control: read response: %w", err)
+		err = fmt.Errorf("control: read response: %w", err)
+		emit(trace.StagePushReply, err)
+		return nil, err
 	}
 	if strings.HasPrefix(msg, "AUTH_FAILED") {
-		return nil, fmt.Errorf("%w: %s", ErrAuthFailed, msg)
+		err = fmt.Errorf("%w: %s", ErrAuthFailed, msg)
+		emit(trace.StagePushReply, err)
+		return nil, err
 	}
 	pushReply, err := proto.ParsePushReply(msg)
 	if err != nil {
-		return nil, fmt.Errorf("control: parse PUSH_REPLY: %w", err)
+		err = fmt.Errorf("control: parse PUSH_REPLY: %w", err)
+		emit(trace.StagePushReply, err)
+		return nil, err
 	}
 	if pushReply.Cipher == "" {
-		return nil, errors.New("control: PUSH_REPLY missing cipher")
+		err = errors.New("control: PUSH_REPLY missing cipher")
+		emit(trace.StagePushReply, err)
+		return nil, err
 	}
 	if _, err := AEADKeyLen(pushReply.Cipher); err != nil {
+		emit(trace.StagePushReply, err)
 		return nil, err
 	}
 
 	// 7. Derive data-channel keys via TLS-EKM.
+	emit(trace.StageDataKeys, nil)
 	cs := tlsConn.ConnectionState()
 	keys, err := DeriveDataKeys(cs)
 	if err != nil {
+		emit(trace.StageDataKeys, err)
 		return nil, err
 	}
 
+	emit(trace.StageComplete, nil)
 	remoteSID, _ := layer.RemoteSessionID()
 	return &Result{
 		TLSConn:     tlsConn,

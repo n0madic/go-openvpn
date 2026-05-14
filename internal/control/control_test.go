@@ -22,6 +22,7 @@ import (
 	"github.com/n0madic/go-openvpn/internal/proto"
 	"github.com/n0madic/go-openvpn/internal/reliable"
 	"github.com/n0madic/go-openvpn/internal/tlscrypt"
+	"github.com/n0madic/go-openvpn/internal/trace"
 	"github.com/n0madic/go-openvpn/internal/transport"
 )
 
@@ -163,6 +164,106 @@ func TestRunFullHandshake(t *testing.T) {
 	// Both sides must derive identical key material via TLS-EKM.
 	if !bytes.Equal(result.KeyMaterial[:], serverEKM[:]) {
 		t.Error("client/server EKM mismatch")
+	}
+}
+
+// recordingTracer collects every HandshakeEvent it sees. Used by
+// TestRunEmitsTracerEvents to assert ordering and outcomes.
+type recordingTracer struct {
+	mu     sync.Mutex
+	events []trace.HandshakeEvent
+}
+
+func (r *recordingTracer) OnHandshakeEvent(e trace.HandshakeEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, e)
+}
+
+func (r *recordingTracer) stages() []trace.HandshakeStage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]trace.HandshakeStage, len(r.events))
+	for i, e := range r.events {
+		out[i] = e.Stage
+	}
+	return out
+}
+
+func TestRunEmitsTracerEvents(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	var staticKey [tlscrypt.StaticKeyLen]byte
+	if _, err := rand.Read(staticKey[:]); err != nil {
+		t.Fatal(err)
+	}
+	clientWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionInverse)
+	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
+
+	cTr, sTr := transport.MemoryPair()
+	clientLayer := reliable.New(reliable.Config{LocalSessionID: 0xC2C2C2C2})
+	serverLayer := reliable.New(reliable.Config{LocalSessionID: 0x5F5F5F5F})
+
+	(&pumper{layer: clientLayer, tr: cTr, wrap: clientWrap}).run(ctx, t)
+	(&pumper{layer: serverLayer, tr: sTr, wrap: serverWrap}).run(ctx, t)
+
+	cert, pool := genSelfSignedCert(t)
+	const pushReply = "PUSH_REPLY,ifconfig 10.8.0.7 255.255.255.0,topology subnet,peer-id 17,cipher AES-256-GCM,tun-mtu 1500,ping 10,ping-restart 60,route-gateway 10.8.0.1"
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_ = runServerSim(ctx, serverLayer, sTr, cert, pushReply, nil)
+	})
+
+	tracer := &recordingTracer{}
+	cfg := control.Config{
+		TLSConfig: &tls.Config{
+			ServerName: "localhost",
+			RootCAs:    pool,
+			MinVersion: tls.VersionTLS13,
+		},
+		Ciphers: []string{"AES-256-GCM"},
+		Tracer:  tracer,
+	}
+	res, err := control.Run(ctx, clientLayer, cTr.LocalAddr(), cTr.RemoteAddr(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	defer func() { _ = res.TLSConn.Close() }()
+	wg.Wait()
+
+	want := []trace.HandshakeStage{
+		trace.StageHardReset,
+		trace.StageTLSHandshake,
+		trace.StageKeyMethod2Send,
+		trace.StageKeyMethod2Recv,
+		trace.StagePushRequest,
+		trace.StagePushReply,
+		trace.StageDataKeys,
+		trace.StageComplete,
+	}
+	got := tracer.stages()
+	if len(got) != len(want) {
+		t.Fatalf("emitted %d events, want %d (%v)", len(got), len(want), got)
+	}
+	for i, s := range want {
+		if got[i] != s {
+			t.Errorf("event %d: got %v, want %v (full: %v)", i, got[i], s, got)
+			break
+		}
+	}
+	// Every success-path event must carry a non-zero Time and nil Err.
+	tracer.mu.Lock()
+	defer tracer.mu.Unlock()
+	for i, e := range tracer.events {
+		if e.Time.IsZero() {
+			t.Errorf("event %d (%v) has zero Time", i, e.Stage)
+		}
+		if e.Err != nil {
+			t.Errorf("event %d (%v) carries unexpected Err: %v", i, e.Stage, e.Err)
+		}
 	}
 }
 

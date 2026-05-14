@@ -28,7 +28,36 @@ import (
 	"time"
 
 	"github.com/n0madic/go-openvpn/internal/session"
+	"github.com/n0madic/go-openvpn/internal/trace"
 )
+
+// HandshakeStage names a phase of the OpenVPN client handshake. It is
+// re-exported from the internal trace package so callers don't have to
+// import an internal path. Use Stage*-prefixed constants below.
+type HandshakeStage = trace.HandshakeStage
+
+// Handshake stages, in the order they are emitted by Run.
+const (
+	StageHardReset      = trace.StageHardReset
+	StageTLSHandshake   = trace.StageTLSHandshake
+	StageKeyMethod2Send = trace.StageKeyMethod2Send
+	StageKeyMethod2Recv = trace.StageKeyMethod2Recv
+	StagePushRequest    = trace.StagePushRequest
+	StagePushReply      = trace.StagePushReply
+	StageDataKeys       = trace.StageDataKeys
+	StageComplete       = trace.StageComplete
+)
+
+// HandshakeEvent describes one handshake-stage notification.
+type HandshakeEvent = trace.HandshakeEvent
+
+// HandshakeTracer is the optional observer interface for handshake
+// progress. A single OnHandshakeEvent is emitted at the start of each
+// stage with a nil Err; if the stage fails, a second event with the
+// same Stage and a non-nil Err is delivered and is the last event for
+// that handshake. A final StageComplete event with nil Err marks
+// success.
+type HandshakeTracer = trace.HandshakeTracer
 
 // RestartError is returned from Tunnel().Read/Write when the server sent us
 // a RESTART control message. Inspect Delay for the server's suggested wait
@@ -102,6 +131,12 @@ type Config struct {
 	// payload of KEY_METHOD 2. Empty defaults to "2.6.0". Use this to
 	// mimic specific OpenVPN versions when the server enforces a minimum.
 	PeerInfoVersion string
+
+	// HandshakeTracer, when non-nil, receives notifications at each
+	// handshake stage of every dialled (or reconnected) session.
+	// Useful for production timing diagnostics and tests. nil disables
+	// tracing entirely with zero overhead beyond an unused field.
+	HandshakeTracer HandshakeTracer
 
 	// Logger receives diagnostic events. nil ⇒ no logging.
 	Logger *slog.Logger
@@ -225,6 +260,7 @@ func sessionCfg(cfg *Config) session.Config {
 		HandshakeTimeout: cfg.HandshakeTimeout,
 		Reneg:            cfg.Reneg,
 		PeerInfoVersion:  cfg.PeerInfoVersion,
+		HandshakeTracer:  cfg.HandshakeTracer,
 		Logger:           cfg.Logger,
 	}
 }
