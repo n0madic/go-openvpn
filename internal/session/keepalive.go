@@ -144,7 +144,7 @@ const statsLogPeriod = 30 * time.Second
 func (s *Session) statsLogger(ctx context.Context) {
 	ticker := time.NewTicker(statsLogPeriod)
 	defer ticker.Stop()
-	var prevForwarded, prevDropped, prevPingIn, prevOpenFailed uint64
+	var prevForwarded, prevDropped, prevPingIn, prevOpenFailed, prevStray uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -154,14 +154,17 @@ func (s *Session) statsLogger(ctx context.Context) {
 			dropped := s.statsDroppedFull.Load()
 			pingIn := s.statsPingIn.Load()
 			openFailed := s.statsOpenFailed.Load()
+			stray := s.statsStrayHandshake.Load()
 			deltaForwarded := forwarded - prevForwarded
 			deltaDropped := dropped - prevDropped
 			deltaPingIn := pingIn - prevPingIn
 			deltaOpenFailed := openFailed - prevOpenFailed
+			deltaStray := stray - prevStray
 			prevForwarded = forwarded
 			prevDropped = dropped
 			prevPingIn = pingIn
 			prevOpenFailed = openFailed
+			prevStray = stray
 			// Time since last successful inbound — the strongest signal
 			// that the tunnel is or isn't carrying real bytes RIGHT NOW.
 			sinceLastIn := now.Sub(time.Unix(0, s.lastDataInbound.Load()))
@@ -178,11 +181,13 @@ func (s *Session) statsLogger(ctx context.Context) {
 				"delta_dropped", deltaDropped,
 				"delta_ping_in", deltaPingIn,
 				"delta_open_failed", deltaOpenFailed,
+				"delta_stray_handshake", deltaStray,
 				"since_last_data_in", sinceLastIn.Round(time.Millisecond),
 				"forwarded_total", forwarded,
 				"dropped_total", dropped,
 				"ping_in_total", pingIn,
 				"open_failed_total", openFailed,
+				"stray_handshake_total", stray,
 			)
 		}
 	}

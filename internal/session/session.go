@@ -125,10 +125,11 @@ type Session struct {
 	lastUserOutbound atomic.Int64
 
 	// Packet-flow counters (lifetime). Sampled by statsLogger.
-	statsForwarded   atomic.Uint64 // delivered to ingressCh
-	statsDroppedFull atomic.Uint64 // ingressCh full → dropped
-	statsPingIn      atomic.Uint64 // inbound PING filtered before ingressCh
-	statsOpenFailed  atomic.Uint64 // slot.Open returned an error
+	statsForwarded      atomic.Uint64 // delivered to ingressCh
+	statsDroppedFull    atomic.Uint64 // ingressCh full → dropped
+	statsPingIn         atomic.Uint64 // inbound PING filtered before ingressCh
+	statsOpenFailed     atomic.Uint64 // slot.Open returned an error
+	statsStrayHandshake atomic.Uint64 // tls-crypt unwrap dropped — stray fresh handshake
 
 	ingressCh chan []byte
 	ctx       context.Context
@@ -760,6 +761,33 @@ func (s *Session) handleDataIn(pkt []byte, kid uint8) {
 	}
 }
 
+// isStrayUnwrap reports whether a failed-to-unwrap control packet looks
+// like benign chatter rather than a real anomaly. Two cases qualify:
+//
+//   - opcode is P_CONTROL_HARD_RESET_SERVER_V2: the server is initiating a
+//     brand-new session, so its tls-crypt send-pid restarts from 1 and
+//     trips our replay window. Common when the server lost track of us
+//     (HA/restart) or another client is competing for the same CN.
+//   - the on-wire session-id differs from the layer's known peer session-id:
+//     packets meant for a different session (load-balancer / NAT echo)
+//     reaching our socket. Only checked when we already know the peer SID;
+//     during the initial handshake the layer hasn't latched it yet.
+//
+// The packet header is parsed inline (cheap: 9 bytes); wrapper.Unwrap
+// zeroes its returned sid on error, so we can't reuse it here.
+func isStrayUnwrap(pkt []byte, opcode proto.Opcode, layer *reliable.Layer) bool {
+	if opcode == proto.PControlHardResetServerV2 {
+		return true
+	}
+	if len(pkt) >= 9 {
+		sid := binary.BigEndian.Uint64(pkt[1:9])
+		if expected, ok := layer.RemoteSessionID(); ok && sid != expected {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Session) handleControlIn(pkt []byte, opcode proto.Opcode, kid uint8) {
 	layer := s.layers.Get(kid)
 	if layer == nil {
@@ -768,6 +796,18 @@ func (s *Session) handleControlIn(pkt []byte, opcode proto.Opcode, kid uint8) {
 	}
 	opcodeKID, sid, _, plain, err := s.wrapper.Unwrap(pkt)
 	if err != nil {
+		// Coalesce the noisy benign case: a server periodically retrying a
+		// fresh handshake (HARD_RESET_SERVER_V2) while our session is alive
+		// produces a wave of replay-rejected packets with pid restarting
+		// from 1. Same for packets bearing a session-id we don't recognize
+		// (another client's traffic landing here via load-balancer / NAT
+		// quirks). Counted but not logged per-packet; statsLogger surfaces
+		// the running total. Anything else still hits Debug so genuine
+		// decrypt anomalies remain visible.
+		if isStrayUnwrap(pkt, opcode, layer) {
+			s.statsStrayHandshake.Add(1)
+			return
+		}
 		s.log.Debug("tls-crypt unwrap failed", "err", err)
 		return
 	}
