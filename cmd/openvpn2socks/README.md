@@ -316,13 +316,9 @@ The OpenVPN client is dialed with `Config.AutoReconnect=true`, so:
   few minutes of idle.
 - The client transmits server-pushed `ping` keepalives so a UDP NAT
   mapping on the path stays warm and the server never times us out.
-- **DNS-failure-driven restart**: when DNS over the tunnel times out
-  `-dns-restart-failures` (default 3) times in a row, the resolver
-  calls `Client.RequestRestart` and AutoReconnect dials a fresh
-  session. This is the safety net for "zombie tunnels" where the
-  OpenVPN session looks healthy at the protocol level (server still
-  exchanges keepalives) but the data plane silently drops new queries.
-  Set `-dns-restart-failures 0` to disable.
+- Failed DNS-over-tunnel queries fall back to the system resolver for
+  *that query only*; the next lookup tries the tunnel again. A
+  throttled warning announces the leak.
 - The SOCKS5 listener stays bound across reconnects.
 - In-flight TCP/UDP proxied connections will see their underlying
   netstack connection drop and the client will get a closed socket,

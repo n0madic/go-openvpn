@@ -21,24 +21,12 @@ import (
 //
 //  1. -dns override (queried over the tunnel)
 //  2. each PUSH_REPLY DNS server (queried over the tunnel)
-//  3. system net.Resolver — only if (1) and (2) yielded nothing; a single
-//     warning is logged so the user knows DNS is not going through the VPN.
-//
-// Consecutive DNS-over-tunnel failures are a strong signal that the tunnel
-// has gone "zombie" — the OpenVPN session is technically alive (control
-// plane chats, server keepalives flow) but the data plane is dropping new
-// queries. The OpenVPN ping-restart watchdog can't always detect this on
-// its own, so the resolver exposes a `restartHook` that gets called after
-// `restartThreshold` consecutive failures. The CLI wires this to
-// `openvpn.Client.RequestRestart`, which triggers AutoReconnect.
+//  3. system net.Resolver — only if (1) and (2) yielded nothing; a throttled
+//     warning is logged so the user knows that one or more queries leaked.
 type resolver struct {
 	ns       *netstack.Net
 	pushed   []netip.Addr
 	override netip.AddrPort
-
-	restartHook      func(reason string) // nil ⇒ feature off
-	restartThreshold int                 // ≤0 disables
-	consecutiveFails atomic.Int32
 
 	// lastSystemWarnNs is the UnixNano of the most recent
 	// "DNS-over-tunnel failed → using system resolver" warning. We
@@ -57,16 +45,6 @@ func newResolver(ns *netstack.Net, pushed []netip.Addr, override netip.AddrPort,
 	return &resolver{ns: ns, pushed: pushed, override: override, log: log}
 }
 
-// SetRestartHook wires the resolver to an application-level restart trigger
-// (typically openvpn.Client.RequestRestart). threshold sets how many
-// *consecutive* DNS-over-tunnel failures count as "tunnel is dead, get me a
-// fresh session". A successful lookup clears the counter. Pass threshold<=0
-// to disable.
-func (r *resolver) SetRestartHook(hook func(reason string), threshold int) {
-	r.restartHook = hook
-	r.restartThreshold = threshold
-}
-
 // LookupIP returns the resolved A/AAAA records for host. If host is already
 // an IP literal it is returned as-is.
 func (r *resolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, error) {
@@ -80,7 +58,6 @@ func (r *resolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, err
 	if r.override.IsValid() {
 		tunnelAttempted = true
 		if ips, err := r.queryOverTunnel(ctx, r.override, host); err == nil && len(ips) > 0 {
-			r.consecutiveFails.Store(0)
 			return ips, nil
 		}
 	}
@@ -92,21 +69,11 @@ func (r *resolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, err
 		tunnelAttempted = true
 		ap := netip.AddrPortFrom(srv, 53)
 		if ips, err := r.queryOverTunnel(ctx, ap, host); err == nil && len(ips) > 0 {
-			r.consecutiveFails.Store(0)
 			return ips, nil
 		}
 	}
-	// All tunnel DNS attempts failed (or none configured). When DNS is
-	// supposed to go through the tunnel, repeated failures probably mean
-	// the tunnel is in a half-broken zombie state — trigger AutoReconnect
-	// after threshold so a fresh session restores DNS.
-	if tunnelAttempted {
-		r.handleTunnelFailure()
-	}
 	// 3. System fallback. Tunnel DNS will be re-attempted on the *next*
-	// LookupIP; this fallback is only for the current query. Throttle the
-	// warning so the user sees if leakage is one-off or ongoing without
-	// spamming the log when a streak of queries fails.
+	// LookupIP; this fallback is only for the current query.
 	if tunnelAttempted {
 		r.maybeWarnSystemFallback(host)
 	}
@@ -132,26 +99,6 @@ func (r *resolver) maybeWarnSystemFallback(host string) {
 	}
 	r.log.Warn("DNS-over-tunnel failed — this query falls back to system resolver (tunnel DNS will be retried on the next lookup)",
 		"host", host)
-}
-
-// handleTunnelFailure increments the consecutive-failure counter and, when
-// it crosses the configured threshold, asks the OpenVPN client to drop the
-// current session and reconnect. Counter is cleared on a successful tunnel
-// query (see LookupIP) so a single transient hiccup never escalates.
-func (r *resolver) handleTunnelFailure() {
-	if r.restartHook == nil || r.restartThreshold <= 0 {
-		return
-	}
-	n := r.consecutiveFails.Add(1)
-	if int(n) < r.restartThreshold {
-		return
-	}
-	// CAS-style reset: zero the counter before invoking the hook so a
-	// reentrant call (or the next query racing the hook) starts fresh.
-	r.consecutiveFails.Store(0)
-	reason := fmt.Sprintf("DNS-over-tunnel failed %d consecutive times", n)
-	r.log.Warn("requesting session restart from resolver", "reason", reason)
-	r.restartHook(reason)
 }
 
 // queryOverTunnel sends parallel DNS A and AAAA queries to server via the

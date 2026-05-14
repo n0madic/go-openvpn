@@ -126,14 +126,9 @@ internal/session         Orchestrator. Goroutines per active session:
   — when set, server `RESTART` is absorbed without surfacing to the user.
 - `Client.RequestRestart(reason string)` — application-level escape hatch
   that forces the current session to close with a `*RestartError` so
-  `AutoReconnect` re-dials. Use when something *outside* the OpenVPN
-  protocol (DNS-over-tunnel failing repeatedly, watchdog probe failing,
-  user-visible error counter, etc.) tells you the data plane is dead
-  even though the protocol can't see it. `cmd/openvpn2socks` wires this
-  to its DNS resolver: N consecutive DNS-over-tunnel timeouts ⇒
-  RequestRestart ⇒ fresh peer_id / local_ip / NAT mapping ⇒ DNS works
-  again. The Tunnel handle survives — blocked Reads resume on the new
-  session.
+  `AutoReconnect` re-dials. Useful for external monitoring / manual
+  session refresh / tests. The Tunnel handle survives — blocked Reads
+  resume on the new session.
 - `Client.OnReconnect(fn func(PushReply))` — register a callback fired
   every time AutoReconnect installs a fresh session. **Critical** for
   anything that caches a tunnel-IP-dependent value: gVisor NIC address,
