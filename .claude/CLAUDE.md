@@ -342,9 +342,23 @@ synthesis, providers that push only `ifconfig-ipv6` (no `route-ipv6
 (http.Server pattern) — that exists specifically so integration tests can
 bind `127.0.0.1:0` and discover the port. `main.go` uses
 `ListenAndServe(ctx)` instead. CONNECT (TCP) + UDP ASSOCIATE are
-supported; BIND returns `REP=0x07`. DNS resolution order: `-dns` override
-→ `PUSH_REPLY` DNS via tunnel UDP → system resolver (with a one-time
-leak warning).
+supported; BIND returns `REP=0x07`. DNS resolution order:
+1. **positive cache** (60s TTL, `dnsCacheTTL`) — masks transient
+   upstream-resolver flakiness; defensive-copy on get so callers can't
+   poison the cache by mutating the returned slice
+2. `-dns` override (over the tunnel) — when set, treated as
+   authoritative; the public-resolver fallback below is skipped
+3. each PUSH_REPLY DNS server (over the tunnel)
+4. `publicDNSFallback` (1.1.1.1) over the tunnel — masks a broken
+   provider resolver while keeping DNS **inside** the VPN; only runs
+   when no `-dns` override is set
+5. system resolver, throttled WARN — DNS leaked
+
+Cache writes happen on every successful *tunneled* resolution (including
+the public-resolver fallback), but **NOT** on system-resolver results —
+caching a system-resolved IP could prolong leak windows after the
+tunnel recovers. Empty answer slices are ignored on `cacheSet` so a
+"no records" answer doesn't masquerade as a hit.
 
 **Address-family filter:** `handleConnect` and the UDP relay funnel the
 resolver output through `filterUsableIPs(ips, ns.HasIPv4(), ns.HasIPv6())`

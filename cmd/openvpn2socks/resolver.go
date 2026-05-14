@@ -11,18 +11,42 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/n0madic/go-openvpn/pkg/netstack"
 )
 
+// dnsCacheTTL is how long a successful resolution is kept. Chosen to be
+// short enough that geo-DNS and load-balanced records rotate within a
+// reasonable user-visible window, but long enough to mask a flaky
+// upstream DNS server through a typical browsing session.
+const dnsCacheTTL = 60 * time.Second
+
+// publicDNSFallback is the well-known public resolver we query over the
+// tunnel when the pushed/override resolver doesn't respond. Picked over
+// 8.8.8.8 specifically because Cloudflare is the most aggressive about
+// SLA on DNS uptime and is reachable from virtually every VPN egress.
+// The query still goes through the tunnel — no DNS leak.
+var publicDNSFallback = netip.AddrPortFrom(netip.AddrFrom4([4]byte{1, 1, 1, 1}), 53)
+
+// dnsCacheEntry is one cached resolution.
+type dnsCacheEntry struct {
+	ips     []netip.Addr
+	expires time.Time
+}
+
 // resolver resolves hostnames to IPs in priority order:
 //
+//  0. positive cache (per-host, dnsCacheTTL) — shielded from a flaky
+//     upstream resolver between cache entries
 //  1. -dns override (queried over the tunnel)
 //  2. each PUSH_REPLY DNS server (queried over the tunnel)
-//  3. system net.Resolver — only if (1) and (2) yielded nothing; a throttled
-//     warning is logged so the user knows that one or more queries leaked.
+//  3. publicDNSFallback (1.1.1.1) over the tunnel — masks failures of the
+//     provider's resolver while still keeping DNS *inside* the VPN
+//  4. system net.Resolver — only when every tunneled option yielded
+//     nothing; a throttled warning is logged so the user knows DNS leaked
 type resolver struct {
 	ns       *netstack.Net
 	pushed   []netip.Addr
@@ -35,6 +59,14 @@ type resolver struct {
 	// doesn't spam when a streak of queries fails.
 	lastSystemWarnNs atomic.Int64
 	log              *slog.Logger
+
+	cacheMu sync.Mutex
+	cache   map[string]dnsCacheEntry
+
+	// Diagnostic counters; sampled by no one yet but cheap to maintain
+	// and useful for testing.
+	statsCacheHit  atomic.Uint64
+	statsCacheMiss atomic.Uint64
 }
 
 // systemWarnThrottle is the minimum gap between two consecutive "falling
@@ -42,15 +74,72 @@ type resolver struct {
 const systemWarnThrottle = 60 * time.Second
 
 func newResolver(ns *netstack.Net, pushed []netip.Addr, override netip.AddrPort, log *slog.Logger) *resolver {
-	return &resolver{ns: ns, pushed: pushed, override: override, log: log}
+	return &resolver{
+		ns:       ns,
+		pushed:   pushed,
+		override: override,
+		log:      log,
+		cache:    make(map[string]dnsCacheEntry),
+	}
+}
+
+// cacheGet returns cached IPs for host if the entry is still fresh.
+func (r *resolver) cacheGet(host string) ([]netip.Addr, bool) {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	e, ok := r.cache[host]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(e.expires) {
+		delete(r.cache, host)
+		return nil, false
+	}
+	// Defensive copy so callers can mutate without poisoning the cache.
+	out := make([]netip.Addr, len(e.ips))
+	copy(out, e.ips)
+	return out, true
+}
+
+// cacheSet stores ips for host with TTL dnsCacheTTL.
+func (r *resolver) cacheSet(host string, ips []netip.Addr) {
+	if len(ips) == 0 {
+		return
+	}
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	stored := make([]netip.Addr, len(ips))
+	copy(stored, ips)
+	r.cache[host] = dnsCacheEntry{ips: stored, expires: time.Now().Add(dnsCacheTTL)}
 }
 
 // LookupIP returns the resolved A/AAAA records for host. If host is already
 // an IP literal it is returned as-is.
+//
+// Resolution order with cache and tunnel-fallback:
+//
+//  0. cache (fresh entry, < dnsCacheTTL old) — shields the user from a
+//     flaky upstream DNS server between cache windows
+//  1. -dns override (over the tunnel)
+//  2. each PUSH_REPLY DNS server (over the tunnel)
+//  3. publicDNSFallback (1.1.1.1) over the tunnel — masks a broken
+//     provider resolver while keeping DNS inside the VPN
+//  4. system net.Resolver — last resort, emits the throttled leak warning
+//
+// Cache writes happen on every successful tunneled resolution (so
+// fallback-resolved entries also serve future cache hits) but NOT on
+// system-fallback resolutions — caching a system-resolved IP could
+// accidentally prolong a DNS-leak window after the tunnel recovers.
 func (r *resolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return []netip.Addr{ip}, nil
 	}
+
+	if ips, ok := r.cacheGet(host); ok {
+		r.statsCacheHit.Add(1)
+		return ips, nil
+	}
+	r.statsCacheMiss.Add(1)
 
 	tunnelAttempted := false
 
@@ -58,6 +147,7 @@ func (r *resolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, err
 	if r.override.IsValid() {
 		tunnelAttempted = true
 		if ips, err := r.queryOverTunnel(ctx, r.override, host); err == nil && len(ips) > 0 {
+			r.cacheSet(host, ips)
 			return ips, nil
 		}
 	}
@@ -69,11 +159,28 @@ func (r *resolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, err
 		tunnelAttempted = true
 		ap := netip.AddrPortFrom(srv, 53)
 		if ips, err := r.queryOverTunnel(ctx, ap, host); err == nil && len(ips) > 0 {
+			r.cacheSet(host, ips)
 			return ips, nil
 		}
 	}
-	// 3. System fallback. Tunnel DNS will be re-attempted on the *next*
-	// LookupIP; this fallback is only for the current query.
+	// 3. publicDNSFallback over the tunnel — try a different resolver
+	// before giving up to the system one. Only runs when the operator
+	// hasn't explicitly overridden DNS (override is treated as
+	// authoritative; if it's broken we honour the user's intent and
+	// don't second-guess them).
+	if !r.override.IsValid() {
+		tunnelAttempted = true
+		if ips, err := r.queryOverTunnel(ctx, publicDNSFallback, host); err == nil && len(ips) > 0 {
+			r.log.Debug("DNS-over-tunnel fallback succeeded via public resolver",
+				"host", host, "via", publicDNSFallback)
+			r.cacheSet(host, ips)
+			return ips, nil
+		}
+	}
+	// 4. System fallback. Tunnel DNS will be re-attempted on the *next*
+	// LookupIP; this fallback is only for the current query. Result is
+	// intentionally NOT cached — caching a system-resolved IP could
+	// prolong DNS leakage after the tunnel recovers.
 	if tunnelAttempted {
 		r.maybeWarnSystemFallback(host)
 	}
