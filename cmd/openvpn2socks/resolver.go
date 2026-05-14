@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,9 +40,18 @@ type resolver struct {
 	restartThreshold int                 // ≤0 disables
 	consecutiveFails atomic.Int32
 
-	systemWarnOnce sync.Once
-	log            *slog.Logger
+	// lastSystemWarnNs is the UnixNano of the most recent
+	// "DNS-over-tunnel failed → using system resolver" warning. We
+	// throttle the message rather than fire it once-ever (a) so the user
+	// sees if DNS leakage is one-off vs ongoing, and (b) so the log
+	// doesn't spam when a streak of queries fails.
+	lastSystemWarnNs atomic.Int64
+	log              *slog.Logger
 }
+
+// systemWarnThrottle is the minimum gap between two consecutive "falling
+// back to system resolver" warnings.
+const systemWarnThrottle = 60 * time.Second
 
 func newResolver(ns *netstack.Net, pushed []netip.Addr, override netip.AddrPort, log *slog.Logger) *resolver {
 	return &resolver{ns: ns, pushed: pushed, override: override, log: log}
@@ -95,15 +103,35 @@ func (r *resolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, err
 	if tunnelAttempted {
 		r.handleTunnelFailure()
 	}
-	// 3. System fallback.
-	r.systemWarnOnce.Do(func() {
-		r.log.Warn("no DNS over tunnel — falling back to system resolver (DNS traffic will NOT go through the VPN)")
-	})
+	// 3. System fallback. Tunnel DNS will be re-attempted on the *next*
+	// LookupIP; this fallback is only for the current query. Throttle the
+	// warning so the user sees if leakage is one-off or ongoing without
+	// spamming the log when a streak of queries fails.
+	if tunnelAttempted {
+		r.maybeWarnSystemFallback(host)
+	}
 	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 	if err != nil {
 		return nil, err
 	}
 	return ips, nil
+}
+
+// maybeWarnSystemFallback emits a throttled warning when we use the system
+// resolver because DNS-over-tunnel failed for `host`. Fires at most once
+// per systemWarnThrottle window so an ongoing leak stays visible but a
+// burst of failures doesn't flood the log.
+func (r *resolver) maybeWarnSystemFallback(host string) {
+	now := time.Now().UnixNano()
+	last := r.lastSystemWarnNs.Load()
+	if now-last < int64(systemWarnThrottle) {
+		return
+	}
+	if !r.lastSystemWarnNs.CompareAndSwap(last, now) {
+		return
+	}
+	r.log.Warn("DNS-over-tunnel failed — this query falls back to system resolver (tunnel DNS will be retried on the next lookup)",
+		"host", host)
 }
 
 // handleTunnelFailure increments the consecutive-failure counter and, when
@@ -126,32 +154,45 @@ func (r *resolver) handleTunnelFailure() {
 	r.restartHook(reason)
 }
 
-// queryOverTunnel sends a DNS A+AAAA query to server via the netstack and
-// returns parsed answer IPs. Tries A first, then AAAA; merges results.
-//
-// Both A and AAAA queries share a single UDP conn through the netstack —
-// cutting gVisor endpoint create/teardown in half compared to dialling
-// once per qtype.
+// queryOverTunnel sends parallel DNS A and AAAA queries to server via the
+// netstack and returns the merged answer IPs. Each qtype runs on its own
+// gonet UDP conn with its own per-query deadline — that way a slow A
+// response doesn't burn the whole deadline and force AAAA to fail without
+// having even hit the wire (a real failure mode observed against
+// ProtonVPN's pushed resolver).
 func (r *resolver) queryOverTunnel(ctx context.Context, server netip.AddrPort, host string) ([]netip.Addr, error) {
-	qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	conn, err := r.ns.DialContext(qctx, "udp", server.String())
-	if err != nil {
-		return nil, err
+	type result struct {
+		ips   []netip.Addr
+		err   error
+		qtype uint16
 	}
-	defer func() { _ = conn.Close() }()
-	if dl, ok := qctx.Deadline(); ok {
-		_ = conn.SetDeadline(dl)
+	qtypes := []uint16{dnsTypeA, dnsTypeAAAA}
+	ch := make(chan result, len(qtypes))
+	for _, qt := range qtypes {
+		go func(qt uint16) {
+			qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			conn, err := r.ns.DialContext(qctx, "udp", server.String())
+			if err != nil {
+				ch <- result{nil, err, qt}
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			if dl, ok := qctx.Deadline(); ok {
+				_ = conn.SetDeadline(dl)
+			}
+			ips, err := r.queryOne(conn, host, qt)
+			ch <- result{ips, err, qt}
+		}(qt)
 	}
-
 	var out []netip.Addr
-	for _, qtype := range []uint16{dnsTypeA, dnsTypeAAAA} {
-		if ips, err := r.queryOne(conn, host, qtype); err == nil {
-			out = append(out, ips...)
-		} else {
-			r.log.Debug("DNS query failed", "server", server, "host", host, "qtype", qtype, "err", err)
+	for range qtypes {
+		res := <-ch
+		if res.err != nil {
+			r.log.Debug("DNS query failed", "server", server, "host", host, "qtype", res.qtype, "err", res.err)
+			continue
 		}
+		out = append(out, res.ips...)
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no records for %q from %s", host, server)
