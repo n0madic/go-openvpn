@@ -319,6 +319,42 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 // PushReply returns the parsed server PUSH_REPLY.
 func (s *Session) PushReply() proto.PushReply { return s.pushReply }
 
+// Stats is a snapshot of one Session's lifetime packet-flow counters
+// and liveness timestamps. Counters are cumulative since the session
+// was dialled; timestamps reflect the most recent observation (zero
+// time means "no observation yet").
+type Stats struct {
+	Forwarded        uint64
+	DroppedFull      uint64
+	PingIn           uint64
+	OpenFailed       uint64
+	StrayHandshake   uint64
+	LastInbound      time.Time
+	LastDataInbound  time.Time
+	LastUserOutbound time.Time
+}
+
+// Stats returns a consistent snapshot of the session's counters and
+// liveness timestamps. Safe to call concurrently with traffic.
+func (s *Session) Stats() Stats {
+	nsToTime := func(ns int64) time.Time {
+		if ns == 0 {
+			return time.Time{}
+		}
+		return time.Unix(0, ns)
+	}
+	return Stats{
+		Forwarded:        s.statsForwarded.Load(),
+		DroppedFull:      s.statsDroppedFull.Load(),
+		PingIn:           s.statsPingIn.Load(),
+		OpenFailed:       s.statsOpenFailed.Load(),
+		StrayHandshake:   s.statsStrayHandshake.Load(),
+		LastInbound:      nsToTime(s.lastInbound.Load()),
+		LastDataInbound:  nsToTime(s.lastDataInbound.Load()),
+		LastUserOutbound: nsToTime(s.lastUserOutbound.Load()),
+	}
+}
+
 func (s *Session) UnderlayLocalAddr() net.Addr  { return s.transport.LocalAddr() }
 func (s *Session) UnderlayRemoteAddr() net.Addr { return s.transport.RemoteAddr() }
 

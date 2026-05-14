@@ -142,6 +142,46 @@ type Config struct {
 	Logger *slog.Logger
 }
 
+// Stats is a snapshot of a Client's packet-flow counters and liveness
+// timestamps. Counter fields aggregate across all sessions ever
+// dialled by this Client — they survive AutoReconnect-driven session
+// replacements so monitoring tools see a continuous view. Timestamp
+// fields reflect the CURRENT session only; they reset on each
+// reconnect (zero time means "no such observation yet").
+type Stats struct {
+	// Forwarded is the number of decrypted IP packets handed to the
+	// Tunnel reader.
+	Forwarded uint64
+	// DroppedFull is the number of packets dropped because the Tunnel
+	// reader could not keep up (ingress channel full).
+	DroppedFull uint64
+	// PingIn is the number of inbound keepalive PINGs filtered before
+	// delivery.
+	PingIn uint64
+	// OpenFailed is the number of inbound AEAD decrypt failures.
+	OpenFailed uint64
+	// StrayHandshake is the number of tls-crypt unwrap drops that
+	// looked like benign load-balancer / server-restart chatter
+	// (stray HARD_RESET_SERVER_V2 or mismatched session-id).
+	StrayHandshake uint64
+
+	// LastInbound is the time of the most recent successfully
+	// decrypted inbound packet of ANY kind (real traffic or PING).
+	LastInbound time.Time
+	// LastDataInbound is the time of the most recent NON-PING inbound
+	// packet — the signal dataActivityWatch uses to distinguish a
+	// data-path-stuck failure from genuine idle.
+	LastDataInbound time.Time
+	// LastUserOutbound is the time of the most recent Tunnel.Write —
+	// real user traffic, not keepalive PINGs.
+	LastUserOutbound time.Time
+
+	// Reconnects is the number of completed AutoReconnect cycles
+	// since this Client was dialled. Zero means we're still on the
+	// initial session.
+	Reconnects uint64
+}
+
 // Client is an active VPN session. When AutoReconnect is enabled, the
 // Client survives RESTART events by replacing its internal session
 // transparently to the Tunnel net.Conn caller.
@@ -169,6 +209,12 @@ type Client struct {
 	// hooksMu protects onReconnect.
 	hooksMu     sync.Mutex
 	onReconnect []func(PushReply)
+
+	// statsMu guards cumStats, the running counter total absorbed
+	// from every prior session before a reconnect swap. The current
+	// session's counters are added on top whenever Stats is called.
+	statsMu  sync.Mutex
+	cumStats Stats
 }
 
 // OnReconnect registers fn to be invoked every time AutoReconnect installs a
@@ -192,6 +238,52 @@ func (c *Client) OnReconnect(fn func(PushReply)) {
 	c.hooksMu.Lock()
 	c.onReconnect = append(c.onReconnect, fn)
 	c.hooksMu.Unlock()
+}
+
+// Stats returns a consistent snapshot of the Client's packet-flow
+// counters and liveness timestamps. Counter fields are cumulative
+// across reconnects; timestamps reflect only the currently active
+// session. See the Stats type for field-level documentation.
+func (c *Client) Stats() Stats {
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	s := c.session()
+	out := c.cumStats
+	if s != nil {
+		cur := s.Stats()
+		out.Forwarded += cur.Forwarded
+		out.DroppedFull += cur.DroppedFull
+		out.PingIn += cur.PingIn
+		out.OpenFailed += cur.OpenFailed
+		out.StrayHandshake += cur.StrayHandshake
+		out.LastInbound = cur.LastInbound
+		out.LastDataInbound = cur.LastDataInbound
+		out.LastUserOutbound = cur.LastUserOutbound
+	}
+	return out
+}
+
+// absorbStatsLocked folds the supplied session's lifetime counters
+// into c.cumStats. Called from the reconnect path just before the
+// session pointer is replaced so future Stats calls see a continuous
+// running total. Caller must hold c.statsMu. A nil session is a no-op
+// (initial dial doesn't have a previous session to absorb).
+func (c *Client) absorbStatsLocked(s *session.Session) {
+	if s == nil {
+		return
+	}
+	c.foldStatsLocked(s.Stats())
+}
+
+// foldStatsLocked is the integer-merge half of absorbStatsLocked,
+// factored out so unit tests can exercise the accumulation logic
+// without standing up a real Session. Caller must hold c.statsMu.
+func (c *Client) foldStatsLocked(st session.Stats) {
+	c.cumStats.Forwarded += st.Forwarded
+	c.cumStats.DroppedFull += st.DroppedFull
+	c.cumStats.PingIn += st.PingIn
+	c.cumStats.OpenFailed += st.OpenFailed
+	c.cumStats.StrayHandshake += st.StrayHandshake
 }
 
 // FireOnReconnect invokes every registered OnReconnect hook with the
@@ -366,6 +458,13 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 				_ = s.Close()
 				return callCtx.Err()
 			}
+			// Absorb the failed session's lifetime counters into cumStats
+			// before we lose visibility of it. Without this, every
+			// reconnect would silently zero the running totals.
+			c.statsMu.Lock()
+			c.absorbStatsLocked(failed)
+			c.cumStats.Reconnects++
+			c.statsMu.Unlock()
 			c.mu.Lock()
 			c.s = s
 			c.mu.Unlock()
