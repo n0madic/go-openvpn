@@ -43,6 +43,14 @@ func NewTCP(c net.Conn) PacketConn {
 }
 
 func newTCPConn(c net.Conn) *tcpConn {
+	// Disable Nagle. Each WritePacket already produces a fully-framed
+	// OpenVPN packet (16-bit length prefix + payload, coalesced via
+	// net.Buffers); Nagle's algorithm has nothing useful to merge here
+	// and only adds ~40 ms of latency waiting for more bytes that will
+	// never come on a per-packet protocol like ours.
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
 	return &tcpConn{c: c, br: bufio.NewReaderSize(c, 8192)}
 }
 
