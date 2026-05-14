@@ -169,6 +169,69 @@ func TestOutOfOrderWithinWindow(t *testing.T) {
 	}
 }
 
+// TestReplayWindowAcceptsLargeReorder is the regression test for the
+// production failure where 46+ packets arrived reordered by more than the
+// old 64-packet window and were all silently dropped as out-of-window.
+// With DefaultReplayWindow = 1024 a "burst-then-stragglers" delivery
+// pattern of up to ~1000 packets reordered must still leave all of them
+// accepted.
+func TestReplayWindowAcceptsLargeReorder(t *testing.T) {
+	t.Parallel()
+	w := NewReplayWindow(0) // default size 1024
+
+	// 1) Advance highest to 1000 (simulates the "future" burst landing first).
+	if !w.Accept(1000) {
+		t.Fatal("first accept of pid=1000 should succeed")
+	}
+
+	// 2) Now deliver the older stragglers, pid 1..999. All must be accepted
+	//    because they're within DefaultReplayWindow (1024) of highest.
+	for pid := uint32(1); pid <= 999; pid++ {
+		if !w.Accept(pid) {
+			t.Fatalf("straggler pid=%d rejected — window too small? (DefaultReplayWindow=%d)",
+				pid, DefaultReplayWindow)
+		}
+	}
+
+	// 3) Re-delivering any of those is a genuine replay → rejected.
+	for pid := uint32(1); pid <= 1000; pid++ {
+		if w.Accept(pid) {
+			t.Fatalf("replay of pid=%d unexpectedly accepted", pid)
+		}
+	}
+
+	// 4) A pid beyond the window must be rejected as truly out-of-window
+	//    — security property must hold. Advance highest to 2000, then
+	//    test pid=100 (which is 1900 behind, well past 1024).
+	if !w.Accept(2000) {
+		t.Fatal("advance to pid=2000 should succeed")
+	}
+	if w.Accept(100) {
+		t.Fatalf("pid=100 is >1024 behind highest=2000, should be rejected")
+	}
+}
+
+// TestReplayWindowLargeAdvance covers the bitmap-shift path when the
+// jump between consecutive accepted pids is larger than 64 (a single
+// uint64 worth of bits). Used to underflow when DefaultReplayWindow was
+// 64; now must work for any size.
+func TestReplayWindowLargeAdvance(t *testing.T) {
+	t.Parallel()
+	w := NewReplayWindow(0)
+	if !w.Accept(1) {
+		t.Fatal("accept pid=1")
+	}
+	// Big jump past one full uint64 worth of bits.
+	if !w.Accept(1000) {
+		t.Fatal("accept pid=1000 after big jump")
+	}
+	// pid=1 must now register as "seen" — it's still within 1024 of
+	// highest=1000 and we accepted it earlier.
+	if w.Accept(1) {
+		t.Fatal("pid=1 should be rejected as replay (still in window)")
+	}
+}
+
 func TestPacketIDExhaustion(t *testing.T) {
 	t.Parallel()
 	client, _ := makeInteropSlots(t, "AES-256-GCM", 1, 0)
