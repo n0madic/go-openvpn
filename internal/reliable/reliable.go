@@ -35,8 +35,11 @@ const (
 	// MaxRetransmit caps the per-retransmit backoff.
 	MaxRetransmit = 16 * time.Second
 	// AckFlushDelay is the grace period before sending a standalone P_ACK_V1
-	// when no piggyback opportunity arrived.
-	AckFlushDelay = 50 * time.Millisecond
+	// when no piggyback opportunity arrived. Short enough that perceived
+	// handshake latency doesn't suffer; long enough that any imminent
+	// outbound P_CONTROL_V1 can piggyback the ack and avoid a separate
+	// packet on the wire. 20ms matches ooni/minivpn's tuning.
+	AckFlushDelay = 20 * time.Millisecond
 	// FastRetransmitThreshold is the number of ACKs we must observe for
 	// packets with strictly higher msgPIDs before we treat a still-pending
 	// packet as lost and retransmit it without waiting for its backoff
@@ -590,8 +593,15 @@ func (l *Layer) Tick() error {
 		pkt.higherACKs = 0
 	}
 
-	if !l.ackPendingSince.IsZero() && now.Sub(l.ackPendingSince) >= AckFlushDelay {
-		return l.emitStandaloneAckLocked()
+	if len(l.pendingAcks) > 0 {
+		// Count-based fast flush: at MaxAcksPerPacket we're at the
+		// per-packet ack ceiling, so waiting longer can only push the
+		// surplus into a second standalone packet anyway. Send now.
+		// Otherwise observe the grace period to give a piggyback chance.
+		if len(l.pendingAcks) >= MaxAcksPerPacket ||
+			(!l.ackPendingSince.IsZero() && now.Sub(l.ackPendingSince) >= AckFlushDelay) {
+			return l.emitStandaloneAckLocked()
+		}
 	}
 	return nil
 }

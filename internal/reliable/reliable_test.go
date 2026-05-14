@@ -337,6 +337,124 @@ func TestStandaloneAckEmittedWhenNoOutbound(t *testing.T) {
 	})
 }
 
+// TestAckFlushCountBased proves that once MaxAcksPerPacket pending acks
+// accumulate, Tick emits a standalone P_ACK_V1 immediately, without
+// waiting for AckFlushDelay. Counterpart to the time-based path.
+func TestAckFlushCountBased(t *testing.T) {
+	t.Parallel()
+	var clockMu sync.Mutex
+	now := time.Now()
+	clock := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	}
+
+	l := New(Config{LocalSessionID: 1, Clock: clock})
+	defer func() { _ = l.Close() }()
+
+	// Inject MaxAcksPerPacket-1 packets — Tick should NOT flush yet
+	// because the grace period hasn't elapsed and the count is below
+	// the threshold.
+	for i := range MaxAcksPerPacket - 1 {
+		err := l.HandleInbound(InPacket{
+			Opcode:    proto.PControlV1,
+			SessionID: 0xAABB,
+			Payload:   proto.ControlPayload{MessagePID: uint32(i)},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case out := <-l.Outbound():
+		t.Fatalf("standalone ack emitted prematurely: %+v", out)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// One more push crosses MaxAcksPerPacket — Tick must drain now.
+	err := l.HandleInbound(InPacket{
+		Opcode:    proto.PControlV1,
+		SessionID: 0xAABB,
+		Payload:   proto.ControlPayload{MessagePID: uint32(MaxAcksPerPacket - 1)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case out := <-l.Outbound():
+		if !out.IsAck() {
+			t.Fatalf("expected standalone P_ACK_V1, got opcode %d", out.Opcode)
+		}
+		if len(out.Ack.Acks) != MaxAcksPerPacket {
+			t.Errorf("ack batch carried %d acks, want %d", len(out.Ack.Acks), MaxAcksPerPacket)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("count-based flush did not emit standalone ack")
+	}
+}
+
+// TestAckFlushTimeBased confirms a lone pending ack still goes out
+// through the grace-period path. Companion to TestAckFlushCountBased.
+func TestAckFlushTimeBased(t *testing.T) {
+	t.Parallel()
+	var clockMu sync.Mutex
+	now := time.Now()
+	clock := func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	}
+	advance := func(d time.Duration) {
+		clockMu.Lock()
+		now = now.Add(d)
+		clockMu.Unlock()
+	}
+
+	l := New(Config{LocalSessionID: 1, Clock: clock})
+	defer func() { _ = l.Close() }()
+
+	err := l.HandleInbound(InPacket{
+		Opcode:    proto.PControlV1,
+		SessionID: 0xAABB,
+		Payload:   proto.ControlPayload{MessagePID: 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Tick before the grace period: nothing should leave.
+	advance(AckFlushDelay / 2)
+	if err := l.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case out := <-l.Outbound():
+		t.Fatalf("ack flushed before grace period: %+v", out)
+	default:
+	}
+
+	// Tick after the grace period: standalone ack must emit.
+	advance(AckFlushDelay)
+	if err := l.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case out := <-l.Outbound():
+		if !out.IsAck() || len(out.Ack.Acks) != 1 {
+			t.Errorf("unexpected outbound: %+v", out)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("time-based flush did not emit standalone ack")
+	}
+}
+
 func TestReadAfterCloseReturnsEOF(t *testing.T) {
 	t.Parallel()
 	l := New(Config{LocalSessionID: 1})
