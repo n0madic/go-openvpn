@@ -56,6 +56,16 @@ type Config struct {
 	TransitionWindow time.Duration
 	IngressBuffer    int // user-side ingress chan capacity; default 256
 
+	// DataActivityWarmup is the grace period after session-up during
+	// which dataActivityWatch never fires. Default 60s. Set to a very
+	// small value in tests.
+	DataActivityWarmup time.Duration
+	// DataActivityStuckThreshold is the max allowed gap between
+	// "user actively sending" and "real (non-PING) inbound data
+	// arriving" before the data-path is considered stuck and a
+	// RestartError is fired. Default 60s.
+	DataActivityStuckThreshold time.Duration
+
 	// PeerInfoVersion overrides the IV_VER field advertised in peer-info.
 	// Empty defaults to "2.6.0".
 	PeerInfoVersion string
@@ -98,6 +108,27 @@ type Session struct {
 	// decrypted data packet of ANY kind (real traffic or PING). Drives
 	// pingRestartWatch.
 	lastInbound atomic.Int64
+
+	// lastDataInbound is the UnixNano timestamp of the most recent
+	// successfully decrypted *non-PING* data packet. Drives
+	// dataActivityWatch — a watchdog independent of pingRestartWatch that
+	// detects the "tunnel-alive-at-protocol-level but data-path-stuck"
+	// failure mode (server PINGs keep lastInbound fresh while real traffic
+	// is silently dropped). Without this, the stuck tunnel never triggers
+	// AutoReconnect and the user must restart the process manually.
+	lastDataInbound atomic.Int64
+
+	// lastUserOutbound is the UnixNano timestamp of the most recent
+	// successful Session.WriteCtx (i.e. real user traffic, not keepalive
+	// PINGs which bypass Write). Paired with lastDataInbound to tell
+	// "the user is actively asking for data" apart from "the user is idle".
+	lastUserOutbound atomic.Int64
+
+	// Packet-flow counters (lifetime). Sampled by statsLogger.
+	statsForwarded   atomic.Uint64 // delivered to ingressCh
+	statsDroppedFull atomic.Uint64 // ingressCh full → dropped
+	statsPingIn      atomic.Uint64 // inbound PING filtered before ingressCh
+	statsOpenFailed  atomic.Uint64 // slot.Open returned an error
 
 	ingressCh chan []byte
 	ctx       context.Context
@@ -222,13 +253,20 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 	// its own ping-restart fires. Fill the gap with sensible defaults so
 	// "tunnel just stops carrying traffic" can't happen out of the box.
 	s.applyKeepaliveDefaults()
-	s.lastInbound.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	s.lastInbound.Store(now)
+	// Seed data-liveness timestamps so dataActivityWatch sees a healthy
+	// session at start and doesn't false-positive during warmup.
+	s.lastDataInbound.Store(now)
+	s.lastUserOutbound.Store(now)
 	if s.pushReply.PingInterval > 0 {
 		s.wg.Go(func() { s.keepaliveLoop(s.ctx) })
 	}
 	if s.pushReply.PingRestart > 0 {
 		s.wg.Go(func() { s.pingRestartWatch(s.ctx) })
 	}
+	s.wg.Go(func() { s.dataActivityWatch(s.ctx) })
+	s.wg.Go(func() { s.statsLogger(s.ctx) })
 
 	// Surface the full server-pushed option set for diagnostics. PUSH_REPLY
 	// carries no credentials (auth precedes it on the control channel), so
@@ -332,6 +370,11 @@ func (s *Session) WriteCtx(ctx context.Context, p []byte) (int, error) {
 	if err := s.transport.WritePacket(writeCtx, wire); err != nil {
 		return 0, err
 	}
+	// Track real-user activity so dataActivityWatch can tell "user
+	// actively sending but nothing coming back" apart from "session idle".
+	// Keepalive PINGs intentionally bypass this — they use
+	// transport.WritePacket directly.
+	s.lastUserOutbound.Store(time.Now().UnixNano())
 	return len(p), nil
 }
 
@@ -662,19 +705,42 @@ func (s *Session) handleDataIn(pkt []byte, kid uint8) {
 	}
 	ip, err := slot.Open(pkt)
 	if err != nil {
+		s.statsOpenFailed.Add(1)
 		s.log.Debug("data open failed", "kid", kid, "err", err)
 		return
 	}
 	// Any decryptable inbound packet (real traffic or PING) proves the peer
 	// is still alive — feed the ping-restart watchdog before deciding what
 	// to do with the payload.
-	s.lastInbound.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	s.lastInbound.Store(now)
 	if proto.IsPing(ip) {
+		s.statsPingIn.Add(1)
+		// Server-side keepalive PINGs are the half of the keepalive
+		// loop that's invisible from outbound logs alone. Logging them
+		// makes the "tunnel alive but data-path stuck" diagnostic real:
+		// if the operator sees inbound PINGs but no inbound data, that's
+		// exactly the failure mode dataActivityWatch is built to catch.
+		s.log.Debug("keepalive PING received", "kid", kid)
 		return
 	}
+	// Real (non-PING) inbound data — feed the data-liveness watchdog
+	// separately. PINGs alone are not enough to call the data path healthy
+	// (server PINGs can keep flowing even when the data path is dead).
+	s.lastDataInbound.Store(now)
+	// Non-blocking send: if the consumer (gVisor link endpoint reader) is
+	// slow or stuck, drop rather than block the entire session.readLoop.
+	// Blocking here was the second half of the "tunnel freezes but PINGs
+	// flow" failure: handleDataIn would stall on a full channel, the OS
+	// UDP receive buffer would back up, and the session would deadlock
+	// silently. Drop-on-full lets gVisor TCP fill the gaps via the standard
+	// retransmit path; lost UDP packets are the caller's problem same as
+	// on any real link.
 	select {
 	case s.ingressCh <- ip:
-	case <-s.ctx.Done():
+		s.statsForwarded.Add(1)
+	default:
+		s.statsDroppedFull.Add(1)
 	}
 }
 

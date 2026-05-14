@@ -490,6 +490,304 @@ func TestRequestRestartTriggersRestartError(t *testing.T) {
 	}
 }
 
+// TestKeepalivePingSkippedDuringOutbound verifies that keepaliveLoop
+// suppresses PING emission while the user is sending real outbound
+// data — matches upstream OpenVPN's `forward.c::process_outgoing_link`
+// behaviour where any outbound packet resets `ping_send_interval`.
+//
+// Before this change keepaliveLoop fired PINGs unconditionally on a
+// fixed ticker, producing redundant wire traffic during active
+// transfers. The fix is functional-correctness, not a bugfix —
+// upstream OpenVPN doesn't emit PINGs during active data flow either.
+func TestKeepalivePingSkippedDuringOutbound(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var staticKey [tlscrypt.StaticKeyLen]byte
+	rand.Read(staticKey[:])
+	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
+	cert, pool := genSelfSignedCert(t)
+	cTr, sTr := transport.MemoryPair()
+
+	ks := newKeepaliveServer()
+	ks.pingInterval = 1
+	ks.pingRestart = 60
+	ks.echoData = false
+
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- ks.run(ctx, sTr, serverWrap, cert, 20, "AES-256-GCM", t) }()
+
+	sess, err := session.DialWithTransport(ctx, session.Config{
+		Network:    "memory",
+		RemoteAddr: "memB",
+		TLSConfig: &tls.Config{
+			ServerName: "localhost", RootCAs: pool, MinVersion: tls.VersionTLS13,
+		},
+		TLSCryptV1: staticKey[:],
+		Ciphers:    []string{"AES-256-GCM"},
+		// Disable dataActivityWatch in this test — outbound-without-inbound
+		// would otherwise trigger it long before we finish counting PINGs.
+		DataActivityWarmup:         10 * time.Second,
+		DataActivityStuckThreshold: 10 * time.Second,
+	}, cTr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	// Drive outbound traffic at well above the ping interval so the
+	// "no outbound for at least interval" guard never lets a PING out.
+	stopWriting := make(chan struct{})
+	defer close(stopWriting)
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		payload := []byte("user-data")
+		for {
+			select {
+			case <-stopWriting:
+				return
+			case <-ticker.C:
+				_, _ = sess.Write(payload)
+			}
+		}
+	}()
+
+	// Count incoming PINGs at the server over 2.5 ping intervals.
+	deadline := time.After(2500 * time.Millisecond)
+	pings := 0
+loop:
+	for {
+		select {
+		case <-ks.recvPing:
+			pings++
+		case <-deadline:
+			break loop
+		}
+	}
+	if pings > 0 {
+		t.Fatalf("got %d PINGs while user was actively writing — keepalive guard not honoured", pings)
+	}
+}
+
+// TestDataActivityWatchTriggersRestartWhenStuck verifies the second-tier
+// liveness watchdog: when the user is actively sending traffic through
+// Session.Write but nothing real comes back (only the protocol-level
+// PINGs that keep pingRestartWatch happy), the data-activity watch
+// must fire RestartError so AutoReconnect can resurrect the tunnel.
+//
+// Regression for the "tunnel freezes but PINGs continue, AutoReconnect
+// never fires, user must restart the process manually" failure mode.
+func TestDataActivityWatchTriggersRestartWhenStuck(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var staticKey [tlscrypt.StaticKeyLen]byte
+	rand.Read(staticKey[:])
+	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
+	cert, pool := genSelfSignedCert(t)
+	cTr, sTr := transport.MemoryPair()
+
+	ks := newKeepaliveServer()
+	// Server pushes its own PINGs to us so pingRestartWatch stays happy.
+	// echoData = false — server gets our outbound but does NOT echo back.
+	// This is the canonical "stuck data path with PINGs flowing" case.
+	ks.pingInterval = 1
+	ks.pingRestart = 60
+	ks.echoData = false
+
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- ks.run(ctx, sTr, serverWrap, cert, 17, "AES-256-GCM", t) }()
+
+	sess, err := session.DialWithTransport(ctx, session.Config{
+		Network:    "memory",
+		RemoteAddr: "memB",
+		TLSConfig: &tls.Config{
+			ServerName: "localhost", RootCAs: pool, MinVersion: tls.VersionTLS13,
+		},
+		TLSCryptV1:                 staticKey[:],
+		Ciphers:                    []string{"AES-256-GCM"},
+		DataActivityWarmup:         200 * time.Millisecond,
+		DataActivityStuckThreshold: 500 * time.Millisecond,
+	}, cTr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	// Drive outbound traffic continuously so dataActivityWatch sees an
+	// "actively sending" user. Server silently drops these (no echo).
+	stopWriting := make(chan struct{})
+	defer close(stopWriting)
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		payload := []byte("test-user-data")
+		for {
+			select {
+			case <-stopWriting:
+				return
+			case <-ticker.C:
+				_, _ = sess.Write(payload)
+			}
+		}
+	}()
+
+	// A Read should eventually surface *RestartError as the watchdog
+	// closes the session.
+	buf := make([]byte, 1500)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := sess.Read(buf)
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		var re *session.RestartError
+		if !errors.As(err, &re) {
+			t.Fatalf("got %T (%v), want *RestartError", err, err)
+		}
+		if re.Reason != "data-activity stuck" {
+			t.Errorf("Reason = %q, want %q", re.Reason, "data-activity stuck")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("dataActivityWatch did not fire RestartError within 3s")
+	}
+}
+
+// TestDataActivityWatchSurvivesIdle verifies that the data-activity
+// watch does NOT false-positive when the user is simply idle — no
+// outbound traffic means we don't expect inbound either.
+func TestDataActivityWatchSurvivesIdle(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var staticKey [tlscrypt.StaticKeyLen]byte
+	rand.Read(staticKey[:])
+	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
+	cert, pool := genSelfSignedCert(t)
+	cTr, sTr := transport.MemoryPair()
+
+	ks := newKeepaliveServer()
+	ks.pingInterval = 1
+	ks.pingRestart = 60
+	ks.echoData = false
+
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- ks.run(ctx, sTr, serverWrap, cert, 18, "AES-256-GCM", t) }()
+
+	sess, err := session.DialWithTransport(ctx, session.Config{
+		Network:    "memory",
+		RemoteAddr: "memB",
+		TLSConfig: &tls.Config{
+			ServerName: "localhost", RootCAs: pool, MinVersion: tls.VersionTLS13,
+		},
+		TLSCryptV1:                 staticKey[:],
+		Ciphers:                    []string{"AES-256-GCM"},
+		DataActivityWarmup:         100 * time.Millisecond,
+		DataActivityStuckThreshold: 300 * time.Millisecond,
+	}, cTr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	// Sit idle past the threshold. Watchdog should NOT fire because
+	// we're not sending anything.
+	buf := make([]byte, 1500)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := sess.Read(buf)
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("session closed during idle period: %v", err)
+	case <-time.After(1500 * time.Millisecond):
+		// Expected: watchdog stays quiet, Read keeps blocking.
+	}
+}
+
+// TestHandleDataInDropsWhenIngressFull verifies that handleDataIn no
+// longer blocks the session.readLoop when the ingress channel is full.
+// Before the fix this was a silent deadlock: the consumer (gVisor link
+// reader) stalls → ingressCh fills → handleDataIn blocks indefinitely
+// → only PINGs (which return before the send) propagate through.
+func TestHandleDataInDropsWhenIngressFull(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var staticKey [tlscrypt.StaticKeyLen]byte
+	rand.Read(staticKey[:])
+	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
+	cert, pool := genSelfSignedCert(t)
+	cTr, sTr := transport.MemoryPair()
+
+	ks := newKeepaliveServer()
+	ks.pingInterval = 0
+	ks.pingRestart = 0
+	ks.echoData = false
+
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- ks.run(ctx, sTr, serverWrap, cert, 19, "AES-256-GCM", t) }()
+
+	sess, err := session.DialWithTransport(ctx, session.Config{
+		Network:    "memory",
+		RemoteAddr: "memB",
+		TLSConfig: &tls.Config{
+			ServerName: "localhost", RootCAs: pool, MinVersion: tls.VersionTLS13,
+		},
+		TLSCryptV1:    staticKey[:],
+		Ciphers:       []string{"AES-256-GCM"},
+		IngressBuffer: 4, // tiny so we fill it quickly
+	}, cTr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Flood the server-injected channel without anyone reading from
+	// the session. After the fix, extra packets get dropped (counter
+	// increments) and the session remains responsive. Before the fix,
+	// session.readLoop would block on the channel send and the test
+	// would hang.
+	payload := []byte("payload-to-drop")
+	const sendCount = 64
+	for range sendCount {
+		select {
+		case ks.inject <- append([]byte(nil), payload...):
+		case <-time.After(1 * time.Second):
+			t.Fatal("server inject channel blocked — readLoop likely deadlocked")
+		}
+	}
+
+	// Give the readLoop time to process all of them (drop or forward).
+	time.Sleep(300 * time.Millisecond)
+
+	// Session must still be responsive: a fresh Write should succeed.
+	doneWrite := make(chan error, 1)
+	go func() {
+		_, err := sess.Write([]byte("hello"))
+		doneWrite <- err
+	}()
+	select {
+	case err := <-doneWrite:
+		if err != nil {
+			t.Fatalf("Write failed after flood: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Write blocked after ingress flood — readLoop deadlocked despite fix")
+	}
+}
+
 // TestPingRestartTriggersRestart verifies that prolonged silence on the data
 // channel (exceeding ping-restart) surfaces as *RestartError from Read so the
 // upper layer (openvpn.Client) can drive AutoReconnect.

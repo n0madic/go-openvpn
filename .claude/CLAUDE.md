@@ -94,9 +94,15 @@ internal/session         Orchestrator. Goroutines per active session:
                          INFO dispatcher), keepaliveLoop (sends PING magic
                          every PushReply.PingInterval), pingRestartWatch
                          (closes session with *RestartError after
-                         PushReply.PingRestart of inbound silence). Holds
-                         per-key-id slot + layer tables for rekey transition
-                         windows.
+                         PushReply.PingRestart of inbound silence),
+                         dataActivityWatch (second-tier liveness watchdog
+                         that fires when the user is actively sending but
+                         no real non-PING inbound data arrives — closes
+                         the "tunnel alive but data path stuck" failure
+                         mode that pingRestartWatch alone misses),
+                         statsLogger (periodic packet-flow counter dump).
+                         Holds per-key-id slot + layer tables for rekey
+                         transition windows.
 ```
 
 ### Public API (`openvpn.go`, `conn.go`)
@@ -171,17 +177,32 @@ internal/session         Orchestrator. Goroutines per active session:
    always win when present. `session.keepaliveLoop` emits the 16-byte
    `proto.PingMagic` (`2a 18 7b f3 64 1e b4 cb 07 ed 2d 0a 98 1f c7 48`,
    per `ping.c::ping_string`) as a regular P_DATA_V2 packet via the
-   active slot. The first nibble (`2`) is not a valid IP version, so
-   `pkg/netstack`'s IPv4/IPv6 demux drops them naturally; `handleDataIn`
-   also filters them so direct `Tunnel.Read` consumers don't see them.
-   `session.pingRestartWatch` is the standard OpenVPN watchdog: `now -
-   lastInbound >= ping-restart` ⇒ `setCloseErr(&RestartError{...})` ⇒
-   `Close()` ⇒ AutoReconnect. Don't gate the loops on push-reply being
-   non-zero — that's the failure mode for providers that don't push.
-   Keepalive `WritePacket` errors are non-fatal: log at Debug and
-   `continue` to the next tick. Bailing out on the first ENOBUFS would
-   silently mute keepalives for the rest of the session (which is the
-   second half of the production failure we hunted — see point 8).
+   active slot. Crucially, **PING is suppressed while any outbound data
+   has gone out in the last `PingInterval`** — matches upstream OpenVPN's
+   `forward.c::process_outgoing_link` which resets `ping_send_interval`
+   on every outbound. Loop samples at `interval/4` (≥250ms) so the next
+   PING fires promptly once the silence threshold is crossed. PINGs
+   themselves count as outbound (loop-local `lastPingSent`); user data
+   resets it via `s.lastUserOutbound`. **`lastUserOutbound` is set ONLY
+   by `Session.WriteCtx`, NOT by `keepaliveLoop`** — that way
+   `dataActivityWatch` (see point 9) keeps treating PINGs as protocol
+   overhead, not as user activity. The first nibble (`2`) of PingMagic
+   is not a valid IP version, so `pkg/netstack`'s IPv4/IPv6 demux
+   drops them naturally; `handleDataIn` also filters them so direct
+   `Tunnel.Read` consumers don't see them. `session.pingRestartWatch`
+   is the standard OpenVPN watchdog: `now - lastInbound >= ping-restart`
+   ⇒ `setCloseErr(&RestartError{...})` ⇒ `Close()` ⇒ AutoReconnect.
+   Don't gate the loops on push-reply being non-zero — that's the
+   failure mode for providers that don't push. Keepalive `WritePacket`
+   errors are non-fatal: log at Debug and `continue` to the next tick.
+   Bailing out on the first ENOBUFS would silently mute keepalives for
+   the rest of the session (which is the second half of the production
+   failure we hunted — see point 8). **`ping_in_total=0` in stats is
+   normal, not a bug**: an OpenVPN server's `ping_send_timeout` only
+   fires when the server has no outbound, so during active user traffic
+   the server never PINGs us — `pingRestartWatch` survives anyway
+   because user data updates `lastInbound` (link-options.rst: "ping ...
+   or other packet").
 
 8. **macOS default `SO_SNDBUF` (~9 KiB) is too small for burst load.**
    gVisor TCP/UDP under heavy concurrent traffic (speedtest, parallel
@@ -194,6 +215,43 @@ internal/session         Orchestrator. Goroutines per active session:
    (kernel silently clamps to `kern.ipc.maxsockbuf` on macOS /
    `net.core.wmem_max` on Linux). Don't remove this without measuring
    loss under burst load.
+
+9. **`pingRestartWatch` alone is not enough — server PINGs can fake
+   liveness.** Servers configured with `keepalive N M` send their own
+   PINGs to the client every N seconds. Our `handleDataIn` updates
+   `lastInbound` on **any** decrypted inbound packet, *including* the
+   PINGs it then filters out. Several failure modes (gVisor link
+   endpoint stall, server-side data-path glitch, intermediate device
+   silently dropping user traffic) leave PINGs flowing while real
+   bytes are silently dropped — `pingRestartWatch` never fires,
+   `AutoReconnect` never kicks in, and the user has to restart the
+   process manually. `session.dataActivityWatch` is the second-tier
+   watchdog: it tracks `lastDataInbound` (non-PING only, updated in
+   `handleDataIn`) and `lastUserOutbound` (updated in `Session.WriteCtx`,
+   intentionally NOT touched by `keepaliveLoop` which goes direct to
+   `transport.WritePacket`). When the user is actively sending
+   (`sinceOut < threshold`) but no real data has arrived in
+   `DataActivityStuckThreshold` (default 60s), it fires `RestartError`
+   the same way pingRestartWatch does, surfacing through `Read`/`Write`
+   for AutoReconnect. Thresholds are configurable via Config so tests
+   can run with sub-second windows. Don't unify with pingRestartWatch
+   — the two are intentionally independent so we get one of them no
+   matter which signal is fake.
+
+10. **`handleDataIn` must NOT block on `ingressCh`.** The
+    decrypt-and-forward path runs inside `session.readLoop`'s single
+    goroutine. If the consumer (gVisor link endpoint reader) stalls,
+    `ingressCh` fills (default capacity 256), and a blocking
+    `s.ingressCh <- ip` would freeze `readLoop` — which would then
+    stop pulling encrypted packets off the OS UDP socket, back-press
+    until the OS buffer overflowed, and silently drop everything
+    including future PINGs (round-trip: tunnel goes from "looks alive"
+    to "actually dead" with no recovery signal). The `select` has a
+    `default` branch that increments `statsDroppedFull` and discards
+    the IP packet; standard network behaviour, gVisor TCP fills any
+    gaps via retransmits. `statsLogger` logs at WARN when drops appear
+    so the operator sees it. PINGs `return` before the select so they
+    never participate in the back-pressure.
 
 ### gVisor netstack adapter (`pkg/netstack/`)
 
