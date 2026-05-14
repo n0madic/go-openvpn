@@ -37,6 +37,13 @@ const (
 	// AckFlushDelay is the grace period before sending a standalone P_ACK_V1
 	// when no piggyback opportunity arrived.
 	AckFlushDelay = 50 * time.Millisecond
+	// FastRetransmitThreshold is the number of ACKs we must observe for
+	// packets with strictly higher msgPIDs before we treat a still-pending
+	// packet as lost and retransmit it without waiting for its backoff
+	// timer. Mirrors TCP's three-duplicate-ACK heuristic — in lossy
+	// uplinks (mobile, Wi-Fi) it cuts handshake/rekey latency by avoiding
+	// the 1-second initial backoff. Idea borrowed from ooni/minivpn.
+	FastRetransmitThreshold = 3
 	// TLSChunkSize caps the body bytes per outbound P_CONTROL_V1. Adds
 	// tls-crypt prefix (~45 bytes) + ack/sid overhead → fits in <1300 bytes
 	// on-wire which is below typical 1500-byte MTU.
@@ -142,6 +149,12 @@ type pendingPkt struct {
 	body     []byte
 	sentAt   time.Time
 	attempts int
+	// higherACKs counts how many times we have observed an inbound ACK
+	// for some packet with msgPID > this one's. Once it reaches
+	// FastRetransmitThreshold, Tick will resend without waiting for the
+	// backoff timer — TCP-style fast retransmit. Reset to zero after
+	// each retransmit so the counter restarts from the new send.
+	higherACKs int
 }
 
 // New constructs a Layer.
@@ -365,6 +378,7 @@ func (l *Layer) HandleInbound(in InPacket) error {
 	if in.Opcode == proto.PAckV1 {
 		for _, ack := range in.Ack.Acks {
 			delete(l.txQueue, ack)
+			l.bumpHigherACKsLocked(ack)
 		}
 		l.queueCond.Broadcast()
 		return nil
@@ -373,6 +387,7 @@ func (l *Layer) HandleInbound(in InPacket) error {
 	// Piggybacked inbound acks: they acknowledge our outbound packets.
 	for _, ack := range in.Payload.Acks {
 		delete(l.txQueue, ack)
+		l.bumpHigherACKsLocked(ack)
 	}
 	if len(in.Payload.Acks) > 0 {
 		l.queueCond.Broadcast()
@@ -411,6 +426,19 @@ func (l *Layer) HandleInbound(in InPacket) error {
 	}
 	l.addPendingAckLocked(msgPID)
 	return nil
+}
+
+// bumpHigherACKsLocked credits an inbound ACK for msgPID=acked toward
+// the fast-retransmit counter of every still-pending packet whose
+// msgPID is strictly lower. The acked packet itself has already been
+// removed from txQueue by the caller, so it never bumps its own
+// counter. Caller must hold mu.
+func (l *Layer) bumpHigherACKsLocked(acked uint32) {
+	for pid, pkt := range l.txQueue {
+		if pid < acked {
+			pkt.higherACKs++
+		}
+	}
 }
 
 func (l *Layer) addPendingAckLocked(msgPID uint32) {
@@ -538,10 +566,18 @@ func (l *Layer) Tick() error {
 	now := l.cfg.Clock()
 
 	for _, pkt := range l.txQueue {
-		backoffShift := min(pkt.attempts-1, 4)
-		backoff := min(InitialRetransmit<<backoffShift, MaxRetransmit)
-		if now.Sub(pkt.sentAt) < backoff {
-			continue
+		// Fast retransmit short-circuits the backoff timer when enough
+		// later packets have already been ACKed — strong evidence that
+		// this one was lost in flight rather than just slow. Still
+		// subject to MaxRetransmits so a one-way black hole can't drive
+		// an infinite resend.
+		fast := pkt.higherACKs >= FastRetransmitThreshold
+		if !fast {
+			backoffShift := min(pkt.attempts-1, 4)
+			backoff := min(InitialRetransmit<<backoffShift, MaxRetransmit)
+			if now.Sub(pkt.sentAt) < backoff {
+				continue
+			}
 		}
 		if pkt.attempts >= MaxRetransmits {
 			return ErrTooManyRetransmits
@@ -551,6 +587,7 @@ func (l *Layer) Tick() error {
 		}
 		pkt.attempts++
 		pkt.sentAt = now
+		pkt.higherACKs = 0
 	}
 
 	if !l.ackPendingSince.IsZero() && now.Sub(l.ackPendingSince) >= AckFlushDelay {

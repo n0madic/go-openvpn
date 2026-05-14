@@ -246,6 +246,69 @@ func TestDeterministicDropDoubleSamePID(t *testing.T) {
 	}
 }
 
+// TestFastRetransmitEngages verifies that the fast-retransmit path
+// (triple-ACK heuristic) recovers a dropped packet well before the
+// 1-second initial backoff window would expire. Concretely, sending a
+// payload with at least FastRetransmitThreshold+1 chunks after a
+// single drop must complete in noticeably under the backoff time.
+func TestFastRetransmitEngages(t *testing.T) {
+	t.Parallel()
+	client, server := newLayerPair(t)
+	// Drop just msgPID=2 (the first P_CONTROL_V1 chunk after hard
+	// reset). Following chunks will be ACKed and credit the lost
+	// packet's higherACKs counter until FastRetransmitThreshold (3)
+	// is reached, triggering an immediate retransmit.
+	drops := newDropMap(2)
+	cancel, wg := runLinksWithDrops(t, client, server, drops, nil)
+	defer wg.Wait()
+	defer cancel()
+
+	waitHardResetDone(t, client, server)
+	// 8 chunks total — drop is at chunk 1, chunks 2..7 must ACK to
+	// supply at least 3 higher-ACK credits.
+	payload := bytes.Repeat([]byte{0xAA, 0x55}, 4800) // ~9.6 KB → 8 chunks
+	start := time.Now()
+	streamAndVerify(t, client, server, payload, 5*time.Second)
+	elapsed := time.Since(start)
+	// Without fast retransmit, the dropped packet would wait the full
+	// InitialRetransmit (1s) before being resent. Allow generous head
+	// room for Tick cadence and link goroutine scheduling but stay
+	// well below the backoff.
+	if elapsed >= 500*time.Millisecond {
+		t.Errorf("delivery took %s; fast retransmit appears not to have engaged "+
+			"(backoff would yield ≥1s)", elapsed)
+	}
+	if drops.droppedTot.Load() != 1 {
+		t.Errorf("expected exactly 1 drop, got %d", drops.droppedTot.Load())
+	}
+}
+
+// TestFastRetransmitDoesNotFireBelowThreshold verifies the heuristic
+// stays inert when fewer than FastRetransmitThreshold higher ACKs have
+// accumulated — the dropped packet must wait for backoff.
+func TestFastRetransmitDoesNotFireBelowThreshold(t *testing.T) {
+	t.Parallel()
+	client, server := newLayerPair(t)
+	drops := newDropMap(2)
+	cancel, wg := runLinksWithDrops(t, client, server, drops, nil)
+	defer wg.Wait()
+	defer cancel()
+
+	waitHardResetDone(t, client, server)
+	// Only 3 chunks total. Dropped chunk is msgPID=2 (chunk #1);
+	// remaining chunks 2 and 3 supply just 2 higher ACKs — one short
+	// of FastRetransmitThreshold. Recovery must wait for the 1-second
+	// backoff before the dropped packet is resent.
+	payload := bytes.Repeat([]byte{0x11, 0x22}, 1800) // ~3.6 KB → 3 chunks
+	start := time.Now()
+	streamAndVerify(t, client, server, payload, 5*time.Second)
+	elapsed := time.Since(start)
+	if elapsed < InitialRetransmit-100*time.Millisecond {
+		t.Errorf("delivery took %s; fast retransmit fired with only 2 higher ACKs "+
+			"(threshold is %d)", elapsed, FastRetransmitThreshold)
+	}
+}
+
 // TestDropExhaustsRetransmits drops msgPID=2 enough times to exceed
 // MaxRetransmits — Tick must return ErrTooManyRetransmits and the
 // stream must NOT complete.

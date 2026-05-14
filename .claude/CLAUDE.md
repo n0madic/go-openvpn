@@ -77,7 +77,9 @@ internal/transport       UDP raw / TCP-with-16BE-length-prefix (PacketConn)
 internal/tlscrypt        AES-256-CTR + HMAC-SHA256 wrapper (v1) +
                          tls-crypt-v2 client bundle (Kc + WKc)
 internal/reliable        Per-key-id reliability shim: msg_pid, retransmit
-                         (1s→16s exp backoff, 8 retries), ACK piggyback/standalone,
+                         (1s→16s exp backoff, 8 retries), TCP-style fast
+                         retransmit (3 higher-msgPID ACKs short-circuit
+                         the backoff timer), ACK piggyback/standalone,
                          in-order delivery to crypto/tls via reliable.Adapter
 internal/control         Handshake state machine: HARD_RESET → TLS over
                          reliable.Adapter → KEY_METHOD 2 → PUSH_REQUEST →
