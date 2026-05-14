@@ -121,9 +121,10 @@ func newRekeyManager(s *Session, transitionWindow time.Duration) *rekeyManager {
 func (m *rekeyManager) PerformSoftReset(ctx context.Context) error {
 	// Reject on already-closing sessions before doing any work. Without this
 	// check, an externally-triggered rekey (Client.Rekey / Write-driven
-	// forced rekey) that races with Close could race s.wg.Add against
-	// s.wg.Wait. Belt-and-suspenders: the retire goroutine is also spawned
-	// outside s.wg now, but this short-circuits earlier.
+	// forced rekey) that races with Close could lose the new layer's pumps
+	// after s.workers has begun shutdown. Belt-and-suspenders: the retire
+	// goroutine is also spawned outside s.workers, but this short-circuits
+	// earlier.
 	if m.s.closed.Load() {
 		return ErrClosed
 	}
@@ -248,10 +249,10 @@ func (m *rekeyManager) PerformSoftReset(ctx context.Context) error {
 	// window. We keep the old slot accepting inbound for the duration to
 	// avoid drops on in-flight packets the server hasn't yet rotated.
 	//
-	// Deliberately NOT in s.wg: PerformSoftReset can be called from user
-	// goroutines (Client.Rekey, Write-driven forced rekey) that are not
-	// part of s.wg, so adding to wg here could race with shutdown's
-	// wg.Wait. retireAfter self-terminates on s.ctx.Done().
+	// Deliberately NOT in s.workers: PerformSoftReset can be called from
+	// user goroutines (Client.Rekey, Write-driven forced rekey) that are
+	// not part of s.workers, so registering this here could race with
+	// shutdown's Wait. retireAfter self-terminates on s.ctx.Done().
 	go m.retireAfter(oldKID)
 	return nil
 }

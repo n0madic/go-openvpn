@@ -86,7 +86,16 @@ internal/data            AEAD seal/open, KeySlot (kid+peerID+ciphers+sendPID+rep
                          sliding-bitmap replay protection
 internal/proto           Opcode encoding, packet headers, KEY_METHOD 2 codec,
                          PUSH_REPLY parser, peer-info builder
-internal/session         Orchestrator. Goroutines per active session:
+internal/workers         Tiny lifecycle manager for the session's
+                         long-running goroutines: named workers, panic
+                         recovery (logged, triggers Shutdown — process
+                         doesn't crash), sync.Once-guarded shutdown,
+                         shared cancellation context. Used by
+                         internal/session so all of its goroutines share
+                         one ctx + WaitGroup with uniform observability.
+internal/session         Orchestrator. Goroutines per active session
+                         (all managed by workers.Manager — named for
+                         logs, recovered on panic, cancelled together):
                          readLoop (demuxes incoming by opcode+key-id),
                          writeLoop + tickLoop (per reliable.Layer, so 2 per
                          key-id), rekeyWatch (rekey trigger watchdog),

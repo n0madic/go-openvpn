@@ -208,9 +208,9 @@ func (s *Session) statsLogger(ctx context.Context) {
 // The "user actively sending" guard prevents spurious restarts during
 // idle periods (no outbound → no expectation of inbound).
 //
-// Closing is dispatched on a fresh goroutine so this watcher (inside
-// s.wg) returns before Close calls s.wg.Wait, avoiding a self-wait
-// deadlock — same pattern as pingRestartWatch.
+// Closing is dispatched on a fresh goroutine so this watcher (managed
+// by s.workers) returns before Close calls s.workers.Wait, avoiding a
+// self-wait deadlock — same pattern as pingRestartWatch.
 func (s *Session) dataActivityWatch(ctx context.Context) {
 	warmup := s.cfg.DataActivityWarmup
 	if warmup <= 0 {
@@ -274,8 +274,8 @@ func (s *Session) dataActivityWatch(ctx context.Context) {
 // PushReply.PingRestart. Mirrors OpenVPN's ping-restart semantic.
 //
 // Closing is dispatched on a fresh goroutine so this watcher (which itself
-// lives inside s.wg) returns before Close calls s.wg.Wait, avoiding a
-// self-wait deadlock.
+// is managed by s.workers) returns before Close calls s.workers.Wait,
+// avoiding a self-wait deadlock.
 func (s *Session) pingRestartWatch(ctx context.Context) {
 	restart := s.pushReply.PingRestart
 	if restart <= 0 {
@@ -306,8 +306,8 @@ func (s *Session) pingRestartWatch(ctx context.Context) {
 			s.log.Warn("ping-restart fired, requesting reconnect",
 				"idle", idle, "threshold", restart)
 			s.setCloseErr(&RestartError{Reason: "ping-restart timeout"})
-			// Detach Close from this goroutine so s.wg.Wait inside Close
-			// doesn't deadlock waiting on us.
+			// Detach Close from this goroutine so s.workers.Wait inside
+			// Close doesn't deadlock waiting on us.
 			go func() { _ = s.Close() }()
 			return
 		}

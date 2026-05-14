@@ -177,6 +177,13 @@ func (l *Layer) SetKeyID(k uint8) {
 	l.mu.Unlock()
 }
 
+// KeyID returns the key-id used in outbound packets.
+func (l *Layer) KeyID() uint8 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.keyID
+}
+
 // RemoteSessionID returns the peer's session-id if known.
 func (l *Layer) RemoteSessionID() (uint64, bool) {
 	l.mu.Lock()

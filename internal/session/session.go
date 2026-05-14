@@ -29,6 +29,7 @@ import (
 	"github.com/n0madic/go-openvpn/internal/reliable"
 	"github.com/n0madic/go-openvpn/internal/tlscrypt"
 	"github.com/n0madic/go-openvpn/internal/transport"
+	"github.com/n0madic/go-openvpn/internal/workers"
 )
 
 // Config holds everything needed to bring up a session.
@@ -132,10 +133,15 @@ type Session struct {
 	statsStrayHandshake atomic.Uint64 // tls-crypt unwrap dropped — stray fresh handshake
 
 	ingressCh chan []byte
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	closed    atomic.Bool
+	// workers owns the cancellation context shared by every long-running
+	// session goroutine (read/write/tick/watch loops). Replaces the
+	// ad-hoc ctx+cancel+wg trio with a single API surface that adds
+	// panic recovery and per-worker logging.
+	workers *workers.Manager
+	// ctx is a cached copy of workers.Context() so call sites that
+	// previously read s.ctx keep working unchanged.
+	ctx    context.Context
+	closed atomic.Bool
 }
 
 // Dial brings up the session.
@@ -183,7 +189,6 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 	// resulting session would die when that context expired. The owning
 	// openvpn.Client links external cancellation to Session.Close() via
 	// its own watcher.
-	sCtx, cancel := context.WithCancel(context.Background())
 	s := &Session{
 		cfg:       cfg,
 		log:       log,
@@ -194,9 +199,13 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 		layers:    newLayerTable(),
 		tlsConfig: cfg.TLSConfig,
 		ingressCh: make(chan []byte, cfgIngressBuffer(cfg)),
-		ctx:       sCtx,
-		cancel:    cancel,
 	}
+	s.workers = workers.NewManager(context.Background(), log,
+		workers.WithPanicHandler(func(name string, r any) {
+			s.setCloseErr(fmt.Errorf("session: worker %q panicked: %v", name, r))
+		}),
+	)
+	s.ctx = s.workers.Context()
 	s.layers.Install(0, initialLayer)
 
 	// Bind the session lifetime ctx to the transport once, so per-call
@@ -204,11 +213,11 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 	// Transports that don't implement the optional interface (e.g. memory
 	// transport in tests) keep their per-call behaviour.
 	if br, ok := tr.(interface{ BindLifetimeCtx(context.Context) }); ok {
-		br.BindLifetimeCtx(sCtx)
+		br.BindLifetimeCtx(s.ctx)
 	}
 
 	// Start the read loop (demuxes by opcode + key-id across all layers).
-	s.wg.Go(s.readLoop)
+	s.workers.Go("readLoop", func(context.Context) { s.readLoop() })
 	// Per-layer write+tick loops for key-id 0.
 	s.startLayerPumps(initialLayer)
 
@@ -249,7 +258,7 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 	// Rekey manager + watchdog.
 	s.rekeyMgr = newRekeyManager(s, cfg.TransitionWindow)
 	rstate := newRekeyState(cfg.Reneg, nil)
-	s.wg.Go(func() { s.rekeyWatch(s.ctx, rstate) })
+	s.workers.Go("rekeyWatch", func(ctx context.Context) { s.rekeyWatch(ctx, rstate) })
 
 	// Keepalive: emit OpenVPN PINGs at the negotiated interval so the peer
 	// (and any UDP NAT on the path) sees us as alive; close with a
@@ -269,13 +278,13 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 	s.lastDataInbound.Store(now)
 	s.lastUserOutbound.Store(now)
 	if s.pushReply.PingInterval > 0 {
-		s.wg.Go(func() { s.keepaliveLoop(s.ctx) })
+		s.workers.Go("keepaliveLoop", s.keepaliveLoop)
 	}
 	if s.pushReply.PingRestart > 0 {
-		s.wg.Go(func() { s.pingRestartWatch(s.ctx) })
+		s.workers.Go("pingRestartWatch", s.pingRestartWatch)
 	}
-	s.wg.Go(func() { s.dataActivityWatch(s.ctx) })
-	s.wg.Go(func() { s.statsLogger(s.ctx) })
+	s.workers.Go("dataActivityWatch", s.dataActivityWatch)
+	s.workers.Go("statsLogger", s.statsLogger)
 
 	// Surface the full server-pushed option set for diagnostics. PUSH_REPLY
 	// carries no credentials (auth precedes it on the control channel), so
@@ -486,7 +495,7 @@ func (s *Session) installTLSConn(c *tls.Conn) {
 		_ = prev.Close()
 	}
 	if c != nil {
-		s.wg.Go(func() { s.controlChannelReader(c) })
+		s.workers.Go("controlChannelReader", func(context.Context) { s.controlChannelReader(c) })
 	}
 }
 
@@ -679,7 +688,7 @@ func parseRestart(msg string) *RestartError {
 }
 
 func (s *Session) shutdown() {
-	s.cancel()
+	s.workers.Shutdown()
 	// Close all layers (cascades into their write/tick goroutines via
 	// closed Outbound channel). Key-id is 3 bits, so 0..7 covers all slots.
 	for kid := range uint8(8) {
@@ -690,7 +699,7 @@ func (s *Session) shutdown() {
 	if s.transport != nil {
 		_ = s.transport.Close()
 	}
-	s.wg.Wait()
+	s.workers.Wait()
 }
 
 // readLoop demuxes inbound packets by opcode + key-id.
@@ -837,8 +846,9 @@ func (s *Session) handleControlIn(pkt []byte, opcode proto.Opcode, kid uint8) {
 // reliable.Layer. They exit when the layer's Outbound chan closes (i.e.
 // when the layer is Close()d).
 func (s *Session) startLayerPumps(layer *reliable.Layer) {
-	s.wg.Go(func() { s.writeLoop(layer) })
-	s.wg.Go(func() { s.tickLoop(layer) })
+	kid := layer.KeyID()
+	s.workers.Go(fmt.Sprintf("writeLoop[kid=%d]", kid), func(context.Context) { s.writeLoop(layer) })
+	s.workers.Go(fmt.Sprintf("tickLoop[kid=%d]", kid), func(context.Context) { s.tickLoop(layer) })
 }
 
 func (s *Session) writeLoop(layer *reliable.Layer) {
