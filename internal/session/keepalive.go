@@ -38,6 +38,27 @@ const (
 	// path is stuck and trigger a reconnect — pingRestartWatch alone
 	// misses this because server-side PINGs keep lastInbound fresh.
 	dataActivityStuckThreshold = 60 * time.Second
+
+	// hardResetCheckPeriod is how often hardResetWatch samples the
+	// statsHardResetIn counter.
+	hardResetCheckPeriod = 5 * time.Second
+
+	// hardResetThreshold is the number of inbound
+	// P_CONTROL_HARD_RESET_SERVER_V2 events tolerated before we force
+	// AutoReconnect. The server only sends HARD_RESET when it has lost
+	// state; a single retry is benign (network burble during initial
+	// handshake), but 3+ within a short window means the server has
+	// definitively forgotten our session and we're now in a useless
+	// "we think we're connected, server doesn't" zombie. Typical
+	// after-laptop-sleep aftermath.
+	hardResetThreshold = 3
+
+	// wakeDetectGapThreshold is the minimum tick gap (relative to the
+	// expected sampling period) that we treat as evidence the host slept.
+	// macOS App Nap and ordinary scheduler delays produce gaps under a
+	// few seconds; anything beyond this is almost certainly suspend.
+	wakeDetectPeriod       = 1 * time.Second
+	wakeDetectGapThreshold = 10 * time.Second
 )
 
 // applyKeepaliveDefaults fills in ping/ping-restart on the parsed PushReply
@@ -144,7 +165,7 @@ const statsLogPeriod = 30 * time.Second
 func (s *Session) statsLogger(ctx context.Context) {
 	ticker := time.NewTicker(statsLogPeriod)
 	defer ticker.Stop()
-	var prevForwarded, prevDropped, prevPingIn, prevOpenFailed, prevStray uint64
+	var prevForwarded, prevDropped, prevPingIn, prevOpenFailed, prevStray, prevHardReset uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -155,24 +176,29 @@ func (s *Session) statsLogger(ctx context.Context) {
 			pingIn := s.statsPingIn.Load()
 			openFailed := s.statsOpenFailed.Load()
 			stray := s.statsStrayHandshake.Load()
+			hardReset := s.statsHardResetIn.Load()
 			deltaForwarded := forwarded - prevForwarded
 			deltaDropped := dropped - prevDropped
 			deltaPingIn := pingIn - prevPingIn
 			deltaOpenFailed := openFailed - prevOpenFailed
 			deltaStray := stray - prevStray
+			deltaHardReset := hardReset - prevHardReset
 			prevForwarded = forwarded
 			prevDropped = dropped
 			prevPingIn = pingIn
 			prevOpenFailed = openFailed
 			prevStray = stray
+			prevHardReset = hardReset
 			// Time since last successful inbound — the strongest signal
 			// that the tunnel is or isn't carrying real bytes RIGHT NOW.
 			sinceLastIn := now.Sub(time.Unix(0, s.lastDataInbound.Load()))
 			level := slog.LevelDebug
 			// Anything unusual deserves WARN so it surfaces without -v:
-			// ingress drops, decrypt failures, or a stuck data path (no
-			// new forwarded packets for at least one interval).
-			if deltaDropped > 0 || deltaOpenFailed > 0 || (deltaForwarded == 0 && sinceLastIn > statsLogPeriod) {
+			// ingress drops, decrypt failures, server-driven re-handshake
+			// attempts, or a stuck data path (no new forwarded packets
+			// for at least one interval).
+			if deltaDropped > 0 || deltaOpenFailed > 0 || deltaHardReset > 0 ||
+				(deltaForwarded == 0 && sinceLastIn > statsLogPeriod) {
 				level = slog.LevelWarn
 			}
 			s.log.Log(ctx, level, "session stats",
@@ -182,12 +208,14 @@ func (s *Session) statsLogger(ctx context.Context) {
 				"delta_ping_in", deltaPingIn,
 				"delta_open_failed", deltaOpenFailed,
 				"delta_stray_handshake", deltaStray,
+				"delta_hard_reset_in", deltaHardReset,
 				"since_last_data_in", sinceLastIn.Round(time.Millisecond),
 				"forwarded_total", forwarded,
 				"dropped_total", dropped,
 				"ping_in_total", pingIn,
 				"open_failed_total", openFailed,
 				"stray_handshake_total", stray,
+				"hard_reset_in_total", hardReset,
 			)
 		}
 	}
@@ -308,6 +336,79 @@ func (s *Session) pingRestartWatch(ctx context.Context) {
 			s.setCloseErr(&RestartError{Reason: "ping-restart timeout"})
 			// Detach Close from this goroutine so s.workers.Wait inside
 			// Close doesn't deadlock waiting on us.
+			go func() { _ = s.Close() }()
+			return
+		}
+	}
+}
+
+// hardResetWatch closes the session with a *RestartError when the server
+// keeps sending P_CONTROL_HARD_RESET_SERVER_V2 packets — that's the server
+// telling us "I lost your session, please re-handshake". `handleControlIn`
+// counts these in statsHardResetIn but otherwise drops them; without this
+// watch the client would stay in a useless "we think we're connected,
+// server doesn't" zombie state until the user notices and restarts.
+//
+// Threshold-based rather than instant so a single retry during a network
+// burble doesn't reset the session needlessly. hardResetThreshold (3)
+// within a sampling window is conclusive evidence the server has
+// forgotten us — typical aftermath of a laptop suspend/resume cycle that
+// outran the server's ping-restart.
+func (s *Session) hardResetWatch(ctx context.Context) {
+	ticker := time.NewTicker(hardResetCheckPeriod)
+	defer ticker.Stop()
+	var baseline uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			current := s.statsHardResetIn.Load()
+			if current-baseline < hardResetThreshold {
+				continue
+			}
+			s.log.Warn("hard-reset watch fired, server lost our session; forcing reconnect",
+				"hard_reset_in_total", current,
+				"hard_reset_since_baseline", current-baseline,
+				"threshold", hardResetThreshold,
+			)
+			s.setCloseErr(&RestartError{Reason: "server hard-reset"})
+			go func() { _ = s.Close() }()
+			return
+		}
+	}
+}
+
+// wakeDetectorWatch detects a wall-clock jump — the textbook symptom of a
+// laptop suspending and waking some seconds/minutes later — and forces a
+// reconnect. After a suspend the server has almost certainly dropped our
+// session (its ping-restart elapsed while our socket was frozen), and
+// continuing on the old keys produces the "tunnel looks alive, nothing
+// works" state. Detecting suspend lets AutoReconnect re-handshake
+// immediately instead of waiting on pingRestartWatch or dataActivityWatch
+// to fail.
+//
+// Implementation: tick every wakeDetectPeriod and check `now.Sub(lastTick)`.
+// A normal tick lands within tens of milliseconds; anything larger than
+// wakeDetectGapThreshold (10s) means the runtime was paused, which on a
+// healthy host only happens during suspend.
+func (s *Session) wakeDetectorWatch(ctx context.Context) {
+	lastTick := time.Now()
+	ticker := time.NewTicker(wakeDetectPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			gap := now.Sub(lastTick)
+			lastTick = now
+			if gap < wakeDetectGapThreshold {
+				continue
+			}
+			s.log.Warn("wake detected — host appears to have slept; forcing reconnect",
+				"gap", gap, "threshold", wakeDetectGapThreshold)
+			s.setCloseErr(&RestartError{Reason: "wake from sleep"})
 			go func() { _ = s.Close() }()
 			return
 		}

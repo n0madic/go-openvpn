@@ -19,6 +19,7 @@ func TestStatsSnapshot(t *testing.T) {
 	s.statsPingIn.Store(20)
 	s.statsOpenFailed.Store(3)
 	s.statsStrayHandshake.Store(7)
+	s.statsHardResetIn.Store(2)
 
 	tIn := time.Now().Add(-2 * time.Second)
 	tData := time.Now().Add(-1 * time.Second)
@@ -29,7 +30,7 @@ func TestStatsSnapshot(t *testing.T) {
 
 	got := s.Stats()
 	if got.Forwarded != 100 || got.DroppedFull != 5 || got.PingIn != 20 ||
-		got.OpenFailed != 3 || got.StrayHandshake != 7 {
+		got.OpenFailed != 3 || got.StrayHandshake != 7 || got.HardResetIn != 2 {
 		t.Errorf("counter mismatch: %+v", got)
 	}
 	if !got.LastInbound.Equal(tIn) {

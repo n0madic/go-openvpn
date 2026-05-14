@@ -164,6 +164,13 @@ type Stats struct {
 	// looked like benign load-balancer / server-restart chatter
 	// (stray HARD_RESET_SERVER_V2 or mismatched session-id).
 	StrayHandshake uint64
+	// HardResetIn is the subset of StrayHandshake events that were
+	// specifically inbound P_CONTROL_HARD_RESET_SERVER_V2 — the
+	// server explicitly asking us to renegotiate. Non-zero values
+	// after the initial handshake indicate the server has forgotten
+	// our session (typical aftermath of a laptop sleep). Drives the
+	// hardResetWatch goroutine that forces AutoReconnect.
+	HardResetIn uint64
 
 	// LastInbound is the time of the most recent successfully
 	// decrypted inbound packet of ANY kind (real traffic or PING).
@@ -256,6 +263,7 @@ func (c *Client) Stats() Stats {
 		out.PingIn += cur.PingIn
 		out.OpenFailed += cur.OpenFailed
 		out.StrayHandshake += cur.StrayHandshake
+		out.HardResetIn += cur.HardResetIn
 		out.LastInbound = cur.LastInbound
 		out.LastDataInbound = cur.LastDataInbound
 		out.LastUserOutbound = cur.LastUserOutbound
@@ -284,6 +292,7 @@ func (c *Client) foldStatsLocked(st session.Stats) {
 	c.cumStats.PingIn += st.PingIn
 	c.cumStats.OpenFailed += st.OpenFailed
 	c.cumStats.StrayHandshake += st.StrayHandshake
+	c.cumStats.HardResetIn += st.HardResetIn
 }
 
 // FireOnReconnect invokes every registered OnReconnect hook with the

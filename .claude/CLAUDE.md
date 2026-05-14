@@ -111,6 +111,15 @@ internal/session         Orchestrator. Goroutines per active session
                          no real non-PING inbound data arrives — closes
                          the "tunnel alive but data path stuck" failure
                          mode that pingRestartWatch alone misses),
+                         hardResetWatch (closes with *RestartError when
+                         the server keeps sending P_CONTROL_HARD_RESET_
+                         SERVER_V2 — the server explicitly saying "I
+                         lost your session, re-handshake"; typical
+                         after-laptop-sleep aftermath),
+                         wakeDetectorWatch (notices a wall-clock jump
+                         > 10s as evidence the host suspended, forces
+                         AutoReconnect immediately instead of waiting
+                         on pingRestart to time out on stale keys),
                          statsLogger (periodic packet-flow counter dump).
                          Holds per-key-id slot + layer tables for rekey
                          transition windows.
@@ -263,6 +272,32 @@ internal/session         Orchestrator. Goroutines per active session
     gaps via retransmits. `statsLogger` logs at WARN when drops appear
     so the operator sees it. PINGs `return` before the select so they
     never participate in the back-pressure.
+
+11. **Laptop sleep/resume needs explicit reconnect — `pingRestart`
+    doesn't catch it.** A suspended laptop freezes the OpenVPN UDP
+    socket. The server, meanwhile, sees us stop talking and after its
+    own ping-restart (typically 60s) drops session state. On wake, the
+    client resumes sending `P_DATA_V2` packets on the old key but the
+    server no longer has matching state — it replies with
+    `P_CONTROL_HARD_RESET_SERVER_V2` ("re-handshake, please"). Our
+    `handleControlIn` recognises these via `isStrayUnwrap` and bumps
+    `statsHardResetIn` (a strict subset of `statsStrayHandshake`).
+    `session.hardResetWatch` polls that counter every 5s and fires
+    `RestartError{Reason:"server hard-reset"}` once the count crosses
+    `hardResetThreshold=3`. Belt-and-braces, `session.wakeDetectorWatch`
+    ticks once per second and notices any wall-clock jump greater than
+    10s — a normal scheduler delay is well under one tick, so anything
+    larger is almost certainly suspend; fires
+    `RestartError{Reason:"wake from sleep"}` so AutoReconnect kicks in
+    immediately rather than waiting on ping-restart with stale keys.
+    `pingRestartWatch` alone misses this scenario because inbound
+    HARD_RESET packets bump `lastInbound` (handleControlIn updates it
+    before discarding strays) — so without these two extra watchdogs
+    the client sat in a useless zombie state. Don't merge wakeDetector
+    into hardResetWatch: the two fire on independent evidence.
+    `statsLogger` surfaces both `delta_stray_handshake` and the new
+    `delta_hard_reset_in` so an operator sees the server-side give-up
+    long before either watch crosses its threshold.
 
 ### gVisor netstack adapter (`pkg/netstack/`)
 

@@ -138,6 +138,16 @@ type Session struct {
 	statsPingIn         atomic.Uint64 // inbound PING filtered before ingressCh
 	statsOpenFailed     atomic.Uint64 // slot.Open returned an error
 	statsStrayHandshake atomic.Uint64 // tls-crypt unwrap dropped — stray fresh handshake
+	// statsHardResetIn counts only the subset of stray-handshake events
+	// that look like *the server asking us to renegotiate* — namely an
+	// inbound P_CONTROL_HARD_RESET_SERVER_V2. Separated from the general
+	// stray counter because it's the strong signal the server has lost
+	// our session (e.g. after the client laptop slept and woke up; the
+	// server's ping-restart elapsed and it dropped the SSL/TLS state).
+	// Drives session.hardResetWatch — when the server keeps re-handshaking
+	// while we ignore it, we force AutoReconnect to bring up a fresh
+	// session that the server actually has state for.
+	statsHardResetIn atomic.Uint64
 
 	ingressCh chan []byte
 	// workers owns the cancellation context shared by every long-running
@@ -292,6 +302,8 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 		s.workers.Go("pingRestartWatch", s.pingRestartWatch)
 	}
 	s.workers.Go("dataActivityWatch", s.dataActivityWatch)
+	s.workers.Go("hardResetWatch", s.hardResetWatch)
+	s.workers.Go("wakeDetectorWatch", s.wakeDetectorWatch)
 	s.workers.Go("statsLogger", s.statsLogger)
 
 	// Surface the full server-pushed option set for diagnostics. PUSH_REPLY
@@ -329,6 +341,7 @@ type Stats struct {
 	PingIn           uint64
 	OpenFailed       uint64
 	StrayHandshake   uint64
+	HardResetIn      uint64
 	LastInbound      time.Time
 	LastDataInbound  time.Time
 	LastUserOutbound time.Time
@@ -349,6 +362,7 @@ func (s *Session) Stats() Stats {
 		PingIn:           s.statsPingIn.Load(),
 		OpenFailed:       s.statsOpenFailed.Load(),
 		StrayHandshake:   s.statsStrayHandshake.Load(),
+		HardResetIn:      s.statsHardResetIn.Load(),
 		LastInbound:      nsToTime(s.lastInbound.Load()),
 		LastDataInbound:  nsToTime(s.lastDataInbound.Load()),
 		LastUserOutbound: nsToTime(s.lastUserOutbound.Load()),
@@ -859,6 +873,13 @@ func (s *Session) handleControlIn(pkt []byte, opcode proto.Opcode, kid uint8) {
 		// decrypt anomalies remain visible.
 		if isStrayUnwrap(pkt, opcode, layer) {
 			s.statsStrayHandshake.Add(1)
+			// HARD_RESET_SERVER_V2 specifically is "the server forgot us,
+			// please re-handshake". Count separately so hardResetWatch
+			// can react. SID mismatch is benign cross-talk / late rekey
+			// remnants and is left alone.
+			if opcode == proto.PControlHardResetServerV2 {
+				s.statsHardResetIn.Add(1)
+			}
 			return
 		}
 		s.log.Debug("tls-crypt unwrap failed", "err", err)
