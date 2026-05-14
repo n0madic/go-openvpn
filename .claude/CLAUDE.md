@@ -89,10 +89,14 @@ internal/proto           Opcode encoding, packet headers, KEY_METHOD 2 codec,
 internal/session         Orchestrator. Goroutines per active session:
                          readLoop (demuxes incoming by opcode+key-id),
                          writeLoop + tickLoop (per reliable.Layer, so 2 per
-                         key-id), rekeyWatch (rekey trigger watchdog), and
+                         key-id), rekeyWatch (rekey trigger watchdog),
                          controlChannelReader (post-handshake RESTART/EXIT/
-                         INFO dispatcher). Holds per-key-id slot + layer
-                         tables for rekey transition windows.
+                         INFO dispatcher), keepaliveLoop (sends PING magic
+                         every PushReply.PingInterval), pingRestartWatch
+                         (closes session with *RestartError after
+                         PushReply.PingRestart of inbound silence). Holds
+                         per-key-id slot + layer tables for rekey transition
+                         windows.
 ```
 
 ### Public API (`openvpn.go`, `conn.go`)
@@ -120,6 +124,26 @@ internal/session         Orchestrator. Goroutines per active session:
   (explicit-exit-notify) and waits for the reliable layer to drain it.
 - `Config.AutoReconnect` + `ReconnectMaxAttempts` + `ReconnectMaxInterval`
   — when set, server `RESTART` is absorbed without surfacing to the user.
+- `Client.RequestRestart(reason string)` — application-level escape hatch
+  that forces the current session to close with a `*RestartError` so
+  `AutoReconnect` re-dials. Use when something *outside* the OpenVPN
+  protocol (DNS-over-tunnel failing repeatedly, watchdog probe failing,
+  user-visible error counter, etc.) tells you the data plane is dead
+  even though the protocol can't see it. `cmd/openvpn2socks` wires this
+  to its DNS resolver: N consecutive DNS-over-tunnel timeouts ⇒
+  RequestRestart ⇒ fresh peer_id / local_ip / NAT mapping ⇒ DNS works
+  again. The Tunnel handle survives — blocked Reads resume on the new
+  session.
+- `Client.OnReconnect(fn func(PushReply))` — register a callback fired
+  every time AutoReconnect installs a fresh session. **Critical** for
+  anything that caches a tunnel-IP-dependent value: gVisor NIC address,
+  bound sockets, host routes. The server assigns a *new* `LocalIP` per
+  session (and may also change Gateway / Routes / MTU), so failing to
+  refresh those state means post-reconnect packets carry the OLD source
+  IP and the server silently drops them — that's the long-running
+  "tunnel works for a bit, reconnects, then nothing works forever"
+  zombie-loop bug we hit. `pkg/netstack/netstack.go::Net.New` registers
+  itself via this hook so the gVisor NIC stays in sync automatically.
 
 ### Key protocol nuances (caught against real OpenVPN — preserve when editing)
 
@@ -143,6 +167,38 @@ internal/session         Orchestrator. Goroutines per active session:
 6. **OpenVPN PEM header for tls-crypt static key uses lowercase `key`**:
    `-----BEGIN OpenVPN Static key V1-----`. Both cases are accepted on
    read but emit with lowercase.
+7. **Keepalive is mandatory and `applyKeepaliveDefaults` fills it when the
+   server is silent.** Real servers push `ping N, ping-restart M` and
+   expect us to PING every N seconds; if M seconds pass without inbound
+   data the server drops us. Several providers (ProtonVPN among them)
+   don't push these directives, so we apply defaults
+   (`defaultPingInterval=15s` / `defaultPingRestart=60s`) — pushed values
+   always win when present. `session.keepaliveLoop` emits the 16-byte
+   `proto.PingMagic` (`2a 18 7b f3 64 1e b4 cb 07 ed 2d 0a 98 1f c7 48`,
+   per `ping.c::ping_string`) as a regular P_DATA_V2 packet via the
+   active slot. The first nibble (`2`) is not a valid IP version, so
+   `pkg/netstack`'s IPv4/IPv6 demux drops them naturally; `handleDataIn`
+   also filters them so direct `Tunnel.Read` consumers don't see them.
+   `session.pingRestartWatch` is the standard OpenVPN watchdog: `now -
+   lastInbound >= ping-restart` ⇒ `setCloseErr(&RestartError{...})` ⇒
+   `Close()` ⇒ AutoReconnect. Don't gate the loops on push-reply being
+   non-zero — that's the failure mode for providers that don't push.
+   Keepalive `WritePacket` errors are non-fatal: log at Debug and
+   `continue` to the next tick. Bailing out on the first ENOBUFS would
+   silently mute keepalives for the rest of the session (which is the
+   second half of the production failure we hunted — see point 8).
+
+8. **macOS default `SO_SNDBUF` (~9 KiB) is too small for burst load.**
+   gVisor TCP/UDP under heavy concurrent traffic (speedtest, parallel
+   HTTP/2 fan-out) easily generates a burst that exceeds the OS UDP
+   send buffer. The kernel rejects writes with `ENOBUFS` and packets
+   are silently dropped; keepalives stop reaching the wire, the server
+   eventually times us out, and the tunnel "freezes" while still looking
+   alive at the protocol level. `internal/transport/udp.go::tuneSockBufs`
+   raises `SO_SNDBUF` and `SO_RCVBUF` to `kernelSockBufBytes = 4 MiB`
+   (kernel silently clamps to `kern.ipc.maxsockbuf` on macOS /
+   `net.core.wmem_max` on Linux). Don't remove this without measuring
+   loss under burst load.
 
 ### gVisor netstack adapter (`pkg/netstack/`)
 
@@ -152,6 +208,19 @@ literal IPs — DNS resolution is the caller's responsibility (see
 inside is a `stack.LinkEndpoint` that pumps IP packets between the gVisor
 stack and the tunnel `net.Conn` without any link-layer header
 (ARPHardwareNone, MaxHeaderLength=0).
+
+**Reconnect synchronisation:** the NIC address / routes / MTU are NOT
+fixed at construction. `Net.New` registers an `openvpn.Client.OnReconnect`
+hook that re-runs `Net.applyPushReply` against every freshly-installed
+session's PUSH_REPLY. Without this, the NIC keeps the *first* session's
+tunnel IP even after reconnect, so post-reconnect packets carry the old
+source IP and the server drops them — there's no protocol-level error
+back, just silent black-hole. The hook updates IPv4 + IPv6 addresses
+(new before old, no transient unconfigured-NIC window), reinstalls the
+route table (`SetRouteTable` replaces, not merges), and refreshes the
+endpoint MTU. Existing TCP/UDP gVisor connections bound to the old
+address become zombies and time out naturally — client apps retry and
+fresh conns bind to the new local IP.
 
 ### SOCKS5 daemon (`cmd/openvpn2socks/`)
 

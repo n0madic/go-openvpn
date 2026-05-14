@@ -50,8 +50,9 @@ type cliOpts struct {
 	dns string
 
 	// Misc.
-	idle    time.Duration
-	verbose bool
+	idle               time.Duration
+	dnsRestartFailures int
+	verbose            bool
 }
 
 func parseFlags() *cliOpts {
@@ -82,6 +83,8 @@ func parseFlags() *cliOpts {
 
 	// Misc.
 	flag.DurationVar(&o.idle, "idle", 10*time.Minute, "close idle proxied TCP after this duration (0 disables)")
+	flag.IntVar(&o.dnsRestartFailures, "dns-restart-failures", 3,
+		"after N consecutive DNS-over-tunnel timeouts, request a session restart so AutoReconnect dials a fresh peer/NAT mapping (0 disables; useful when only -dns/PUSH_REPLY DNS is configured)")
 	flag.BoolVar(&o.verbose, "v", false, "verbose logging (slog Debug)")
 	flag.Parse()
 
@@ -151,6 +154,9 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 		}
 	}
 	r := newResolver(ns, pr.DNS, override, logger)
+	if opts.dnsRestartFailures > 0 {
+		r.SetRestartHook(cli.RequestRestart, opts.dnsRestartFailures)
+	}
 
 	srv := newSOCKS5(ns, r, opts.listen, opts.socksAuth, opts.idle, logger)
 	logger.Info("SOCKS5 listening", "addr", opts.listen)

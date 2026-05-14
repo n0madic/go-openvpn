@@ -94,6 +94,11 @@ type Session struct {
 	// been closed for a specific protocol reason (e.g. server RESTART).
 	closeErr atomic.Pointer[error]
 
+	// lastInbound is the UnixNano timestamp of the most recent successfully
+	// decrypted data packet of ANY kind (real traffic or PING). Drives
+	// pingRestartWatch.
+	lastInbound atomic.Int64
+
 	ingressCh chan []byte
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -206,11 +211,32 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 	rstate := newRekeyState(cfg.Reneg, nil)
 	s.wg.Go(func() { s.rekeyWatch(s.ctx, rstate) })
 
+	// Keepalive: emit OpenVPN PINGs at the negotiated interval so the peer
+	// (and any UDP NAT on the path) sees us as alive; close with a
+	// RestartError after PingRestart seconds of inbound silence so
+	// openvpn.Client.AutoReconnect can resurrect the session.
+	//
+	// Many real providers (ProtonVPN among them) do NOT push `ping`/
+	// `ping-restart`, so honouring the push reply verbatim leaves the tunnel
+	// with no keepalive at all and the server happily drops the session after
+	// its own ping-restart fires. Fill the gap with sensible defaults so
+	// "tunnel just stops carrying traffic" can't happen out of the box.
+	s.applyKeepaliveDefaults()
+	s.lastInbound.Store(time.Now().UnixNano())
+	if s.pushReply.PingInterval > 0 {
+		s.wg.Go(func() { s.keepaliveLoop(s.ctx) })
+	}
+	if s.pushReply.PingRestart > 0 {
+		s.wg.Go(func() { s.pingRestartWatch(s.ctx) })
+	}
+
 	log.Info("openvpn session up",
 		"cipher", result.Cipher,
 		"peer_id", result.PeerID,
 		"local_ip", result.PushReply.LocalIP.String(),
 		"mtu", result.PushReply.MTU,
+		"ping", s.pushReply.PingInterval,
+		"ping_restart", s.pushReply.PingRestart,
 	)
 	return s, nil
 }
@@ -391,6 +417,26 @@ func (s *Session) installTLSConn(c *tls.Conn) {
 	if c != nil {
 		s.wg.Go(func() { s.controlChannelReader(c) })
 	}
+}
+
+// RequestRestart asks the session to terminate with a *RestartError so the
+// surrounding openvpn.Client (when AutoReconnect is on) re-dials. Intended
+// for application-level health checks that observe data-plane failure the
+// session itself can't detect — for example, the SOCKS5 daemon's resolver
+// noticing repeated DNS-over-tunnel timeouts.
+//
+// Idempotent: a second call while shutdown is in flight is a no-op.
+func (s *Session) RequestRestart(reason string) {
+	if s.closed.Load() {
+		return
+	}
+	if reason == "" {
+		reason = "application requested restart"
+	}
+	s.log.Warn("session restart requested by application", "reason", reason)
+	re := &RestartError{Reason: reason}
+	s.setCloseErr(re)
+	go func() { _ = s.Close() }()
 }
 
 // Rekey triggers a soft-reset rekey synchronously. Useful for tests and for
@@ -606,6 +652,13 @@ func (s *Session) handleDataIn(pkt []byte, kid uint8) {
 	ip, err := slot.Open(pkt)
 	if err != nil {
 		s.log.Debug("data open failed", "kid", kid, "err", err)
+		return
+	}
+	// Any decryptable inbound packet (real traffic or PING) proves the peer
+	// is still alive — feed the ping-restart watchdog before deciding what
+	// to do with the payload.
+	s.lastInbound.Store(time.Now().UnixNano())
+	if proto.IsPing(ip) {
 		return
 	}
 	select {

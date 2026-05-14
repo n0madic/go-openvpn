@@ -28,6 +28,7 @@ TCP/IP stacks (gVisor netstack, Tailscale-style).
 | `--explicit-exit-notify` (sends `EXIT\0` on Close so the server cleans up immediately) | ✅ |
 | RESTART detection — surfaces as `*RestartError` from `Tunnel.Read/Write` | ✅ |
 | `Config.AutoReconnect` — transparently re-dials on server RESTART | ✅ |
+| Keepalive: sends server-negotiated `ping`, watches `ping-restart` (silence triggers `*RestartError`, AutoReconnect picks it up) | ✅ |
 | gVisor netstack adapter (`pkg/netstack/`) — userspace TCP/IP through the tunnel | ✅ |
 | `.ovpn` profile parser (`pkg/ovpn`) — converts standard OpenVPN config files into `*openvpn.Config` | ✅ |
 | Real-world tested: connects to ProtonVPN servers (AES-256-GCM, tls-crypt v1, auth-user-pass, no client cert) | ✅ |

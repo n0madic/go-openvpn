@@ -17,6 +17,20 @@ import (
 // to avoid silently truncating server packets if MTU is misconfigured.
 const maxUDPPacket = 65535
 
+// kernelSockBufBytes is what we try to set SO_SNDBUF/SO_RCVBUF to on the
+// underlying UDP socket. The OS-default values are tiny (macOS ships with
+// SO_SNDBUF = 9216 bytes — six OpenVPN frames!) and a burst of traffic from
+// gVisor (e.g. dozens of TCP handshakes during a speedtest, or HTTP/2
+// fan-out from a browser) trivially fills them up. Once full, the kernel
+// rejects writes with ENOBUFS ("no buffer space available"); from the
+// outside the tunnel looks like it's silently freezing, because keepalive
+// PINGs and data packets are dropped before they ever reach the wire.
+//
+// 4 MiB is generous but bounded by macOS's kern.ipc.maxsockbuf (default
+// 6 MiB on recent versions); the SetWriteBuffer call below downgrades
+// silently if the kernel clamps it.
+const kernelSockBufBytes = 4 * 1024 * 1024
+
 // udpReadBufPool re-uses 64 KiB receive buffers across ReadPacket calls so
 // high-throughput sessions don't allocate per-packet.
 var udpReadBufPool = sync.Pool{
@@ -39,13 +53,25 @@ func dialUDP(ctx context.Context, network, addr string) (PacketConn, error) {
 		_ = c.Close()
 		return nil, errors.New("transport: DialContext did not return *net.UDPConn")
 	}
+	tuneSockBufs(uc)
 	return &udpConn{c: uc}, nil
 }
 
 // NewUDP wraps an existing *net.UDPConn. Useful for tests and for callers that
 // need to configure the socket themselves (e.g. fwmark).
 func NewUDP(c *net.UDPConn) PacketConn {
+	tuneSockBufs(c)
 	return &udpConn{c: c}
+}
+
+// tuneSockBufs requests larger SO_SNDBUF / SO_RCVBUF on the underlying UDP
+// socket so a burst of OpenVPN traffic (encrypted gVisor TCP/UDP packets,
+// keepalives) doesn't overflow the kernel send queue. Best effort: the
+// kernel silently caps to kern.ipc.maxsockbuf on macOS / net.core.wmem_max
+// on Linux, but we still get a much larger window than the OS default.
+func tuneSockBufs(c *net.UDPConn) {
+	_ = c.SetWriteBuffer(kernelSockBufBytes)
+	_ = c.SetReadBuffer(kernelSockBufBytes)
 }
 
 func (u *udpConn) ReadPacket(ctx context.Context) ([]byte, error) {

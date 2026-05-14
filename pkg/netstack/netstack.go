@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strconv"
@@ -246,13 +247,27 @@ func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 
 // Net is a thin facade over *stack.Stack that exposes net-like helpers
 // (DialContext / Listen / etc.) wired up to gVisor's gonet adapters.
+//
+// The NIC's IPv4/IPv6 addresses and route table are *not* fixed at
+// construction time: when the underlying openvpn.Client reconnects (and the
+// server hands out a fresh tunnel IP / gateway / routes), `Net` reapplies
+// the new PushReply automatically via an openvpn.Client OnReconnect hook
+// registered in `New`. Without this, packets sent from gVisor after a
+// reconnect would carry the old source IP and the server would silently
+// drop them.
 type Net struct {
-	stack   *stack.Stack
-	ep      *endpoint
+	stack *stack.Stack
+	ep    *endpoint
+	log   *slog.Logger
+
+	// nicMu protects the fields below — they're rewritten on every
+	// reconnect when applyPushReply runs.
+	nicMu   sync.Mutex
 	localV4 netip.Addr
 	localV6 netip.Addr
 	hasV4   bool
 	hasV6   bool
+
 	closeMu sync.Mutex
 	closed  bool
 	cli     *openvpn.Client
@@ -306,9 +321,47 @@ func New(cli *openvpn.Client) (*Net, error) {
 		return nil, fmt.Errorf("SetPromiscuousMode: %s", err)
 	}
 
-	n := &Net{stack: s, ep: ep, cli: cli}
+	n := &Net{stack: s, ep: ep, cli: cli, log: cli.Logger()}
 
-	if pr.LocalIP.IsValid() && pr.LocalIP.Is4() {
+	if err := n.applyPushReply(pr); err != nil {
+		return nil, err
+	}
+
+	// Track future reconnects: every successful AutoReconnect-driven session
+	// replacement hands us a fresh tunnel IP / gateway. Without re-syncing
+	// the NIC, post-reconnect packets carry the OLD source IP and the
+	// server silently drops them.
+	cli.OnReconnect(func(pr openvpn.PushReply) {
+		if err := n.applyPushReply(pr); err != nil && n.log != nil {
+			n.log.Error("netstack applyPushReply failed on reconnect", "err", err)
+		}
+		if pr.MTU > 0 {
+			n.ep.SetMTU(uint32(pr.MTU))
+		}
+	})
+
+	return n, nil
+}
+
+// applyPushReply (re)installs the NIC's IPv4/IPv6 protocol addresses and
+// route table from the supplied PushReply. Designed to be idempotent and
+// safe to call from a reconnect hook: it adds the new address first, then
+// removes the prior one (if different), so there's no window where the NIC
+// has no address.
+//
+// Existing TCP/UDP gVisor connections that were bound to the OLD address
+// continue to exist but their outbound packets carry the old source IP and
+// will be dropped by the OpenVPN server in the new session — that's
+// expected behaviour; client apps retry and the new conns bind to the
+// fresh local IP.
+func (n *Net) applyPushReply(pr openvpn.PushReply) error {
+	n.nicMu.Lock()
+	defer n.nicMu.Unlock()
+
+	oldV4, oldHasV4 := n.localV4, n.hasV4
+	oldV6, oldHasV6 := n.localV6, n.hasV6
+
+	if pr.LocalIP.IsValid() && pr.LocalIP.Is4() && (!oldHasV4 || oldV4 != pr.LocalIP) {
 		ip := pr.LocalIP.As4()
 		addrProto := tcpip.ProtocolAddress{
 			Protocol: ipv4.ProtocolNumber,
@@ -317,13 +370,13 @@ func New(cli *openvpn.Client) (*Net, error) {
 				PrefixLen: maskPrefixLen(pr.Netmask),
 			},
 		}
-		if err := s.AddProtocolAddress(nicID, addrProto, stack.AddressProperties{}); err != nil {
-			return nil, fmt.Errorf("AddProtocolAddress v4: %s", err)
+		if err := n.stack.AddProtocolAddress(nicID, addrProto, stack.AddressProperties{}); err != nil {
+			return fmt.Errorf("AddProtocolAddress v4: %s", err)
 		}
 		n.localV4 = pr.LocalIP
 		n.hasV4 = true
 	}
-	if pr.LocalIP.IsValid() && pr.LocalIP.Is6() {
+	if pr.LocalIP.IsValid() && pr.LocalIP.Is6() && (!oldHasV6 || oldV6 != pr.LocalIP) {
 		ip := pr.LocalIP.As16()
 		addrProto := tcpip.ProtocolAddress{
 			Protocol: ipv6.ProtocolNumber,
@@ -332,15 +385,34 @@ func New(cli *openvpn.Client) (*Net, error) {
 				PrefixLen: 128,
 			},
 		}
-		if err := s.AddProtocolAddress(nicID, addrProto, stack.AddressProperties{}); err != nil {
-			return nil, fmt.Errorf("AddProtocolAddress v6: %s", err)
+		if err := n.stack.AddProtocolAddress(nicID, addrProto, stack.AddressProperties{}); err != nil {
+			return fmt.Errorf("AddProtocolAddress v6: %s", err)
 		}
 		n.localV6 = pr.LocalIP
 		n.hasV6 = true
 	}
 
-	// Routes — default route to the tunnel gateway, plus any extra
-	// PUSH_REPLY-supplied prefixes.
+	// Reinstall the route table verbatim — SetRouteTable replaces (not
+	// merges), so any old default-via-gateway entries get cleaned up
+	// automatically.
+	n.stack.SetRouteTable(buildRoutes(pr))
+
+	// Drop the stale address last so there's no instant where the NIC has
+	// no IPv4/IPv6 configured.
+	if oldHasV4 && oldV4 != n.localV4 {
+		_ = n.stack.RemoveAddress(nicID, tcpip.AddrFrom4(oldV4.As4()))
+	}
+	if oldHasV6 && oldV6 != n.localV6 {
+		_ = n.stack.RemoveAddress(nicID, tcpip.AddrFrom16(oldV6.As16()))
+	}
+
+	return nil
+}
+
+// buildRoutes converts a PushReply's gateway+routes into a gVisor route
+// table. Same logic the initial setup used; factored out so applyPushReply
+// can reuse it on reconnect.
+func buildRoutes(pr openvpn.PushReply) []tcpip.Route {
 	var routes []tcpip.Route
 	if pr.Gateway.IsValid() && pr.Gateway.Is4() {
 		gw := pr.Gateway.As4()
@@ -371,16 +443,14 @@ func New(cli *openvpn.Client) (*Net, error) {
 		routes = append(routes, tcpip.Route{Destination: net, NIC: nicID})
 	}
 	if len(routes) == 0 {
-		// At minimum, an on-link route over the NIC so the stack knows
-		// any traffic should head out via the endpoint.
+		// On-link route over the NIC so the stack knows traffic should head
+		// out via the endpoint even with no gateway pushed.
 		routes = append(routes, tcpip.Route{
 			Destination: header.IPv4EmptySubnet,
 			NIC:         nicID,
 		})
 	}
-	s.SetRouteTable(routes)
-
-	return n, nil
+	return routes
 }
 
 // Stack returns the underlying *stack.Stack so callers can register their own
@@ -388,7 +458,11 @@ func New(cli *openvpn.Client) (*Net, error) {
 func (n *Net) Stack() *stack.Stack { return n.stack }
 
 // LocalIP returns the IPv4 address assigned to the tunnel (from PUSH_REPLY).
-func (n *Net) LocalIP() netip.Addr { return n.localV4 }
+func (n *Net) LocalIP() netip.Addr {
+	n.nicMu.Lock()
+	defer n.nicMu.Unlock()
+	return n.localV4
+}
 
 // Close tears down the netstack but leaves the underlying openvpn.Client
 // running. The tunnel Conn it was using is closed (so further Read/Write on
@@ -459,10 +533,35 @@ func (n *Net) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		return gonet.DialUDP(n.stack, nil, &full, proto)
+		// Pass an explicit local address for UDP. Without this gVisor picks
+		// from the NIC's address list via route lookup; passing laddr makes
+		// the bind track reconnect-driven IP changes 1:1.
+		return gonet.DialUDP(n.stack, n.currentLocalFullAddress(ip.Is4()), &full, proto)
 	default:
 		return nil, &net.OpError{Op: "dial", Net: network, Err: errors.New("netstack: unsupported network")}
 	}
+}
+
+// currentLocalFullAddress returns a FullAddress suitable as `laddr` for a
+// gonet Dial, snapshotting the NIC's current IPv4 or IPv6 address under the
+// nicMu lock. Returns nil if no address of the requested family is
+// installed — gonet treats nil laddr as "auto-pick", matching the prior
+// behaviour for that edge case.
+func (n *Net) currentLocalFullAddress(v4 bool) *tcpip.FullAddress {
+	n.nicMu.Lock()
+	defer n.nicMu.Unlock()
+	if v4 {
+		if !n.hasV4 {
+			return nil
+		}
+		a := n.localV4.As4()
+		return &tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom4(a)}
+	}
+	if !n.hasV6 {
+		return nil
+	}
+	a := n.localV6.As16()
+	return &tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom16(a)}
 }
 
 // maskPrefixLen converts a 4-byte IPv4 netmask address into a prefix length

@@ -130,6 +130,49 @@ type Client struct {
 
 	// The single user-facing tunnel handle survives reconnects.
 	tun *tunnel
+
+	// hooksMu protects onReconnect.
+	hooksMu     sync.Mutex
+	onReconnect []func(PushReply)
+}
+
+// OnReconnect registers fn to be invoked every time AutoReconnect installs a
+// fresh session, AFTER the new session is published as the active one and
+// the PushReply is queryable. fn receives the new PUSH_REPLY values so it
+// can adapt: most importantly, the new `LocalIP`, `Gateway`, `Routes` and
+// `MTU` — the server hands out a new tunnel IP per session, so anything
+// using the tunnel IP (gVisor NIC address, SOCKS5 listener bind, etc.) must
+// re-sync or its packets will be silently dropped by the server.
+//
+// fn runs synchronously inside the reconnect path; keep it short. Multiple
+// hooks are invoked in registration order. Hooks registered after the
+// session is closed will never fire.
+//
+// `pkg/netstack` registers a hook here automatically via Net.New so the
+// gVisor NIC tracks reconnects — no caller wiring required for that path.
+func (c *Client) OnReconnect(fn func(PushReply)) {
+	if fn == nil {
+		return
+	}
+	c.hooksMu.Lock()
+	c.onReconnect = append(c.onReconnect, fn)
+	c.hooksMu.Unlock()
+}
+
+// FireOnReconnect invokes every registered OnReconnect hook with the
+// supplied PushReply. The library calls this internally after AutoReconnect
+// dials a fresh session; it is also exposed so external code can force a
+// re-sync after an out-of-band event (e.g. an integration test that wants
+// to simulate "the server handed us a new local IP" without spinning up
+// another endpoint).
+func (c *Client) FireOnReconnect(pr PushReply) {
+	c.hooksMu.Lock()
+	hooks := make([]func(PushReply), len(c.onReconnect))
+	copy(hooks, c.onReconnect)
+	c.hooksMu.Unlock()
+	for _, h := range hooks {
+		h(pr)
+	}
 }
 
 // Dial brings up the session. ctx scopes the handshake only — once Dial
@@ -291,6 +334,10 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 			c.s = s
 			c.mu.Unlock()
 			c.log.Info("reconnect successful", "attempt", attempt)
+			// Notify subscribers (e.g. pkg/netstack updating the gVisor NIC
+			// to the new tunnel IP). Fire AFTER publishing the new session
+			// so c.PushedOptions() inside a hook sees the fresh values.
+			c.FireOnReconnect(c.PushedOptions())
 			return nil
 		}
 		c.log.Warn("reconnect failed", "attempt", attempt, "err", err)
@@ -365,6 +412,33 @@ func (c *Client) UnderlayRemoteAddr() net.Addr { return c.session().UnderlayRemo
 
 // Rekey performs a synchronous soft-reset on the current session.
 func (c *Client) Rekey(ctx context.Context) error { return c.session().Rekey(ctx) }
+
+// Logger returns the slog.Logger configured for this client. Hook consumers
+// (e.g. pkg/netstack) can use this to log with the same handler/level as
+// the rest of the openvpn stack rather than relying on slog.Default().
+func (c *Client) Logger() *slog.Logger { return c.log }
+
+// RequestRestart tells the current session to close with a *RestartError so
+// AutoReconnect (when enabled) re-dials with a fresh peer-id, local IP and
+// NAT mapping. The Tunnel handle survives, blocked Reads transparently
+// resume on the new session.
+//
+// Useful when an application-level signal indicates the data plane is dead
+// (DNS-over-tunnel timing out repeatedly, watchdog probes failing, etc.) —
+// the OpenVPN protocol itself can't always distinguish "tunnel healthy" from
+// "tunnel zombie with control plane still chatting", so the consumer of the
+// tunnel is best placed to declare it broken.
+//
+// No-op if the client is closed or AutoReconnect is off (in which case the
+// session ends and Tunnel.Read/Write surface the RestartError to the caller).
+func (c *Client) RequestRestart(reason string) {
+	if c.closed.Load() {
+		return
+	}
+	if s := c.session(); s != nil {
+		s.RequestRestart(reason)
+	}
+}
 
 // Close tears down the session. Idempotent. Cancels any in-flight
 // AutoReconnect attempt so no orphan session is left behind.
