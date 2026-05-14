@@ -33,9 +33,53 @@ make pki          # one-time: generate CA + server/client certs + tls-crypt key
 make up           # build + start the OpenVPN container in background
 make logs         # tail server logs (Ctrl-C to leave running)
 make test         # run go test -tags=integration ./...
+make bench        # run benchmarks against the live server (see below)
 make down         # stop + remove the container
 make clean        # also wipe ./pki
 ```
+
+## Benchmarks
+
+`make bench` runs two suites against the same live server, skipping regular
+tests via `-run=^$`:
+
+1. **Pure go-openvpn data path** (`test/integration/benchmark_test.go`):
+   raw IPv4+UDP packets pushed directly into `Tunnel().Write` / `Read`,
+   targeting the in-container `socat` UDP echo on 10.8.0.1:8080. No gVisor.
+   - `BenchmarkTunnelUDPEchoRoundtrip/{64,512,1400}B` — synchronous RT.
+   - `BenchmarkTunnelUDPWriteOnly/{64,512,1400}B` — one-way write
+     throughput (drains replies after); isolates the encrypt+transport path.
+
+2. **Full stack through gVisor** (`pkg/netstack/benchmark_test.go`):
+   `Tunnel()` ↔ gVisor TCP/UDP socket ↔ socat echo.
+   - `BenchmarkNetstackTCPEcho/{64,512,1400}B` — lockstep TCP request/reply.
+   - `BenchmarkNetstackTCPStream` — pipelined unidirectional TCP throughput
+     (iperf-like; bandwidth-bound, not latency-bound).
+   - `BenchmarkNetstackUDPEcho/{64,512,1400}B` — UDP via gonet UDP socket;
+     directly comparable to `BenchmarkTunnelUDPEchoRoundtrip` to isolate
+     gVisor's UDP-socket overhead.
+
+Override the bench filter or duration:
+
+```bash
+make bench BENCH=BenchmarkNetstackTCPStream BENCHTIME=5s
+```
+
+Or run a single suite directly:
+
+```bash
+# pure tunnel only
+cd ../.. && go test -tags=integration -bench=. -benchmem \
+    -run=^$ -benchtime=3s -timeout=600s ./test/integration/...
+
+# netstack only
+cd ../../pkg/netstack && go test -tags=integration -bench=. -benchmem \
+    -run=^$ -benchtime=3s -timeout=600s ./...
+```
+
+The `b.SetBytes` value is the one-way user-payload size, so reported MB/s
+matches the classic "one direction" throughput convention. Multiply by 2
+for true on-wire round-trip bytes on the echo benches.
 
 ## What's tested
 

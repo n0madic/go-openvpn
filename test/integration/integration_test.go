@@ -35,22 +35,22 @@ const (
 // once via the test working directory.
 var pkiDir = "./pki"
 
-func loadTLSConfig(t *testing.T) *tls.Config {
-	t.Helper()
+func loadTLSConfig(tb testing.TB) *tls.Config {
+	tb.Helper()
 	caBytes, err := os.ReadFile(filepath.Join(pkiDir, "ca.crt"))
 	if err != nil {
-		t.Fatalf("read CA: %v", err)
+		tb.Fatalf("read CA: %v", err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caBytes) {
-		t.Fatal("no certs in CA file")
+		tb.Fatal("no certs in CA file")
 	}
 	cert, err := tls.LoadX509KeyPair(
 		filepath.Join(pkiDir, "client.crt"),
 		filepath.Join(pkiDir, "client.key"),
 	)
 	if err != nil {
-		t.Fatalf("load client cert: %v", err)
+		tb.Fatalf("load client cert: %v", err)
 	}
 	return &tls.Config{
 		RootCAs:      pool,
@@ -60,11 +60,11 @@ func loadTLSConfig(t *testing.T) *tls.Config {
 	}
 }
 
-func loadTLSCrypt(t *testing.T) []byte {
-	t.Helper()
+func loadTLSCrypt(tb testing.TB) []byte {
+	tb.Helper()
 	b, err := os.ReadFile(filepath.Join(pkiDir, "tlscrypt.key"))
 	if err != nil {
-		t.Fatalf("read tls-crypt key: %v", err)
+		tb.Fatalf("read tls-crypt key: %v", err)
 	}
 	return b
 }
