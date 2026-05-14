@@ -140,9 +140,18 @@ func (s *Session) keepaliveLoop(ctx context.Context) {
 				continue
 			}
 			if err := s.transport.WritePacket(ctx, wire); err != nil {
-				s.log.Debug("keepalive write failed (will retry next tick)", "err", err)
+				s.statsOutboundErr.Add(1)
+				s.lastOutboundErrNs.Store(time.Now().UnixNano())
+				// Promote to WARN so the operator sees keepalive write
+				// failures without -v=debug. Recurring writes will
+				// surface in the next stats tick too.
+				s.log.Warn("keepalive WritePacket failed",
+					"err", err,
+					"outbound_err_total", s.statsOutboundErr.Load(),
+				)
 				continue
 			}
+			s.statsOutboundOK.Add(1)
 			lastPingSent = now
 			s.log.Debug("keepalive PING sent", "kid", slot.KeyID)
 		}
@@ -163,6 +172,7 @@ func (s *Session) statsLogger(ctx context.Context) {
 	ticker := time.NewTicker(statsLogPeriod)
 	defer ticker.Stop()
 	var prevForwarded, prevDropped, prevPingIn, prevOpenFailed, prevStray, prevHardReset uint64
+	var prevOutOK, prevOutErr uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -174,27 +184,33 @@ func (s *Session) statsLogger(ctx context.Context) {
 			openFailed := s.statsOpenFailed.Load()
 			stray := s.statsStrayHandshake.Load()
 			hardReset := s.statsHardResetIn.Load()
+			outOK := s.statsOutboundOK.Load()
+			outErr := s.statsOutboundErr.Load()
 			deltaForwarded := forwarded - prevForwarded
 			deltaDropped := dropped - prevDropped
 			deltaPingIn := pingIn - prevPingIn
 			deltaOpenFailed := openFailed - prevOpenFailed
 			deltaStray := stray - prevStray
 			deltaHardReset := hardReset - prevHardReset
+			deltaOutOK := outOK - prevOutOK
+			deltaOutErr := outErr - prevOutErr
 			prevForwarded = forwarded
 			prevDropped = dropped
 			prevPingIn = pingIn
 			prevOpenFailed = openFailed
 			prevStray = stray
 			prevHardReset = hardReset
+			prevOutOK = outOK
+			prevOutErr = outErr
 			// Time since last successful inbound — the strongest signal
 			// that the tunnel is or isn't carrying real bytes RIGHT NOW.
 			sinceLastIn := now.Sub(time.Unix(0, s.lastDataInbound.Load()))
 			level := slog.LevelDebug
 			// Anything unusual deserves WARN so it surfaces without -v:
 			// ingress drops, decrypt failures, server-driven re-handshake
-			// attempts, or a stuck data path (no new forwarded packets
-			// for at least one interval).
-			if deltaDropped > 0 || deltaOpenFailed > 0 || deltaHardReset > 0 ||
+			// attempts, outbound write errors, or a stuck data path (no
+			// new forwarded packets for at least one interval).
+			if deltaDropped > 0 || deltaOpenFailed > 0 || deltaHardReset > 0 || deltaOutErr > 0 ||
 				(deltaForwarded == 0 && sinceLastIn > statsLogPeriod) {
 				level = slog.LevelWarn
 			}
@@ -206,6 +222,8 @@ func (s *Session) statsLogger(ctx context.Context) {
 				"delta_open_failed", deltaOpenFailed,
 				"delta_stray_handshake", deltaStray,
 				"delta_hard_reset_in", deltaHardReset,
+				"delta_outbound_ok", deltaOutOK,
+				"delta_outbound_err", deltaOutErr,
 				"since_last_data_in", sinceLastIn.Round(time.Millisecond),
 				"forwarded_total", forwarded,
 				"dropped_total", dropped,
@@ -213,6 +231,8 @@ func (s *Session) statsLogger(ctx context.Context) {
 				"open_failed_total", openFailed,
 				"stray_handshake_total", stray,
 				"hard_reset_in_total", hardReset,
+				"outbound_ok_total", outOK,
+				"outbound_err_total", outErr,
 			)
 		}
 	}

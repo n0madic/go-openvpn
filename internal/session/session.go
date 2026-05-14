@@ -149,6 +149,19 @@ type Session struct {
 	// session that the server actually has state for.
 	statsHardResetIn atomic.Uint64
 
+	// Outbound write counters. statsOutboundOK and statsOutboundErr are
+	// the headline pair — the ratio (and especially Err growing in
+	// isolation) tells the operator immediately whether outbound through
+	// the OS UDP socket is healthy. Currently we swallow WritePacket
+	// errors at Debug, so without these the "outbound silently broken"
+	// failure mode is invisible.
+	statsOutboundOK  atomic.Uint64
+	statsOutboundErr atomic.Uint64
+	// lastOutboundErrNs is the UnixNano of the most recent observed
+	// transport.WritePacket failure. Used by statsLogger to surface
+	// "the tunnel is failing writes right now".
+	lastOutboundErrNs atomic.Int64
+
 	ingressCh chan []byte
 	// workers owns the cancellation context shared by every long-running
 	// session goroutine (read/write/tick/watch loops). Replaces the
@@ -436,8 +449,18 @@ func (s *Session) WriteCtx(ctx context.Context, p []byte) (int, error) {
 		defer cancel()
 	}
 	if err := s.transport.WritePacket(writeCtx, wire); err != nil {
+		// Surface every outbound write failure — silently swallowing them
+		// hid a class of "tunnel functionally dead, no protocol error" bugs.
+		s.statsOutboundErr.Add(1)
+		s.lastOutboundErrNs.Store(time.Now().UnixNano())
+		s.log.Warn("transport WritePacket failed (data)",
+			"err", err,
+			"bytes", len(wire),
+			"outbound_err_total", s.statsOutboundErr.Load(),
+		)
 		return 0, err
 	}
+	s.statsOutboundOK.Add(1)
 	// Track real-user activity so dataActivityWatch can tell "user
 	// actively sending but nothing coming back" apart from "session idle".
 	// Keepalive PINGs intentionally bypass this — they use
@@ -923,8 +946,15 @@ func (s *Session) writeLoop(layer *reliable.Layer) {
 			opcodeKID := proto.PackOpcodeKID(out.Opcode, out.KeyID)
 			wrapped := s.wrapper.Wrap(opcodeKID, out.SessionID, body)
 			if err := s.transport.WritePacket(s.ctx, wrapped); err != nil {
+				s.statsOutboundErr.Add(1)
+				s.lastOutboundErrNs.Store(time.Now().UnixNano())
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, transport.ErrClosed) {
-					s.log.Warn("transport write", "err", err)
+					s.log.Warn("transport WritePacket failed (control)",
+						"err", err,
+						"opcode", out.Opcode,
+						"kid", out.KeyID,
+						"outbound_err_total", s.statsOutboundErr.Load(),
+					)
 				}
 				return
 			}
