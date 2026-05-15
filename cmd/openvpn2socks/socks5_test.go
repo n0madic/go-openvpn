@@ -292,10 +292,10 @@ func TestFilterUsableIPs(t *testing.T) {
 	v6b := netip.MustParseAddr("2001:db8::2")
 
 	for _, tc := range []struct {
-		name              string
-		ips               []netip.Addr
-		haveV4, haveV6    bool
-		want              []netip.Addr
+		name           string
+		ips            []netip.Addr
+		haveV4, haveV6 bool
+		want           []netip.Addr
 	}{
 		{
 			name: "v4-only tunnel drops v6 candidates",
