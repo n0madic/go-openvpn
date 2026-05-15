@@ -238,6 +238,14 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 	s.ctx = s.workers.Context()
 	s.layers.Install(0, initialLayer)
 
+	// Bind the session lifetime ctx to the transport once, so per-call
+	// ReadPacket/WritePacket don't spawn a watcher goroutine on every
+	// packet. Transports that don't implement this optional capability
+	// (e.g. memory transport in tests) keep their per-call behaviour.
+	if br, ok := tr.(interface{ BindLifetimeCtx(context.Context) }); ok {
+		br.BindLifetimeCtx(s.ctx)
+	}
+
 	// Start the read loop (demuxes by opcode + key-id across all layers).
 	s.workers.Go("readLoop", func(context.Context) { s.readLoop() })
 	// Per-layer write+tick loops for key-id 0.
@@ -448,7 +456,16 @@ func (s *Session) WriteCtx(ctx context.Context, p []byte) (int, error) {
 		writeCtx, cancel = mergedContext(s.ctx, ctx)
 		defer cancel()
 	}
-	if err := s.transport.WritePacket(writeCtx, wire); err != nil {
+	werr := s.transport.WritePacket(writeCtx, wire)
+	// Return the Seal output buffer to the pool regardless of outcome.
+	// WritePacket is synchronous: by the time it returns the kernel has
+	// either copied the bytes out of `wire` (success) or rejected the
+	// write (error) — in both cases we own the memory again. The
+	// transport's ENOBUFS backoff retries internally with the same
+	// buffer; after the final attempt (success or giveup), Release is
+	// safe.
+	data.ReleaseSealedBuf(wire)
+	if werr != nil {
 		s.statsOutboundErr.Add(1)
 		s.lastOutboundErrNs.Store(time.Now().UnixNano())
 		// Per-error logging is Debug because the aggregate is the
@@ -460,11 +477,11 @@ func (s *Session) WriteCtx(ctx context.Context, p []byte) (int, error) {
 		// any actionable information — every single line said the
 		// same thing, dozens of times per second.
 		s.log.Debug("transport WritePacket failed (data)",
-			"err", err,
+			"err", werr,
 			"bytes", len(wire),
 			"outbound_err_total", s.statsOutboundErr.Load(),
 		)
-		return 0, err
+		return 0, werr
 	}
 	s.statsOutboundOK.Add(1)
 	// Track real-user activity so dataActivityWatch can tell "user

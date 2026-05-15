@@ -6,10 +6,47 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	"github.com/n0madic/go-openvpn/internal/proto"
 )
+
+// sealBufSize is the working size for outbound packet buffers used by
+// Slot.Seal: one MTU-class IP packet (1500) plus OpenVPN data-channel
+// overhead (8B header + 16B tag + 16B scratch for in-place AEAD seal).
+// Anything larger falls back to a per-call allocation; in practice IP
+// packets are bounded by the tunnel MTU and stay well under this.
+const sealBufSize = 1500 + proto.DataV2HeaderLen + 2*TagLen
+
+// sealBufPool recycles outbound Seal buffers across calls. The caller
+// of Seal owns the returned slice and is responsible for handing it
+// back via ReleaseSealedBuf once the on-wire packet has been written
+// (or dropped). Skipping the release just sends the slice to GC —
+// correct, just less efficient. Concurrent-safe — multiple
+// Session.WriteCtx goroutines (one per gVisor TCP/UDP endpoint
+// writing through Tunnel.Write) all Get/Put independently.
+var sealBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, sealBufSize)
+		return &b
+	},
+}
+
+// ReleaseSealedBuf returns a buffer produced by Slot.Seal to the pool.
+// The slice must be one that Seal returned (or a sub-slice of the
+// original backing array). Buffers larger than sealBufSize are
+// dropped — they were allocated per-call, never from the pool. Safe
+// to call with nil. Idempotent in practice: returning the same buf
+// twice means the second consumer might see the wrong data, but
+// nothing crashes.
+func ReleaseSealedBuf(b []byte) {
+	if cap(b) != sealBufSize {
+		return
+	}
+	full := b[:sealBufSize]
+	sealBufPool.Put(&full)
+}
 
 // ErrPacketIDExhausted is returned when the outbound packet-id has crossed
 // the soft-rekey threshold; the session should perform a soft reset before
@@ -97,7 +134,15 @@ func (s *Slot) Seal(plaintext []byte) ([]byte, error) {
 	// place: that needs len(plaintext)+TagLen bytes starting right after the
 	// header+tag slot. Layout while we work:
 	//   [hdr | tag-slot | space-for-Seal-output (cap=len(pt)+TagLen)]
-	buf := make([]byte, pktLen+TagLen)
+	want := pktLen + TagLen
+	var buf []byte
+	if want <= sealBufSize {
+		bufPtr := sealBufPool.Get().(*[]byte)
+		buf = (*bufPtr)[:want]
+	} else {
+		// Oversize fallback — rare on tunnels respecting NIC MTU.
+		buf = make([]byte, want)
+	}
 	buf[0] = opcodeKID
 	buf[1] = byte(s.PeerID >> 16)
 	buf[2] = byte(s.PeerID >> 8)

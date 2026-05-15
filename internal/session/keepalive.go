@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/n0madic/go-openvpn/internal/data"
 	"github.com/n0madic/go-openvpn/internal/proto"
 )
 
@@ -99,10 +100,7 @@ func (s *Session) keepaliveLoop(ctx context.Context) {
 	if interval <= 0 {
 		return
 	}
-	period := interval / 4
-	if period < 250*time.Millisecond {
-		period = 250 * time.Millisecond
-	}
+	period := max(interval/4, 250*time.Millisecond)
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
 	// Seed lastPingSent to "now" — same effect as the upstream OpenVPN
@@ -139,14 +137,16 @@ func (s *Session) keepaliveLoop(ctx context.Context) {
 				s.log.Debug("keepalive seal failed", "err", err)
 				continue
 			}
-			if err := s.transport.WritePacket(ctx, wire); err != nil {
+			werr := s.transport.WritePacket(ctx, wire)
+			data.ReleaseSealedBuf(wire)
+			if werr != nil {
 				s.statsOutboundErr.Add(1)
 				s.lastOutboundErrNs.Store(time.Now().UnixNano())
 				// Promote to WARN so the operator sees keepalive write
 				// failures without -v=debug. Recurring writes will
 				// surface in the next stats tick too.
 				s.log.Warn("keepalive WritePacket failed",
-					"err", err,
+					"err", werr,
 					"outbound_err_total", s.statsOutboundErr.Load(),
 				)
 				continue

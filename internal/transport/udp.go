@@ -32,15 +32,27 @@ const maxUDPPacket = 65535
 // silently if the kernel clamps it.
 const kernelSockBufBytes = 4 * 1024 * 1024
 
-// udpReadBufPool re-uses 64 KiB receive buffers across ReadPacket calls so
-// high-throughput sessions don't allocate per-packet.
-var udpReadBufPool = sync.Pool{
-	New: func() any { b := make([]byte, maxUDPPacket); return &b },
-}
-
 type udpConn struct {
 	c      *net.UDPConn
 	closed atomic.Bool
+
+	// rbuf is the single receive buffer reused across ReadPacket calls.
+	// The PacketConn contract promises the caller owns the returned
+	// slice only until the next ReadPacket on this conn, and the
+	// session has a single reader goroutine, so direct in-place reuse
+	// is safe. Verified that downstream consumers don't retain the
+	// slice: control path (reliable.Layer.appendReadLocked) copies
+	// via append, data path (slot.Open) decrypts into a fresh
+	// plaintext buffer. Lazy-allocated so unused conns never pay the
+	// 64 KiB.
+	rbuf []byte
+
+	// lifetimeMu guards lifetimeStop. lifetimeCtx is loaded via
+	// atomic.Pointer on the hot path (no lock); the mutex only
+	// serialises installation of the watcher goroutine.
+	lifetimeMu   sync.Mutex
+	lifetimeCtx  atomic.Pointer[context.Context]
+	lifetimeStop chan struct{}
 
 	// statsENOBUFSRetries counts how many times we hit ENOBUFS on the
 	// kernel send buffer and successfully retried after backoff. A
@@ -127,23 +139,32 @@ func (u *udpConn) ReadPacket(ctx context.Context) ([]byte, error) {
 		_ = u.c.SetReadDeadline(deadline)
 		defer func() { _ = u.c.SetReadDeadline(time.Time{}) }()
 	}
-	cancel := watchContext(ctx, u.c)
-	defer cancel()
+	// Skip the per-call watcher goroutine when ctx is the conn's bound
+	// lifetime context: the single watcher installed by BindLifetimeCtx
+	// already handles SetDeadline on cancellation. This is the read
+	// loop's hot path — eliminating one goroutine spawn + channel
+	// allocation per packet matters at sustained 1500+ pps.
+	if !u.isLifetimeCtx(ctx) {
+		cancel := watchContext(ctx, u.c)
+		defer cancel()
+	}
 
-	bufPtr := udpReadBufPool.Get().(*[]byte)
-	defer udpReadBufPool.Put(bufPtr)
-	buf := *bufPtr
-
-	n, err := u.c.Read(buf)
+	if u.rbuf == nil {
+		u.rbuf = make([]byte, maxUDPPacket)
+	}
+	n, err := u.c.Read(u.rbuf)
 	if err != nil {
 		if u.closed.Load() {
 			return nil, ErrClosed
 		}
 		return nil, err
 	}
-	out := make([]byte, n)
-	copy(out, buf[:n])
-	return out, nil
+	// Hand out a sub-slice of the shared buffer. Per the PacketConn
+	// contract, the caller owns it only until the next ReadPacket on
+	// this conn — overwritten in place by the next u.c.Read. Verified
+	// safe: control path (reliable.Layer) copies via append, data
+	// path (slot.Open) decrypts into a freshly-allocated plaintext.
+	return u.rbuf[:n], nil
 }
 
 func (u *udpConn) WritePacket(ctx context.Context, p []byte) error {
@@ -211,10 +232,51 @@ func (u *udpConn) WritePacket(ctx context.Context, p []byte) error {
 func (u *udpConn) LocalAddr() net.Addr  { return u.c.LocalAddr() }
 func (u *udpConn) RemoteAddr() net.Addr { return u.c.RemoteAddr() }
 
+// BindLifetimeCtx wires a single, long-lived watcher goroutine that
+// calls SetDeadline(past) when ctx.Done() fires. Subsequent
+// ReadPacket/WritePacket calls that pass the same ctx skip the
+// per-call watcher spawn — eliminating one goroutine + channel
+// allocation per packet on the hot read path. Safe to call once
+// per connection; a second call closes the prior watcher first.
+func (u *udpConn) BindLifetimeCtx(ctx context.Context) {
+	if ctx == nil || ctx.Done() == nil {
+		return
+	}
+	u.lifetimeMu.Lock()
+	defer u.lifetimeMu.Unlock()
+	if u.lifetimeStop != nil {
+		close(u.lifetimeStop)
+	}
+	stop := make(chan struct{})
+	u.lifetimeStop = stop
+	u.lifetimeCtx.Store(&ctx)
+	go func(ctx context.Context, stop chan struct{}) {
+		select {
+		case <-ctx.Done():
+			_ = u.c.SetDeadline(time.Unix(1, 0))
+		case <-stop:
+		}
+	}(ctx, stop)
+}
+
+// isLifetimeCtx reports whether ctx is the conn's currently-bound
+// lifetime context. Pointer comparison via atomic load — no
+// allocation, no lock on the hot path.
+func (u *udpConn) isLifetimeCtx(ctx context.Context) bool {
+	p := u.lifetimeCtx.Load()
+	return p != nil && *p == ctx
+}
+
 func (u *udpConn) Close() error {
 	if u.closed.Swap(true) {
 		return nil
 	}
+	u.lifetimeMu.Lock()
+	if u.lifetimeStop != nil {
+		close(u.lifetimeStop)
+		u.lifetimeStop = nil
+	}
+	u.lifetimeMu.Unlock()
 	return u.c.Close()
 }
 
