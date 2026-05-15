@@ -129,6 +129,17 @@ type endpoint struct {
 	statsInUDP   atomic.Uint64
 	statsInICMP  atomic.Uint64
 	statsInOther atomic.Uint64
+
+	// statsMaxDeliverNs is the high-water mark of how long a single
+	// d.DeliverNetworkPacket call took (nanoseconds) since the last
+	// statsLoggerLoop snapshot. In direct-delivery mode that call runs
+	// synchronously on the session's read loop, so a slow gVisor
+	// dispatcher under load translates directly into back-pressure on
+	// the OS UDP receive buffer (CLAUDE.md point 10 failure mode). The
+	// snapshot is Swap'd to 0 each tick so the logged value reflects
+	// "worst single call in this 30s window" — not lifetime worst —
+	// which is the actionable signal for tail-latency investigation.
+	statsMaxDeliverNs atomic.Int64
 }
 
 // Compile-time guard.
@@ -363,8 +374,22 @@ func (e *endpoint) dispatchInbound(ip []byte) (dispatcherMissing bool) {
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData(ip),
 	})
+	// Measure the dispatcher call directly: time.Now() is one syscall-
+	// free clock read on darwin/arm64 (~25 ns), so the per-packet cost
+	// of the metric is below the noise floor of a full IP-stack
+	// dispatch. We pair it with a CAS-loop update to statsMaxDeliverNs
+	// so the operator-visible "worst single deliver" surfaces in the
+	// next stats tick without bloating endpoint state.
+	start := time.Now()
 	d.DeliverNetworkPacket(proto, pkt)
 	pkt.DecRef()
+	elapsed := time.Since(start).Nanoseconds()
+	for {
+		cur := e.statsMaxDeliverNs.Load()
+		if elapsed <= cur || e.statsMaxDeliverNs.CompareAndSwap(cur, elapsed) {
+			break
+		}
+	}
 	e.statsInPackets.Add(1)
 	return false
 }
@@ -927,6 +952,13 @@ func (n *Net) statsLoggerLoop() {
 			ipSent, ipRcvd, ipMalformed,
 			dropped := snap()
 
+		// Swap-and-reset: the next 30s window starts from 0 so the
+		// reported number always means "worst single call IN THIS
+		// WINDOW", which is the actionable form for tail-latency
+		// regressions. Lifetime-max would freeze on the first big
+		// spike and never recover.
+		maxDeliverUs := n.ep.statsMaxDeliverNs.Swap(0) / 1000
+
 		dOutPkts := outPkts - prevOutPkts
 		dOutErr := outErr - prevOutErr
 		dInPkts := inPkts - prevInPkts
@@ -986,6 +1018,15 @@ func (n *Net) statsLoggerLoop() {
 			dIPMalformed > 0 || dDropped > 0 || dUDPUnknownPort > 0 {
 			level = slog.LevelWarn
 		}
+		// A single gVisor dispatcher call eating >5 ms is the canonical
+		// "fast-path back-pressure starting to bite" signal: the session
+		// read loop is blocked exactly that long, and the OS UDP buffer
+		// loses that many microseconds of receive headroom. 5 ms is well
+		// above normal worst-case (sub-millisecond) and below typical
+		// TCP RTT jitter, so it shouldn't trip on benign noise.
+		if maxDeliverUs > 5_000 {
+			level = slog.LevelWarn
+		}
 
 		if n.log != nil {
 			n.log.Log(context.Background(), level, "netstack stats",
@@ -1019,6 +1060,13 @@ func (n *Net) statsLoggerLoop() {
 				"delta_ip_malformed", dIPMalformed,
 				// Catch-all.
 				"delta_dropped", dDropped,
+				// Tail-latency probe for the direct-delivery fast path:
+				// worst single DeliverNetworkPacket call (microseconds)
+				// observed in this window. Read loop blocks for exactly
+				// this long on the worst packet — useful to spot gVisor
+				// under-contention slow paths before they manifest as
+				// OS-UDP-buffer overflow.
+				"max_deliver_us", maxDeliverUs,
 			)
 		}
 	}
