@@ -879,12 +879,21 @@ func (n *Net) statsLoggerLoop() {
 		prevDropped = dropped
 
 		// Anything that looks like a real symptom escalates to WARN so
-		// it surfaces without -v: outright errors, growing retransmits,
-		// resets received, malformed packets, generic dropped packets,
-		// or UDP responses landing on closed endpoints.
+		// it surfaces without -v: outright errors, sustained
+		// retransmits, malformed packets, generic dropped packets, or
+		// UDP responses landing on closed endpoints.
+		//
+		// `delta_tcp_resets_rcvd` is intentionally NOT included even
+		// though it's surfaced in the message body for diagnosis. A
+		// busy browsing session naturally produces a steady trickle
+		// of RSTs because Apple/Google/Telegram services close
+		// short-lived TCP via RST rather than graceful FIN, so any
+		// > 0 threshold makes the line WARN on a perfectly healthy
+		// tunnel. Same reasoning that retired the RST-storm watchdog
+		// trigger — the metric is noise as a binary signal.
 		level := slog.LevelDebug
 		if dOutErr > 0 || dTCPSendErr > 0 || dUDPSendErr > 0 ||
-			dTCPRetrans > 5 || dTCPResetsRcvd > 0 ||
+			dTCPRetrans > 5 ||
 			dIPMalformed > 0 || dDropped > 0 || dUDPUnknownPort > 0 {
 			level = slog.LevelWarn
 		}
