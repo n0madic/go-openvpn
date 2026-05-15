@@ -61,11 +61,22 @@ type socks5Server struct {
 	authPass string
 	log      *slog.Logger
 
+	// connRate refuses aggressive same-target burst from misbehaving
+	// clients before they hit the tunnel. See connrate.go.
+	connRate *connRateLimiter
+
 	inflight atomic.Int64
 }
 
 func newSOCKS5(ns *netstack.Net, r *resolver, listen, authSpec string, idle time.Duration, log *slog.Logger) *socks5Server {
-	s := &socks5Server{ns: ns, resolver: r, listen: listen, idle: idle, log: log}
+	s := &socks5Server{
+		ns:       ns,
+		resolver: r,
+		listen:   listen,
+		idle:     idle,
+		log:      log,
+		connRate: newConnRateLimiter(),
+	}
 	if authSpec != "" {
 		if u, p, ok := strings.Cut(authSpec, ":"); ok && u != "" {
 			s.authUser, s.authPass = u, p

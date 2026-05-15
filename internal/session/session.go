@@ -449,11 +449,17 @@ func (s *Session) WriteCtx(ctx context.Context, p []byte) (int, error) {
 		defer cancel()
 	}
 	if err := s.transport.WritePacket(writeCtx, wire); err != nil {
-		// Surface every outbound write failure — silently swallowing them
-		// hid a class of "tunnel functionally dead, no protocol error" bugs.
 		s.statsOutboundErr.Add(1)
 		s.lastOutboundErrNs.Store(time.Now().UnixNano())
-		s.log.Warn("transport WritePacket failed (data)",
+		// Per-error logging is Debug because the aggregate is the
+		// signal that matters: `delta_outbound_err` in the periodic
+		// session stats line auto-escalates to WARN when it's > 0
+		// over the window, which is what operators actually need.
+		// Per-error WARN flooded the log under transient kernel
+		// buffer pressure (speedtest, bulk upload) without adding
+		// any actionable information — every single line said the
+		// same thing, dozens of times per second.
+		s.log.Debug("transport WritePacket failed (data)",
 			"err", err,
 			"bytes", len(wire),
 			"outbound_err_total", s.statsOutboundErr.Load(),

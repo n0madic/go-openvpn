@@ -172,7 +172,21 @@ func (s *Session) statsLogger(ctx context.Context) {
 	ticker := time.NewTicker(statsLogPeriod)
 	defer ticker.Stop()
 	var prevForwarded, prevDropped, prevPingIn, prevOpenFailed, prevStray, prevHardReset uint64
-	var prevOutOK, prevOutErr uint64
+	var prevOutOK, prevOutErr, prevENOBUFS uint64
+
+	// transportENOBUFS is an optional capability some transports expose
+	// (UDP does). When the kernel send buffer fills up the transport
+	// blocks the writer goroutine for a brief backoff instead of
+	// returning the error straight back to gVisor TCP — exposing the
+	// retry count lets operators see backpressure activity without
+	// the WARN flood we used to get from amplified retransmits.
+	type enobufsReporter interface {
+		ENOBUFSRetries() uint64
+	}
+	enobufsLoader := func() uint64 { return 0 }
+	if r, ok := s.transport.(enobufsReporter); ok {
+		enobufsLoader = r.ENOBUFSRetries
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -186,6 +200,7 @@ func (s *Session) statsLogger(ctx context.Context) {
 			hardReset := s.statsHardResetIn.Load()
 			outOK := s.statsOutboundOK.Load()
 			outErr := s.statsOutboundErr.Load()
+			enobufs := enobufsLoader()
 			deltaForwarded := forwarded - prevForwarded
 			deltaDropped := dropped - prevDropped
 			deltaPingIn := pingIn - prevPingIn
@@ -194,6 +209,7 @@ func (s *Session) statsLogger(ctx context.Context) {
 			deltaHardReset := hardReset - prevHardReset
 			deltaOutOK := outOK - prevOutOK
 			deltaOutErr := outErr - prevOutErr
+			deltaENOBUFS := enobufs - prevENOBUFS
 			prevForwarded = forwarded
 			prevDropped = dropped
 			prevPingIn = pingIn
@@ -202,15 +218,19 @@ func (s *Session) statsLogger(ctx context.Context) {
 			prevHardReset = hardReset
 			prevOutOK = outOK
 			prevOutErr = outErr
+			prevENOBUFS = enobufs
 			// Time since last successful inbound — the strongest signal
 			// that the tunnel is or isn't carrying real bytes RIGHT NOW.
 			sinceLastIn := now.Sub(time.Unix(0, s.lastDataInbound.Load()))
 			level := slog.LevelDebug
 			// Anything unusual deserves WARN so it surfaces without -v:
 			// ingress drops, decrypt failures, server-driven re-handshake
-			// attempts, outbound write errors, or a stuck data path (no
-			// new forwarded packets for at least one interval).
+			// attempts, outbound write errors, sustained kernel buffer
+			// pressure (ENOBUFS backoff happening a lot), or a stuck
+			// data path (no new forwarded packets for at least one
+			// interval).
 			if deltaDropped > 0 || deltaOpenFailed > 0 || deltaHardReset > 0 || deltaOutErr > 0 ||
+				deltaENOBUFS > 10 ||
 				(deltaForwarded == 0 && sinceLastIn > statsLogPeriod) {
 				level = slog.LevelWarn
 			}
@@ -224,6 +244,7 @@ func (s *Session) statsLogger(ctx context.Context) {
 				"delta_hard_reset_in", deltaHardReset,
 				"delta_outbound_ok", deltaOutOK,
 				"delta_outbound_err", deltaOutErr,
+				"delta_enobufs_retries", deltaENOBUFS,
 				"since_last_data_in", sinceLastIn.Round(time.Millisecond),
 				"forwarded_total", forwarded,
 				"dropped_total", dropped,
@@ -233,6 +254,7 @@ func (s *Session) statsLogger(ctx context.Context) {
 				"hard_reset_in_total", hardReset,
 				"outbound_ok_total", outOK,
 				"outbound_err_total", outErr,
+				"enobufs_retries_total", enobufs,
 			)
 		}
 	}

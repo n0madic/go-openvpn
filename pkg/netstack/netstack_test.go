@@ -208,6 +208,120 @@ func TestMaskPrefixLen(t *testing.T) {
 	}
 }
 
+// TestTrackedConnLifecycle exercises the active-conns tracker without
+// going through gVisor: it inserts mock conns, verifies they're
+// remembered, force-closes them, and confirms double-close is safe and
+// re-deregistration is idempotent.
+func TestTrackedConnLifecycle(t *testing.T) {
+	t.Parallel()
+
+	n := &Net{}
+
+	type mockConn struct {
+		net.Conn // nil-Conn fine; we only exercise Close
+		closes   int
+	}
+	// Override Close via a struct that satisfies the type-assertion path.
+	closer1 := &fakeCloseCounter{}
+	closer2 := &fakeCloseCounter{}
+
+	tc1 := n.trackConn(closer1).(*trackedConn)
+	tc2 := n.trackConn(closer2).(*trackedConn)
+
+	// Both registered.
+	count := 0
+	n.activeConns.Range(func(_, _ any) bool { count++; return true })
+	if count != 2 {
+		t.Fatalf("after two trackConn, active=%d, want 2", count)
+	}
+
+	// closeActiveOnReconnect closes both and clears the map.
+	closed := n.closeActiveOnReconnect()
+	if closed != 2 {
+		t.Fatalf("closeActiveOnReconnect returned %d, want 2", closed)
+	}
+	if closer1.closes != 1 || closer2.closes != 1 {
+		t.Fatalf("expected each underlying conn closed exactly once, got %d / %d",
+			closer1.closes, closer2.closes)
+	}
+	count = 0
+	n.activeConns.Range(func(_, _ any) bool { count++; return true })
+	if count != 0 {
+		t.Fatalf("after closeActiveOnReconnect, active=%d, want 0", count)
+	}
+
+	// Double-close is idempotent on the wrapper too.
+	if err := tc1.Close(); err != nil {
+		t.Fatalf("second Close() on tc1 returned error: %v", err)
+	}
+	if closer1.closes != 2 {
+		// Note: the wrapper always forwards Close to the underlying conn,
+		// even when already deregistered — this keeps the contract of
+		// "Close returns the conn's own error" intact. The dedup is only
+		// on the map removal, not on the Conn.Close call. That's safe
+		// because gVisor's *TCPConn.Close is already idempotent.
+		t.Fatalf("after second Close() on tc1, underlying closes=%d, want 2",
+			closer1.closes)
+	}
+
+	// New conns can be tracked after a reconnect.
+	closer3 := &fakeCloseCounter{}
+	_ = n.trackConn(closer3)
+	count = 0
+	n.activeConns.Range(func(_, _ any) bool { count++; return true })
+	if count != 1 {
+		t.Fatalf("after fresh trackConn, active=%d, want 1", count)
+	}
+	_ = tc2 // keep ref for clarity
+}
+
+// fakeCloseCounter is a minimal net.Conn that counts Close calls.
+// Only Close is exercised; the other net.Conn methods are nil-bodied.
+type fakeCloseCounter struct {
+	closes int
+}
+
+func (f *fakeCloseCounter) Read([]byte) (int, error)         { return 0, nil }
+func (f *fakeCloseCounter) Write([]byte) (int, error)        { return 0, nil }
+func (f *fakeCloseCounter) Close() error                     { f.closes++; return nil }
+func (f *fakeCloseCounter) LocalAddr() net.Addr              { return nil }
+func (f *fakeCloseCounter) RemoteAddr() net.Addr             { return nil }
+func (f *fakeCloseCounter) SetDeadline(time.Time) error      { return nil }
+func (f *fakeCloseCounter) SetReadDeadline(time.Time) error  { return nil }
+func (f *fakeCloseCounter) SetWriteDeadline(time.Time) error { return nil }
+
+// TestClampInnerMTU verifies the conservative NIC MTU policy: gVisor's
+// NIC MTU must never exceed safeInnerMTU, regardless of what the
+// server pushes. This is the architectural equivalent of the
+// official OpenVPN client's MSS clamping (mssfix=1492) — gVisor TCP
+// auto-negotiates MSS based on NIC MTU, so capping the NIC MTU
+// caps the MSS apps inside the tunnel will use, which keeps every
+// outer wire datagram comfortably under 1500 bytes after
+// OpenVPN/UDP/IP encapsulation.
+func TestClampInnerMTU(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		pushed uint32
+		want   uint32
+	}{
+		{"server pushes 1500 (typical): clamp to safe", 1500, safeInnerMTU},
+		{"server pushes 1492 (PPPoE): clamp to safe", 1492, safeInnerMTU},
+		{"server pushes exactly safeInnerMTU: pass through", safeInnerMTU, safeInnerMTU},
+		{"server pushes below safe: respect server", 1280, 1280},
+		{"server pushes well below safe: respect server", 576, 576},
+		{"server pushes 0 (no MTU pushed): default to safe", 0, safeInnerMTU},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := clampInnerMTU(tc.pushed); got != tc.want {
+				t.Errorf("clampInnerMTU(%d) = %d, want %d", tc.pushed, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSubnetFromPrefix(t *testing.T) {
 	t.Parallel()
 	// Pin some IPv4 prefix and verify it survives the round-trip without

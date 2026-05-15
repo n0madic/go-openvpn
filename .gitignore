@@ -3,3 +3,4 @@ examples/netstack-http/netstack-http
 *PLAN*
 *.ovpn
 *.log
+bench-artifacts

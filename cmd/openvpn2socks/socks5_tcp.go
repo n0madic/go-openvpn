@@ -44,6 +44,25 @@ func (s *socks5Server) handleConnect(ctx context.Context, client net.Conn, br *b
 		return
 	}
 
+	target := usable[0]
+
+	// Per-destination-IP connect-burst limit (aggregate across all
+	// ports of the host). Misbehaving native clients (Telegram
+	// Desktop, iCloud sync) have been observed opening 20+ CONNECTs
+	// to the same address — split between :80 and :443 — in ~2
+	// seconds, which trips upstream rate-limiting and cascades into
+	// tunnel-wide degradation. A per-(IP,port) limiter let half of
+	// the burst through; keying on the IP catches the aggregate,
+	// which is what actually overloads the destination. Refusing
+	// the excess locally with REP=0x05 keeps the tunnel healthy at
+	// the cost of slowing the offending client.
+	if s.connRate != nil && !s.connRate.allow(target) {
+		s.log.Debug("CONNECT: per-host rate limit",
+			"target", target, "port", req.port, "host", req.host)
+		_ = writeReply(client, repConnRefused, netip.AddrPortFrom(netip.IPv4Unspecified(), 0))
+		return
+	}
+
 	addr := net.JoinHostPort(usable[0].String(), strconv.Itoa(int(req.port)))
 	remote, err := s.ns.DialContext(dialCtx, "tcp", addr)
 	if err != nil {

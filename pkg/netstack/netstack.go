@@ -49,6 +49,41 @@ import (
 // nicID is the only NIC we register inside the stack.
 const nicID tcpip.NICID = 1
 
+// safeInnerMTU caps the gVisor NIC's MTU so that, after OpenVPN
+// encryption + UDP/IP outer headers, the resulting wire datagram
+// fits within the lowest common path MTU we'll realistically see.
+//
+// Budget per wire datagram (worst case):
+//
+//	outer IPv4 header (20) + UDP header (8) +
+//	OpenVPN encap (1 opcode + 3 peer-id + 4 pkt-id + 16 AEAD tag = 24)
+//	= 52 bytes of overhead
+//
+// 1400 inner IP → 1452 outer wire. That fits 1500-MTU ethernet,
+// 1492-MTU PPPoE, 1480-MTU VPN-in-VPN, and several other common
+// "almost-1500" paths with margin. Setting the NIC MTU here is
+// architecturally equivalent to the official OpenVPN client's
+// runtime MSS clamping (`mssfix=1492` rewriting TCP SYN options on
+// every packet, src/openvpn/mss.c): gVisor *is* the OS for apps
+// inside the tunnel, so configuring its NIC MTU directly is
+// sufficient — TCP MSS auto-negotiates to NIC_MTU - 40 = 1360 on
+// every SYN gVisor generates, and apps respect it. Without this,
+// a default 1500 inner MTU produces ~1552-byte outer datagrams
+// that fragment or silently drop on any path with a strict
+// 1500-byte MTU, which manifests as "tunnel works for a while
+// then degrades under sustained TCP load".
+const safeInnerMTU = 1400
+
+// clampInnerMTU returns the smaller of `pushed` and safeInnerMTU,
+// floored sensibly. Used both at New time and on every reconnect
+// so a server pushing a different MTU still gets clamped.
+func clampInnerMTU(pushed uint32) uint32 {
+	if pushed == 0 || pushed > safeInnerMTU {
+		return safeInnerMTU
+	}
+	return pushed
+}
+
 // endpoint is a stack.LinkEndpoint backed by a tunnel net.Conn that carries
 // raw IP datagrams (one Read = one IP packet, one Write = one IP packet).
 type endpoint struct {
@@ -63,6 +98,29 @@ type endpoint struct {
 	linkAddr   tcpip.LinkAddress
 
 	onClose func()
+
+	// Diagnostic counters. Independent from session.statsOutboundOK
+	// (which counts every WritePacket on the underlying transport,
+	// including PINGs and other non-gVisor traffic). These count only
+	// IP packets that traverse the gVisor LinkEndpoint, so a divergence
+	// between (statsOutPackets here) and (statsOutboundOK in session)
+	// localises whether a stuck data path is above or below this layer.
+	statsOutPackets atomic.Uint64 // IP packets gVisor pushed to tunnel
+	statsOutErrors  atomic.Uint64 // conn.Write failures
+	statsInPackets  atomic.Uint64 // IP packets delivered up to gVisor
+	statsInUnknown  atomic.Uint64 // bad IP version, dropped
+
+	// Per-L4-protocol counters for the inbound stream. Sniff the IP
+	// header at the LinkEndpoint level (before gVisor sees the packet),
+	// so we can compare "did UDP responses physically arrive from the
+	// tunnel" (statsInUDP) against "did gVisor's UDP layer process them"
+	// (UDP.PacketsReceived). A growing statsInUDP with flat UDP.PacketsReceived
+	// pinpoints gVisor's IP-or-UDP demux as the loss point; a flat
+	// statsInUDP rules our code out and indicts the network/server.
+	statsInTCP   atomic.Uint64
+	statsInUDP   atomic.Uint64
+	statsInICMP  atomic.Uint64
+	statsInOther atomic.Uint64
 }
 
 // Compile-time guard.
@@ -199,13 +257,37 @@ func (e *endpoint) readLoop() {
 
 		// IP version is in the first nibble of the first byte.
 		var proto tcpip.NetworkProtocolNumber
+		var l4 uint8 // 0 == unknown/skip-bucketing
 		switch buf[0] >> 4 {
 		case 4:
 			proto = header.IPv4ProtocolNumber
+			// IPv4 protocol field is byte 9. Minimum IHL=5 (20 bytes).
+			if n >= 20 {
+				l4 = buf[9]
+			}
 		case 6:
 			proto = header.IPv6ProtocolNumber
+			// IPv6 NextHeader is byte 6. Strictly, NH may be a chain of
+			// extension headers (HBH/Routing/Fragment); we don't walk
+			// them here. Mis-bucketing a fragmented or extension-laden
+			// packet as "other" is harmless for our diagnostic — we're
+			// only counting frequency, not correctness.
+			if n >= 40 {
+				l4 = buf[6]
+			}
 		default:
+			e.statsInUnknown.Add(1)
 			continue
+		}
+		switch l4 {
+		case 6: // TCP
+			e.statsInTCP.Add(1)
+		case 17: // UDP
+			e.statsInUDP.Add(1)
+		case 1, 58: // ICMP, ICMPv6
+			e.statsInICMP.Add(1)
+		default:
+			e.statsInOther.Add(1)
 		}
 
 		e.mu.RLock()
@@ -222,6 +304,7 @@ func (e *endpoint) readLoop() {
 		})
 		d.DeliverNetworkPacket(proto, pkt)
 		pkt.DecRef()
+		e.statsInPackets.Add(1)
 	}
 }
 
@@ -235,11 +318,13 @@ func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 		_, err := e.conn.Write(data)
 		v.Release()
 		if err != nil {
+			e.statsOutErrors.Add(1)
 			if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
 				return wrote, &tcpip.ErrClosedForSend{}
 			}
 			return wrote, &tcpip.ErrAborted{}
 		}
+		e.statsOutPackets.Add(1)
 		wrote++
 	}
 	return wrote, nil
@@ -271,6 +356,96 @@ type Net struct {
 	closeMu sync.Mutex
 	closed  bool
 	cli     *openvpn.Client
+
+	// statsStop closes when the periodic stats logger should exit.
+	// Started in New, drained in Close.
+	statsStop chan struct{}
+
+	// activeConns tracks every net.Conn handed out by DialContext so
+	// they can be force-closed when the tunnel IP changes (see
+	// closeActiveOnReconnect). Without this, gVisor TCP endpoints
+	// bound to the OLD tunnel IP keep retransmitting with a
+	// now-invalid src IP — the server drops those packets and
+	// gVisor's TCP retransmit takes 60-120s to give up. Force-
+	// closing matches what an OS kernel does via RTM_CHANGE when
+	// a utun interface's address changes: apps see an immediate
+	// ECONNRESET and retry on the new local IP. Keys are
+	// *trackedConn (which embeds net.Conn). Map operations are
+	// safe for concurrent use.
+	activeConns sync.Map
+}
+
+// trackedConn wraps a net.Conn returned by Net.DialContext so the
+// Net can force-close it on reconnect. The original conn is exposed
+// via embedding for everything except Close (which deregisters from
+// the tracker) and CloseWrite/CloseRead (which forward to the
+// underlying conn if it supports them — gVisor's *TCPConn does,
+// *UDPConn does not, and existing SOCKS5 callers depend on the
+// type assertion `interface{ CloseWrite() error }` working when
+// the underlying is TCP).
+type trackedConn struct {
+	net.Conn
+	n      *Net
+	closed atomic.Bool
+}
+
+// Close removes the conn from the active-conns tracker and closes
+// the underlying conn. Idempotent. Safe to call from any goroutine.
+func (t *trackedConn) Close() error {
+	err := t.Conn.Close()
+	if t.closed.CompareAndSwap(false, true) {
+		t.n.activeConns.Delete(t)
+	}
+	return err
+}
+
+// CloseWrite forwards to the underlying conn if it supports half-
+// close (gVisor's *TCPConn does). For conns that don't (UDP), it's
+// a no-op returning nil — the type assertion succeeds but does
+// nothing meaningful, which matches the "do half-close if possible,
+// else nothing" pattern callers expect.
+func (t *trackedConn) CloseWrite() error {
+	if cw, ok := t.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+// CloseRead is symmetric to CloseWrite.
+func (t *trackedConn) CloseRead() error {
+	if cr, ok := t.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return nil
+}
+
+// trackConn wraps a fresh conn from gonet into a trackedConn and
+// registers it in activeConns. The returned conn is always safe to
+// Close even if called multiple times.
+func (n *Net) trackConn(c net.Conn) net.Conn {
+	if c == nil {
+		return nil
+	}
+	tc := &trackedConn{Conn: c, n: n}
+	n.activeConns.Store(tc, struct{}{})
+	return tc
+}
+
+// closeActiveOnReconnect force-closes every active conn handed out
+// by DialContext. Called from the OnReconnect hook AFTER the new
+// PUSH_REPLY's addresses have been installed on the NIC, so any
+// retry by the app's higher-level code immediately binds to the
+// fresh local IP. Returns the number of conns closed (for logging).
+func (n *Net) closeActiveOnReconnect() int {
+	closed := 0
+	n.activeConns.Range(func(k, _ any) bool {
+		if tc, ok := k.(*trackedConn); ok {
+			_ = tc.Close()
+			closed++
+		}
+		return true
+	})
+	return closed
 }
 
 // New builds a userspace TCP/IP stack on top of an openvpn.Client. The Client
@@ -287,12 +462,13 @@ func New(cli *openvpn.Client) (*Net, error) {
 	}
 
 	pr := cli.PushedOptions()
-	mtu := cli.TunnelMTU()
-	if mtu <= 0 {
-		mtu = 1500
+	rawMTU := cli.TunnelMTU()
+	if rawMTU <= 0 {
+		rawMTU = 1500
 	}
+	mtu := clampInnerMTU(uint32(rawMTU))
 
-	ep := newEndpoint(cli.Tunnel(), uint32(mtu))
+	ep := newEndpoint(cli.Tunnel(), mtu)
 
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
@@ -321,7 +497,7 @@ func New(cli *openvpn.Client) (*Net, error) {
 		return nil, fmt.Errorf("SetPromiscuousMode: %s", err)
 	}
 
-	n := &Net{stack: s, ep: ep, cli: cli, log: cli.Logger()}
+	n := &Net{stack: s, ep: ep, cli: cli, log: cli.Logger(), statsStop: make(chan struct{})}
 
 	if err := n.applyPushReply(pr); err != nil {
 		return nil, err
@@ -332,13 +508,63 @@ func New(cli *openvpn.Client) (*Net, error) {
 	// the NIC, post-reconnect packets carry the OLD source IP and the
 	// server silently drops them.
 	cli.OnReconnect(func(pr openvpn.PushReply) {
+		// Snapshot the pre-reconnect local addresses so we can decide
+		// whether existing conns are still valid (same tunnel IP) or
+		// have become zombies (new tunnel IP). The server hands us
+		// back the same IP often enough — observed in production when
+		// the edge keeps session state cached — that doing a blind
+		// force-close on every reconnect would needlessly disrupt
+		// app conns that would otherwise have kept working.
+		n.nicMu.Lock()
+		oldV4, oldV6 := n.localV4, n.localV6
+		n.nicMu.Unlock()
+
 		if err := n.applyPushReply(pr); err != nil && n.log != nil {
 			n.log.Error("netstack applyPushReply failed on reconnect", "err", err)
 		}
 		if pr.MTU > 0 {
-			n.ep.SetMTU(uint32(pr.MTU))
+			n.ep.SetMTU(clampInnerMTU(uint32(pr.MTU)))
+		}
+
+		n.nicMu.Lock()
+		newV4, newV6 := n.localV4, n.localV6
+		n.nicMu.Unlock()
+
+		ipChanged := oldV4 != newV4 || oldV6 != newV6
+		if !ipChanged {
+			// Same tunnel IP across reconnect → existing gVisor TCP
+			// 4-tuples remain valid (server's NAT/conntrack routes
+			// by IP, not by OpenVPN peer-id), so active conns are
+			// NOT zombies and we leave them alone. Apps see a brief
+			// blip during the protocol handshake, then traffic
+			// resumes on the same conns.
+			if n.log != nil {
+				n.log.Info("netstack: reconnect kept same tunnel IP, leaving active conns intact",
+					"local_v4", newV4, "local_v6", newV6)
+			}
+			return
+		}
+		// Tunnel IP changed → existing conns are bound to the OLD
+		// local IP, their packets now carry an IP the server no
+		// longer routes for our session. Force-close them so apps
+		// see ECONNRESET immediately and retry on the new local IP,
+		// instead of waiting 60-120s for gVisor's TCP retransmit to
+		// give up. Architectural equivalent of the OS kernel's
+		// RTM_CHANGE on utun when the interface address changes.
+		if closed := n.closeActiveOnReconnect(); closed > 0 && n.log != nil {
+			n.log.Info("netstack: force-closed conns bound to old tunnel IP after reconnect",
+				"count", closed,
+				"old_v4", oldV4, "new_v4", newV4,
+				"old_v6", oldV6, "new_v6", newV6,
+			)
 		}
 	})
+
+	// Start the periodic stats logger so operators can see whether
+	// stuck data flows correspond to a problem in gVisor (e.g. growing
+	// retransmits / send errors / endpoint leak) or below it. Pure
+	// observability — does not take action on anything.
+	go n.statsLoggerLoop()
 
 	return n, nil
 }
@@ -522,9 +748,182 @@ func (n *Net) Close() error {
 		return nil
 	}
 	n.closed = true
+	close(n.statsStop)
 	n.stack.Close()
 	n.ep.Close()
 	return nil
+}
+
+// statsLogPeriod is how often statsLoggerLoop emits a snapshot. Matched
+// to the session's stats period so the two logs interleave on the same
+// cadence and operators can correlate them.
+const statsLogPeriod = 30 * time.Second
+
+// statsLoggerLoop periodically logs a structured snapshot of the
+// LinkEndpoint counters and key gVisor stack.Stats() fields. Designed
+// to localise stuck data paths:
+//
+//   - Endpoint outPackets delta ≈ 0 while session outbound_ok is growing
+//     → the stuck traffic is non-gVisor (e.g. keepalive only); apps
+//     stopped sending through the netstack.
+//   - Endpoint outPackets delta growing AND tcp_retransmits delta growing
+//     → packets enter the tunnel from gVisor but aren't being acked;
+//     either the wire is dropping them or the server's data path is sick.
+//   - tcp_segment_send_errors > 0 → gVisor's own send path is failing;
+//     usually means our WritePackets returned an error.
+//   - udp_send_errors growing → ditto for UDP (DNS queries via gonet).
+//   - tcp_current_established climbing without bound → endpoint leak;
+//     our SOCKS5 layer isn't releasing TCP endpoints after Close.
+//   - ip_packets_received delta vs endpoint inPackets delta: if endpoint
+//     in is growing but IP received isn't, gVisor's IP layer is rejecting
+//     the inbound (look at ip_malformed for confirmation).
+func (n *Net) statsLoggerLoop() {
+	t := time.NewTicker(statsLogPeriod)
+	defer t.Stop()
+
+	var (
+		prevOutPkts, prevOutErr, prevInPkts uint64
+		prevInTCP, prevInUDP, prevInICMP    uint64
+		prevTCPSent, prevTCPSendErr         uint64
+		prevTCPRetrans, prevTCPResetsRcvd   uint64
+		prevTCPFailedOpens                  uint64
+		prevUDPSent, prevUDPSendErr         uint64
+		prevUDPRcvd, prevUDPUnknownPort     uint64
+		prevIPSent, prevIPRcvd              uint64
+		prevIPMalformed                     uint64
+		prevDropped                         uint64
+	)
+
+	snap := func() (
+		outPkts, outErr, inPkts, inTCP, inUDP, inICMP uint64,
+		tcpSent, tcpSendErr, tcpRetrans, tcpResetsRcvd, tcpFailedOpens, tcpCurEst uint64,
+		udpSent, udpSendErr, udpRcvd, udpUnknownPort uint64,
+		ipSent, ipRcvd, ipMalformed uint64,
+		dropped uint64,
+	) {
+		outPkts = n.ep.statsOutPackets.Load()
+		outErr = n.ep.statsOutErrors.Load()
+		inPkts = n.ep.statsInPackets.Load()
+		inTCP = n.ep.statsInTCP.Load()
+		inUDP = n.ep.statsInUDP.Load()
+		inICMP = n.ep.statsInICMP.Load()
+		st := n.stack.Stats()
+		tcpSent = st.TCP.SegmentsSent.Value()
+		tcpSendErr = st.TCP.SegmentSendErrors.Value()
+		tcpRetrans = st.TCP.Retransmits.Value()
+		tcpResetsRcvd = st.TCP.ResetsReceived.Value()
+		tcpFailedOpens = st.TCP.FailedConnectionAttempts.Value()
+		tcpCurEst = st.TCP.CurrentEstablished.Value()
+		udpSent = st.UDP.PacketsSent.Value()
+		udpSendErr = st.UDP.PacketSendErrors.Value()
+		udpRcvd = st.UDP.PacketsReceived.Value()
+		udpUnknownPort = st.UDP.UnknownPortErrors.Value()
+		ipSent = st.IP.PacketsSent.Value()
+		ipRcvd = st.IP.PacketsReceived.Value()
+		ipMalformed = st.IP.MalformedPacketsReceived.Value()
+		dropped = st.DroppedPackets.Value()
+		return
+	}
+
+	for {
+		select {
+		case <-n.statsStop:
+			return
+		case <-t.C:
+		}
+
+		outPkts, outErr, inPkts, inTCP, inUDP, inICMP,
+			tcpSent, tcpSendErr, tcpRetrans, tcpResetsRcvd, tcpFailedOpens, tcpCurEst,
+			udpSent, udpSendErr, udpRcvd, udpUnknownPort,
+			ipSent, ipRcvd, ipMalformed,
+			dropped := snap()
+
+		dOutPkts := outPkts - prevOutPkts
+		dOutErr := outErr - prevOutErr
+		dInPkts := inPkts - prevInPkts
+		dInTCP := inTCP - prevInTCP
+		dInUDP := inUDP - prevInUDP
+		dInICMP := inICMP - prevInICMP
+		dTCPSent := tcpSent - prevTCPSent
+		dTCPSendErr := tcpSendErr - prevTCPSendErr
+		dTCPRetrans := tcpRetrans - prevTCPRetrans
+		dTCPResetsRcvd := tcpResetsRcvd - prevTCPResetsRcvd
+		dTCPFailedOpens := tcpFailedOpens - prevTCPFailedOpens
+		dUDPSent := udpSent - prevUDPSent
+		dUDPSendErr := udpSendErr - prevUDPSendErr
+		dUDPRcvd := udpRcvd - prevUDPRcvd
+		dUDPUnknownPort := udpUnknownPort - prevUDPUnknownPort
+		dIPSent := ipSent - prevIPSent
+		dIPRcvd := ipRcvd - prevIPRcvd
+		dIPMalformed := ipMalformed - prevIPMalformed
+		dDropped := dropped - prevDropped
+
+		prevOutPkts = outPkts
+		prevOutErr = outErr
+		prevInPkts = inPkts
+		prevInTCP = inTCP
+		prevInUDP = inUDP
+		prevInICMP = inICMP
+		prevTCPSent = tcpSent
+		prevTCPSendErr = tcpSendErr
+		prevTCPRetrans = tcpRetrans
+		prevTCPResetsRcvd = tcpResetsRcvd
+		prevTCPFailedOpens = tcpFailedOpens
+		prevUDPSent = udpSent
+		prevUDPSendErr = udpSendErr
+		prevUDPRcvd = udpRcvd
+		prevUDPUnknownPort = udpUnknownPort
+		prevIPSent = ipSent
+		prevIPRcvd = ipRcvd
+		prevIPMalformed = ipMalformed
+		prevDropped = dropped
+
+		// Anything that looks like a real symptom escalates to WARN so
+		// it surfaces without -v: outright errors, growing retransmits,
+		// resets received, malformed packets, generic dropped packets,
+		// or UDP responses landing on closed endpoints.
+		level := slog.LevelDebug
+		if dOutErr > 0 || dTCPSendErr > 0 || dUDPSendErr > 0 ||
+			dTCPRetrans > 5 || dTCPResetsRcvd > 0 ||
+			dIPMalformed > 0 || dDropped > 0 || dUDPUnknownPort > 0 {
+			level = slog.LevelWarn
+		}
+
+		if n.log != nil {
+			n.log.Log(context.Background(), level, "netstack stats",
+				"interval", statsLogPeriod,
+				// LinkEndpoint counters (deltas + totals).
+				"delta_ep_out", dOutPkts,
+				"delta_ep_out_err", dOutErr,
+				"delta_ep_in", dInPkts,
+				"delta_ep_in_tcp", dInTCP,
+				"delta_ep_in_udp", dInUDP,
+				"delta_ep_in_icmp", dInICMP,
+				"ep_out_total", outPkts,
+				"ep_out_err_total", outErr,
+				"ep_in_total", inPkts,
+				"ep_in_udp_total", inUDP,
+				// gVisor TCP.
+				"delta_tcp_sent", dTCPSent,
+				"delta_tcp_send_err", dTCPSendErr,
+				"delta_tcp_retrans", dTCPRetrans,
+				"delta_tcp_resets_rcvd", dTCPResetsRcvd,
+				"delta_tcp_failed_opens", dTCPFailedOpens,
+				"tcp_current_established", tcpCurEst,
+				// gVisor UDP.
+				"delta_udp_sent", dUDPSent,
+				"delta_udp_send_err", dUDPSendErr,
+				"delta_udp_rcvd", dUDPRcvd,
+				"delta_udp_unknown_port", dUDPUnknownPort,
+				// gVisor IP.
+				"delta_ip_sent", dIPSent,
+				"delta_ip_rcvd", dIPRcvd,
+				"delta_ip_malformed", dIPMalformed,
+				// Catch-all.
+				"delta_dropped", dDropped,
+			)
+		}
+	}
 }
 
 // CloseAll tears down BOTH the netstack and the openvpn.Client.
@@ -574,7 +973,11 @@ func (n *Net) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 
 	switch network {
 	case "tcp", "tcp4", "tcp6":
-		return gonet.DialContextTCP(ctx, n.stack, full, proto)
+		c, err := gonet.DialContextTCP(ctx, n.stack, full, proto)
+		if err != nil {
+			return nil, err
+		}
+		return n.trackConn(c), nil
 	case "udp", "udp4", "udp6":
 		// gonet.DialUDP has no Context variant; it returns immediately because
 		// UDP is connectionless. We honor ctx best-effort by checking it first.
@@ -584,7 +987,11 @@ func (n *Net) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 		// Pass an explicit local address for UDP. Without this gVisor picks
 		// from the NIC's address list via route lookup; passing laddr makes
 		// the bind track reconnect-driven IP changes 1:1.
-		return gonet.DialUDP(n.stack, n.currentLocalFullAddress(ip.Is4()), &full, proto)
+		c, err := gonet.DialUDP(n.stack, n.currentLocalFullAddress(ip.Is4()), &full, proto)
+		if err != nil {
+			return nil, err
+		}
+		return n.trackConn(c), nil
 	default:
 		return nil, &net.OpError{Op: "dial", Net: network, Err: errors.New("netstack: unsupported network")}
 	}

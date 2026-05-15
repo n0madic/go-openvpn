@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -40,7 +41,54 @@ var udpReadBufPool = sync.Pool{
 type udpConn struct {
 	c      *net.UDPConn
 	closed atomic.Bool
+
+	// statsENOBUFSRetries counts how many times we hit ENOBUFS on the
+	// kernel send buffer and successfully retried after backoff. A
+	// healthy session has zero of these; a sustained spike means the
+	// upper layer (typically gVisor TCP under a speedtest or bulk
+	// upload) is producing packets faster than the kernel can flush
+	// to the wire and the backoff loop is doing its job.
+	statsENOBUFSRetries atomic.Uint64
 }
+
+// ENOBUFSRetries returns the count of WritePacket calls that had to
+// back off because the kernel UDP send buffer was full. Exposed via
+// transport.PacketConn through a type assertion in stats reporting.
+func (u *udpConn) ENOBUFSRetries() uint64 { return u.statsENOBUFSRetries.Load() }
+
+// WritePacket retry-loop tunables. Keeping them as constants (not
+// configurable) — these are protocol-correctness numbers, not
+// per-deployment tuning knobs.
+const (
+	// enobufInitialBackoff is the first sleep after ENOBUFS. Below
+	// macOS/Linux scheduler tick (1ms) on purpose: the buffer
+	// typically drains in microseconds, so the first retry usually
+	// succeeds immediately.
+	enobufInitialBackoff = 500 * time.Microsecond
+	// enobufMaxBackoff caps the exponential backoff. 16ms is small
+	// enough that gVisor TCP's send window stays unaffected during
+	// transient bursts but large enough to give a saturated kernel
+	// buffer real time to drain.
+	enobufMaxBackoff = 16 * time.Millisecond
+	// enobufMaxTotalSleep is the upper bound on how long one
+	// WritePacket call may block waiting for the buffer to drain.
+	// Past this we return ENOBUFS to the caller — gVisor TCP then
+	// queues for retransmit (lossless), or UDP/keepalive drops the
+	// packet (cheap to retry at the next interval).
+	//
+	// 1500ms is generous — a 1 Gbps speedtest fills 4 MiB SO_SNDBUF
+	// in ~33ms, so any genuinely-healthy write finishes far inside
+	// this window. The headroom matters because the backpressure
+	// only blocks the *one* TCP endpoint's goroutine (gVisor calls
+	// WritePackets per endpoint, in parallel); other connections
+	// keep flowing while one waits. With a shorter window (we tried
+	// 200ms) a sustained burst racked up a small but non-zero error
+	// count and the operator-visible WARN flood looked alarming
+	// even though gVisor TCP was happily retransmitting and the
+	// tunnel was healthy. 1500ms cuts those near-misses to zero
+	// in the same workload.
+	enobufMaxTotalSleep = 1500 * time.Millisecond
+)
 
 func dialUDP(ctx context.Context, network, addr string) (PacketConn, error) {
 	var d net.Dialer
@@ -106,8 +154,58 @@ func (u *udpConn) WritePacket(ctx context.Context, p []byte) error {
 		_ = u.c.SetWriteDeadline(deadline)
 		defer func() { _ = u.c.SetWriteDeadline(time.Time{}) }()
 	}
+
+	// Fast path: vast majority of writes succeed first try.
 	_, err := u.c.Write(p)
-	return err
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, syscall.ENOBUFS) {
+		return err
+	}
+
+	// ENOBUFS: kernel UDP send buffer is full. Returning the error
+	// straight back to gVisor TCP would let it retransmit the same
+	// packet immediately, amplifying the buffer pressure into a
+	// retransmit storm. Instead, we block the writer goroutine for
+	// a brief backoff so gVisor's TCP send rate naturally throttles
+	// down to match the rate at which the kernel can flush to the
+	// wire — the same way kernel TCP/IP stacks apply backpressure
+	// via EAGAIN/ENOBUFS on the application send call.
+	//
+	// Total block bounded by enobufMaxTotalSleep to keep one stuck
+	// write from pinning the whole writer (a wedged wire would
+	// otherwise look indistinguishable from saturated wire).
+	backoff := enobufInitialBackoff
+	var totalSleep time.Duration
+	for {
+		if totalSleep >= enobufMaxTotalSleep {
+			return err
+		}
+		if dl, ok := ctx.Deadline(); ok && time.Until(dl) <= backoff {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		totalSleep += backoff
+		if backoff < enobufMaxBackoff {
+			backoff *= 2
+			if backoff > enobufMaxBackoff {
+				backoff = enobufMaxBackoff
+			}
+		}
+		_, err = u.c.Write(p)
+		if err == nil {
+			u.statsENOBUFSRetries.Add(1)
+			return nil
+		}
+		if !errors.Is(err, syscall.ENOBUFS) {
+			return err
+		}
+	}
 }
 
 func (u *udpConn) LocalAddr() net.Addr  { return u.c.LocalAddr() }

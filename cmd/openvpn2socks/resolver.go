@@ -208,19 +208,51 @@ func (r *resolver) maybeWarnSystemFallback(host string) {
 		"host", host)
 }
 
-// queryOverTunnel sends parallel DNS A and AAAA queries to server via the
-// netstack and returns the merged answer IPs. Each qtype runs on its own
-// gonet UDP conn with its own per-query deadline — that way a slow A
-// response doesn't burn the whole deadline and force AAAA to fail without
-// having even hit the wire (a real failure mode observed against
-// ProtonVPN's pushed resolver).
+// pickQueryTypes returns the DNS qtypes worth issuing for a host given
+// the NIC's current address families. AAAA queries are pure overhead
+// when the NIC has no IPv6 address — the response IPs are unreachable
+// and filterUsableIPs would discard them anyway — so we skip them
+// entirely to halve the DNS wire load on v4-only tunnels (which is the
+// common case for ProtonVPN users without v6). Pulled out as a pure
+// function for trivial unit-testing.
+func pickQueryTypes(hasV4, hasV6 bool) []uint16 {
+	qtypes := make([]uint16, 0, 2)
+	if hasV4 {
+		qtypes = append(qtypes, dnsTypeA)
+	}
+	if hasV6 {
+		qtypes = append(qtypes, dnsTypeAAAA)
+	}
+	return qtypes
+}
+
+// queryOverTunnel sends the relevant DNS queries (A and/or AAAA, see
+// pickQueryTypes) to server via the netstack in parallel and returns
+// the merged answer IPs. Each qtype runs on its own gonet UDP conn
+// with its own per-query deadline — that way a slow A response doesn't
+// burn the whole deadline and force AAAA to fail without having even
+// hit the wire (a real failure mode observed against ProtonVPN's
+// pushed resolver). Issuing AAAA on a v4-only NIC is suppressed
+// entirely; gratuitous AAAA queries are the single biggest source of
+// DNS load against the tunnel under browser workloads and contributed
+// directly to the upstream UDP rate-limit we've seen.
 func (r *resolver) queryOverTunnel(ctx context.Context, server netip.AddrPort, host string) ([]netip.Addr, error) {
 	type result struct {
 		ips   []netip.Addr
 		err   error
 		qtype uint16
 	}
-	qtypes := []uint16{dnsTypeA, dnsTypeAAAA}
+	// Default to both families when ns is nil so unit tests that don't
+	// wire up a netstack continue to exercise the merge path.
+	hasV4, hasV6 := true, true
+	if r.ns != nil {
+		hasV4 = r.ns.HasIPv4()
+		hasV6 = r.ns.HasIPv6()
+	}
+	qtypes := pickQueryTypes(hasV4, hasV6)
+	if len(qtypes) == 0 {
+		return nil, fmt.Errorf("no usable address family for DNS lookup of %q", host)
+	}
 	ch := make(chan result, len(qtypes))
 	for _, qt := range qtypes {
 		go func(qt uint16) {

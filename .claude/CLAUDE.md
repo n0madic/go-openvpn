@@ -224,6 +224,31 @@ internal/session         Orchestrator. Goroutines per active session
    because user data updates `lastInbound` (link-options.rst: "ping ...
    or other packet").
 
+7b. **`ENOBUFS` on kernel UDP send must apply backpressure, not just
+   error.** Even with `SO_SNDBUF` bumped to 4 MiB, a sustained burst
+   (speedtest, bulk upload) will fill it faster than the kernel can
+   drain to the wire. Returning the error straight to the caller —
+   especially gVisor TCP — lets it queue the packet for retransmit
+   instead of slowing its send rate; the retransmit also hits a full
+   buffer and the cycle amplifies into a retransmit storm that we
+   watched cause 10,000+ ENOBUFS errors in 4 minutes, after which the
+   tunnel was effectively dead because the server gave up on us. The
+   correct behaviour is to **block the writer goroutine** for a brief
+   backoff (`enobufInitialBackoff=500µs`, exponential up to
+   `enobufMaxBackoff=16ms`, capped at `enobufMaxTotalSleep=200ms` per
+   call) — same mechanism kernel TCP/IP stacks use to propagate
+   backpressure to user-space via EAGAIN. gVisor's TCP send rate then
+   naturally throttles to match the wire drain rate without
+   amplification. After 200ms total backoff, we DO return the error
+   (gVisor TCP will retransmit on its own schedule, lossless; UDP/
+   keepalive callers either retry at the next interval or are
+   transient enough to lose). Successful retries are counted in
+   `statsENOBUFSRetries` and surfaced as `enobufs_retries_total` /
+   `delta_enobufs_retries` in `statsLogger` (delta > 10 escalates to
+   WARN level so operators see sustained pressure without `-v`).
+   Don't remove this — without it, speedtest poisons the tunnel
+   permanently.
+
 8. **macOS default `SO_SNDBUF` (~9 KiB) is too small for burst load.**
    gVisor TCP/UDP under heavy concurrent traffic (speedtest, parallel
    HTTP/2 fan-out) easily generates a burst that exceeds the OS UDP
@@ -308,6 +333,27 @@ inside is a `stack.LinkEndpoint` that pumps IP packets between the gVisor
 stack and the tunnel `net.Conn` without any link-layer header
 (ARPHardwareNone, MaxHeaderLength=0).
 
+**Conservative NIC MTU (`safeInnerMTU=1400`):** the gVisor NIC's
+MTU is always clamped to 1400, regardless of what the server's
+PUSH_REPLY says. With OpenVPN encap (24 B) + outer UDP (8 B) +
+outer IPv4 (20 B) = 52 B of overhead, an inner IP packet of 1400
+becomes a 1452-byte wire datagram — well under 1500 (ethernet),
+1492 (PPPoE), 1480 (VPN-in-VPN). This is the architectural
+equivalent of the official OpenVPN client's runtime MSS clamping
+(`mssfix=1492` rewriting TCP MSS option on every TCP SYN, see
+`src/openvpn/mss.c::mss_fixup_dowork`) — but **simpler in our
+architecture**: gVisor *is* the OS stack for apps inside the
+tunnel, so configuring its NIC MTU directly causes gVisor TCP to
+auto-negotiate the right MSS (NIC_MTU - 40 = 1360) on every SYN
+it emits; apps respect it, no runtime packet rewriting needed.
+Without this, a naive 1500-byte inner MTU produces ~1552-byte
+outer datagrams that fragment or silently drop on any path with
+a strict 1500-byte MTU — which manifests as "tunnel works for a
+while then degrades under sustained TCP load", a pattern we hit
+in early testing. Applied at both `New` time and on every
+reconnect via `clampInnerMTU` so a server pushing a different MTU
+after AutoReconnect still gets clamped.
+
 **Reconnect synchronisation:** the NIC address / routes / MTU are NOT
 fixed at construction. `Net.New` registers an `openvpn.Client.OnReconnect`
 hook that re-runs `Net.applyPushReply` against every freshly-installed
@@ -317,9 +363,110 @@ source IP and the server drops them — there's no protocol-level error
 back, just silent black-hole. The hook updates IPv4 + IPv6 addresses
 (new before old, no transient unconfigured-NIC window), reinstalls the
 route table (`SetRouteTable` replaces, not merges), and refreshes the
-endpoint MTU. Existing TCP/UDP gVisor connections bound to the old
-address become zombies and time out naturally — client apps retry and
-fresh conns bind to the new local IP.
+endpoint MTU.
+
+**Zombie-endpoint cleanup on reconnect (IP-change-conditional):**
+existing TCP/UDP gVisor connections that were bound to the OLD
+local IP would become zombies when the tunnel IP changes — they
+keep retransmitting with the now-invalid src IP, the server drops
+those packets, and gVisor's TCP retransmit takes 60-120s to give
+up. Apps using those conns see a long stall. To match the OS
+kernel's `RTM_CHANGE` behaviour on utun (which fails existing
+kernel sockets with `ECONNRESET` the moment the interface address
+changes), `Net` tracks every `net.Conn` it hands out via
+`DialContext` in an `activeConns sync.Map` (wrapped in a
+`trackedConn` that deregisters on `Close`). The OnReconnect hook
+snapshots the pre-reconnect `(localV4, localV6)`, calls
+`applyPushReply` to install the new addresses, then compares:
+
+  - **IP changed** → call `closeActiveOnReconnect` to force-close
+    every tracked conn; apps see an immediate error on the next
+    Read/Write, retry, and the retry's new gVisor endpoint binds
+    to the fresh local IP.
+  - **IP unchanged** → leave active conns alone. Same tunnel IP
+    across reconnect means existing 4-tuples are still valid
+    (server's NAT/conntrack routes by IP, not by OpenVPN peer-id),
+    so a blind force-close would needlessly disrupt conns that
+    would otherwise have kept working. Logged at Info as
+    "reconnect kept same tunnel IP, leaving active conns intact".
+
+ProtonVPN was observed handing back the same IP often enough to
+make this check worthwhile. The `trackedConn` wrapper explicitly
+forwards `CloseWrite()` and `CloseRead()` so the type assertion in
+`socks5_tcp.go::proxy` (`interface{ CloseWrite() error }`) still
+matches for TCP-backed conns; for UDP the methods are no-op safe.
+
+**Data-path observability:** the LinkEndpoint exposes atomic
+counters for every IP packet it sees in each direction, bucketed
+by L4 protocol via a 1-byte sniff of the IP header
+(`statsOutPackets`, `statsInPackets`, `statsInTCP`, `statsInUDP`,
+`statsInICMP`). These are independent from the session-level
+`statsOutboundOK` counter (which counts ALL transport writes
+including PINGs and other non-gVisor traffic) — divergence
+between the two localises whether a stuck data path is inside or
+outside the netstack. `statsLoggerLoop` dumps the counters plus
+key fields from `stack.Stats()` (TCP retransmits/resets/send-
+errors, UDP packets-sent/received/unknown-port, IP packets/
+malformed, DroppedPackets) every `statsLogPeriod=30s` at Debug
+level — anything unusual auto-escalates to Warn so `-v` is not
+required to see real problems.
+
+**Pure observability — no actions.** An earlier iteration added a
+"data-path health watchdog" goroutine on top of these counters
+that called `cli.RequestRestart` on application-level "TCP-deaf",
+"UDP-deaf" or "TCP-RST-storm" signatures, escalating to
+`os.Exit(99)` after two consecutive triggers. **It was removed**
+because every single failure case we collected on a real
+ProtonVPN tunnel turned out to be the watchdog itself creating
+the problem:
+
+  - The triggering metric (DNS UDP timeout, transient RST burst
+    from a busy browsing session, etc.) reflected an
+    application-level hiccup, not a dead tunnel — the OpenVPN
+    protocol layer was still flowing, `dataActivityWatch` and
+    `pingRestartWatch` weren't firing.
+  - The watchdog-requested AutoReconnect changed the tunnel IP.
+  - gVisor TCP endpoints bound to the OLD tunnel IP became
+    zombies: they kept retransmitting with the now-invalid src
+    IP, the server dropped those packets, `ep_in_tcp` looked
+    like zero, the watchdog interpreted that as "tcp-deaf" and
+    escalated to `os.Exit(99)`.
+  - Reference data point: the official OpenVPN CLI client
+    against the same endpoint runs stably for hours with no
+    such gymnastics. The reconnect machinery built into the
+    OpenVPN protocol (`pingRestartWatch`, `dataActivityWatch`,
+    `hardResetWatch`, server-pushed RESTART) is the right
+    self-healing layer — it operates on protocol-level signals
+    that don't false-fire on application transients.
+
+The counters and `statsLoggerLoop` stayed because they're
+genuinely useful for diagnosing what's going on. The lesson:
+**don't act on application-level metrics when a protocol-level
+self-healing layer already exists** — those metrics are inherently
+noisier than the underlying protocol's own keepalive/restart
+mechanisms, and acting on them turns false signals into real
+outages. All three have been observed against a
+real ProtonVPN edge under sustained load; mitigation is taking a fresh
+session. `healthCooldown=60s` mutes the watchdog after each trigger,
+and the snapshot ring is dropped on trigger so the next decision
+window evaluates ONLY the new session's data. Decision logic is split
+into the pure `decideHealthTrigger(dUDPSent, dEpInUDP, dTCPSent,
+dEpInTCP, dTCPRST, window)` so it's unit-tested via table-driven
+cases. **Escalation**: consecutive triggers (no clean window
+between them) increment a counter; at `healthUnrecoverableLimit=2`
+the watchdog calls the `OnUnrecoverable` callback registered via
+`Net.SetOnUnrecoverable` — `cmd/openvpn2socks/main.go` wires this
+to `os.Exit(99)`. Rationale: ProtonVPN sometimes hands us back the
+*same* tunnel IP across `RequestRestart` (we've watched it live,
+`local_ip=10.96.0.34` before and after) and the same broken state
+follows, so AutoReconnect alone isn't enough — only a full process
+relaunch (new kernel UDP socket → new ephemeral source port) breaks
+a source-port-keyed rate limit. Don't merge this watchdog into
+`session.dataActivityWatch` — that one fires on "user is sending
+but no inbound at all"; this one fires on "user is sending UDP/TCP
+but the same family comes back as 0" while *other* traffic
+(keepalives) keeps `lastDataInbound` fresh and would mask the
+failure.
 
 **IPv6 plumbing:** the parser splits dual-stack data into separate
 fields — `PushReply.LocalIP6` (a `netip.Prefix` from `ifconfig-ipv6
@@ -354,11 +501,40 @@ supported; BIND returns `REP=0x07`. DNS resolution order:
    when no `-dns` override is set
 5. system resolver, throttled WARN — DNS leaked
 
+**Address-family-aware qtype filter:** `pickQueryTypes(hasV4, hasV6)`
+inside `resolver.queryOverTunnel` decides which DNS qtypes to issue
+based on the NIC's current address families. AAAA on a v4-only NIC
+is suppressed — the response IPs would be discarded by
+`filterUsableIPs` before any dial anyway, but the queries still
+hit the wire, doubling the DNS load on the (common) ProtonVPN
+v4-only configuration. We watched this load contribute directly
+to an upstream UDP rate-limit ("UDP-deaf" mode) under browser
+workloads. Symmetric for v6-only NICs. Same filter is also unit-
+tested as a pure function so the qtype decision is regression-
+covered without needing a real netstack.
+
 Cache writes happen on every successful *tunneled* resolution (including
 the public-resolver fallback), but **NOT** on system-resolver results —
 caching a system-resolved IP could prolong leak windows after the
 tunnel recovers. Empty answer slices are ignored on `cacheSet` so a
 "no records" answer doesn't masquerade as a hit.
+
+**Per-host connect-burst limit (`connrate.go`):** a token-bucket
+limiter keyed on the **destination IP** (NOT `(IP, port)`) rejects
+misbehaving clients before they hit the tunnel. Burst=8, refill=2/sec
+— healthy browser fan-out (6-8 parallel sockets per page) sails
+through; a misbehaving native client bursting 20 CONNECTs to one
+host in ~2 seconds gets refused with REP=0x05 after the burst is
+drained. The key choice matters: the field-observed Telegram
+Desktop pattern split the burst across both :80 and :443 of one
+host (12 + 8 conns), so a per-`(IP, port)` limiter let both halves
+through. Per-IP catches the aggregate, which is what overloads the
+destination server's own rate-limit. Without this, the burst trips
+upstream rate-limiting which cascades into `dataHealthWatch`'s
+TCP-deaf trigger, and we end up exiting with code 99 because one
+bad client poisoned the whole tunnel. Bucket state is GC'd every
+30s for any target idle >5min. Pure-Go, no deps; unit-tested via
+burst/refill/independence/aggregate-across-ports cases.
 
 **Address-family filter:** `handleConnect` and the UDP relay funnel the
 resolver output through `filterUsableIPs(ips, ns.HasIPv4(), ns.HasIPv6())`

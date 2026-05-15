@@ -27,6 +27,39 @@ func newTestResolver(t *testing.T) *resolver {
 	return newResolver(nil, nil, netip.AddrPort{}, log)
 }
 
+// TestPickQueryTypes verifies the address-family-aware qtype filter
+// that cuts the DNS wire load in half on v4-only tunnels (the common
+// ProtonVPN case observed in the field). AAAA on a v4-only NIC was a
+// pure waste: the response IPs would be filtered out by
+// filterUsableIPs before any dial anyway.
+func TestPickQueryTypes(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name         string
+		hasV4, hasV6 bool
+		want         []uint16
+	}{
+		{"v4-only NIC: only A", true, false, []uint16{dnsTypeA}},
+		{"v6-only NIC: only AAAA", false, true, []uint16{dnsTypeAAAA}},
+		{"dual-stack NIC: both", true, true, []uint16{dnsTypeA, dnsTypeAAAA}},
+		{"no addrs: none", false, false, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := pickQueryTypes(tc.hasV4, tc.hasV6)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
 // TestCacheStoresAndReturnsHits confirms the basic positive path: write
 // once, read many — every subsequent call returns the cached entry until
 // dnsCacheTTL elapses.
