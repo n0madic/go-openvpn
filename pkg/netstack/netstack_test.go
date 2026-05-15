@@ -72,7 +72,7 @@ func TestEndpointInbound(t *testing.T) {
 	cliConn, srvConn := net.Pipe()
 	defer func() { _ = srvConn.Close() }()
 
-	ep := newEndpoint(cliConn, 1500)
+	ep := newEndpoint(cliConn, 1500, false)
 	disp := newFakeDispatcher()
 	ep.Attach(disp)
 	defer ep.Close()
@@ -122,7 +122,7 @@ func TestEndpointOutbound(t *testing.T) {
 	defer func() { _ = cliConn.Close() }()
 	defer func() { _ = srvConn.Close() }()
 
-	ep := newEndpoint(cliConn, 1500)
+	ep := newEndpoint(cliConn, 1500, false)
 	defer ep.Close()
 	// Attach is required by some stack code paths, but WritePackets does not
 	// gate on it. We still Attach a dispatcher to keep the lifecycle realistic.
@@ -169,7 +169,7 @@ func TestEndpointCloseUnblocksReader(t *testing.T) {
 	cliConn, srvConn := net.Pipe()
 	defer func() { _ = srvConn.Close() }()
 
-	ep := newEndpoint(cliConn, 1500)
+	ep := newEndpoint(cliConn, 1500, false)
 	ep.Attach(newFakeDispatcher())
 
 	done := make(chan struct{})

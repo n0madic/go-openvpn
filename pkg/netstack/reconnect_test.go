@@ -27,7 +27,7 @@ import (
 func newTestNet(t *testing.T) (*Net, func()) {
 	t.Helper()
 	cli, srv := net.Pipe()
-	ep := newEndpoint(cli, 1500)
+	ep := newEndpoint(cli, 1500, false)
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,

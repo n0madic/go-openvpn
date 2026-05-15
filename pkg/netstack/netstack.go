@@ -92,6 +92,14 @@ type endpoint struct {
 	closeMu sync.Mutex
 	closed  bool
 	done    chan struct{}
+	doneCh  sync.Once // closes done at most once (readLoop OR Close)
+
+	// directDelivery, when true, signals Attach to skip starting the
+	// reader goroutine: inbound IP packets are delivered via
+	// deliverInbound from the openvpn session's read loop, not by
+	// pulling them from e.conn here. Avoids one goroutine handoff and
+	// one defensive memcpy per inbound packet.
+	directDelivery bool
 
 	mu         sync.RWMutex
 	dispatcher stack.NetworkDispatcher
@@ -127,10 +135,13 @@ type endpoint struct {
 var _ stack.LinkEndpoint = (*endpoint)(nil)
 
 // newEndpoint wraps the given conn into a LinkEndpoint with the given MTU.
-func newEndpoint(conn net.Conn, mtu uint32) *endpoint {
+// When directDelivery is true the endpoint does NOT spawn a reader
+// goroutine in Attach; inbound packets arrive via deliverInbound.
+func newEndpoint(conn net.Conn, mtu uint32, directDelivery bool) *endpoint {
 	e := &endpoint{
-		conn: conn,
-		done: make(chan struct{}),
+		conn:           conn,
+		done:           make(chan struct{}),
+		directDelivery: directDelivery,
 	}
 	e.mtu.Store(mtu)
 	return e
@@ -156,13 +167,18 @@ func (e *endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
 
 func (*endpoint) Capabilities() stack.LinkEndpointCapabilities { return stack.CapabilityNone }
 
-// Attach starts the reader goroutine that pumps inbound IP packets up the
-// stack. Called once by stack.Stack.CreateNIC.
+// Attach wires the dispatcher and (unless directDelivery is set) starts
+// the reader goroutine that pumps inbound IP packets up the stack.
+// Called once by stack.Stack.CreateNIC.
+//
+// In directDelivery mode the readLoop is skipped: inbound packets reach
+// the dispatcher via deliverInbound called from the openvpn session's
+// own read loop. The endpoint still uses conn for outbound (WritePackets).
 func (e *endpoint) Attach(d stack.NetworkDispatcher) {
 	e.mu.Lock()
 	e.dispatcher = d
 	e.mu.Unlock()
-	if d != nil {
+	if d != nil && !e.directDelivery {
 		go e.readLoop()
 	}
 }
@@ -211,6 +227,13 @@ func (e *endpoint) Close() {
 		_ = d.SetReadDeadline(time.Unix(1, 0))
 	}
 	_ = e.conn.Close()
+	// In directDelivery mode readLoop never runs, so nothing else closes
+	// e.done — drive it from Close. sync.Once makes the double-close from
+	// the legacy path (readLoop's `defer close(e.done)` + an explicit
+	// Close()) harmless. Wait() therefore returns the moment Close ran.
+	if e.directDelivery {
+		e.doneCh.Do(func() { close(e.done) })
+	}
 	if cb != nil {
 		cb()
 	}
@@ -231,7 +254,7 @@ func (e *endpoint) SetOnCloseAction(f func()) {
 const maxIPPacketLen = 65535 + 64
 
 func (e *endpoint) readLoop() {
-	defer close(e.done)
+	defer e.doneCh.Do(func() { close(e.done) })
 	buf := make([]byte, maxIPPacketLen)
 	for {
 		n, err := e.conn.Read(buf)
@@ -254,58 +277,96 @@ func (e *endpoint) readLoop() {
 		if n < 1 {
 			continue
 		}
-
-		// IP version is in the first nibble of the first byte.
-		var proto tcpip.NetworkProtocolNumber
-		var l4 uint8 // 0 == unknown/skip-bucketing
-		switch buf[0] >> 4 {
-		case 4:
-			proto = header.IPv4ProtocolNumber
-			// IPv4 protocol field is byte 9. Minimum IHL=5 (20 bytes).
-			if n >= 20 {
-				l4 = buf[9]
-			}
-		case 6:
-			proto = header.IPv6ProtocolNumber
-			// IPv6 NextHeader is byte 6. Strictly, NH may be a chain of
-			// extension headers (HBH/Routing/Fragment); we don't walk
-			// them here. Mis-bucketing a fragmented or extension-laden
-			// packet as "other" is harmless for our diagnostic — we're
-			// only counting frequency, not correctness.
-			if n >= 40 {
-				l4 = buf[6]
-			}
-		default:
-			e.statsInUnknown.Add(1)
-			continue
-		}
-		switch l4 {
-		case 6: // TCP
-			e.statsInTCP.Add(1)
-		case 17: // UDP
-			e.statsInUDP.Add(1)
-		case 1, 58: // ICMP, ICMPv6
-			e.statsInICMP.Add(1)
-		default:
-			e.statsInOther.Add(1)
-		}
-
-		e.mu.RLock()
-		d := e.dispatcher
-		e.mu.RUnlock()
-		if d == nil {
+		if e.dispatchInbound(buf[:n]) {
+			// dispatcher missing — Attach hasn't wired one or the NIC
+			// was removed. Without a sink there's nothing to do, so
+			// terminate the loop cleanly.
 			return
 		}
-
-		// gVisor takes ownership of the PacketBuffer's payload, so we hand
-		// over a freshly-allocated copy of the slice we just read.
-		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithData(append([]byte(nil), buf[:n]...)),
-		})
-		d.DeliverNetworkPacket(proto, pkt)
-		pkt.DecRef()
-		e.statsInPackets.Add(1)
 	}
+}
+
+// deliverInbound is the fast-path entry for direct delivery from the
+// openvpn session's read loop. ip is the plaintext IP datagram returned
+// by the AEAD decrypt; the caller is free to reuse the backing memory
+// once this returns (buffer.MakeWithData copies, see comments below).
+//
+// Stats counters and L4 bucketing mirror readLoop's behaviour so the
+// monitoring view is identical regardless of which path delivers a
+// given packet.
+func (e *endpoint) deliverInbound(ip []byte) {
+	// dispatcher-missing is treated as a per-packet drop here — the
+	// session keeps calling deliverInbound on subsequent packets, and a
+	// late Attach (unlikely under direct delivery, but possible during
+	// startup) will resume normal flow without restarting anything.
+	_ = e.dispatchInbound(ip)
+}
+
+// dispatchInbound is the shared body used by both readLoop (legacy
+// channel-then-Tunnel.Read path, used by tests and any pre-Net.New
+// consumer) and deliverInbound (direct fast path, used by netstack.Net).
+//
+// Returns dispatcherMissing=true when no dispatcher is attached; the
+// readLoop interprets that as a terminal "no sink" signal, while
+// deliverInbound just drops the packet and moves on.
+func (e *endpoint) dispatchInbound(ip []byte) (dispatcherMissing bool) {
+	n := len(ip)
+	if n < 1 {
+		return false
+	}
+	// IP version is in the first nibble of the first byte.
+	var proto tcpip.NetworkProtocolNumber
+	var l4 uint8 // 0 == unknown/skip-bucketing
+	switch ip[0] >> 4 {
+	case 4:
+		proto = header.IPv4ProtocolNumber
+		// IPv4 protocol field is byte 9. Minimum IHL=5 (20 bytes).
+		if n >= 20 {
+			l4 = ip[9]
+		}
+	case 6:
+		proto = header.IPv6ProtocolNumber
+		// IPv6 NextHeader is byte 6. Strictly, NH may be a chain of
+		// extension headers (HBH/Routing/Fragment); we don't walk
+		// them here. Mis-bucketing a fragmented or extension-laden
+		// packet as "other" is harmless for this diagnostic — we're
+		// only counting frequency, not correctness.
+		if n >= 40 {
+			l4 = ip[6]
+		}
+	default:
+		e.statsInUnknown.Add(1)
+		return false
+	}
+	switch l4 {
+	case 6: // TCP
+		e.statsInTCP.Add(1)
+	case 17: // UDP
+		e.statsInUDP.Add(1)
+	case 1, 58: // ICMP, ICMPv6
+		e.statsInICMP.Add(1)
+	default:
+		e.statsInOther.Add(1)
+	}
+
+	e.mu.RLock()
+	d := e.dispatcher
+	e.mu.RUnlock()
+	if d == nil {
+		return true
+	}
+	// buffer.MakeWithData copies (verified in gVisor view.go:
+	// NewViewWithData → newChunk(len(data)) + v.Write(data) → copy(...)).
+	// The input slice is NOT retained, so it's safe to pass ip directly —
+	// no defensive `append([]byte(nil), ip...)` needed even when the
+	// caller (readLoop or session.handleDataIn) reuses the backing array.
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(ip),
+	})
+	d.DeliverNetworkPacket(proto, pkt)
+	pkt.DecRef()
+	e.statsInPackets.Add(1)
+	return false
 }
 
 // WritePackets serialises each PacketBuffer to a single IP datagram and
@@ -468,7 +529,7 @@ func New(cli *openvpn.Client) (*Net, error) {
 	}
 	mtu := clampInnerMTU(uint32(rawMTU))
 
-	ep := newEndpoint(cli.Tunnel(), mtu)
+	ep := newEndpoint(cli.Tunnel(), mtu, true /* directDelivery */)
 
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
@@ -502,6 +563,14 @@ func New(cli *openvpn.Client) (*Net, error) {
 	if err := n.applyPushReply(pr); err != nil {
 		return nil, err
 	}
+
+	// Wire the fast-path: every decrypted inbound IP packet from the
+	// session lands here synchronously on the session's read loop,
+	// skipping ingressCh + Tunnel.Read + endpoint.readLoop. Net.Close
+	// will detach via SetIngressHandler(nil) — that call drains any
+	// in-flight handler invocations before returning, so the subsequent
+	// stack.Close() is race-free.
+	cli.SetIngressHandler(ep.deliverInbound)
 
 	// Track future reconnects: every successful AutoReconnect-driven session
 	// replacement hands us a fresh tunnel IP / gateway. Without re-syncing
@@ -748,6 +817,14 @@ func (n *Net) Close() error {
 		return nil
 	}
 	n.closed = true
+	// Detach the fast-path BEFORE tearing down the stack. The session's
+	// SetIngressHandler is RWMutex-guarded: this call blocks until every
+	// in-flight ep.deliverInbound returns, so stack.Close runs on a
+	// quiescent gVisor stack with no risk of a straggler
+	// DeliverNetworkPacket racing the teardown.
+	if n.cli != nil {
+		n.cli.SetIngressHandler(nil)
+	}
 	close(n.statsStop)
 	n.stack.Close()
 	n.ep.Close()

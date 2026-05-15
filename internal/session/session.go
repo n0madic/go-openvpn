@@ -33,6 +33,23 @@ import (
 	"github.com/n0madic/go-openvpn/internal/workers"
 )
 
+// IngressHandler receives one decrypted inbound IP packet from the data
+// channel. The handler runs synchronously on the session's read loop, so
+// it MUST be fast and non-blocking; returning releases the read loop to
+// process the next packet.
+//
+// The plaintext slice is owned by the handler for the duration of the
+// call and must not be retained past return — the read loop is free to
+// reuse the backing memory on the next decryption. Callers that need to
+// keep the bytes must copy them (gVisor's buffer.MakeWithData already
+// copies, so the netstack consumer doesn't need a defensive copy).
+//
+// Installing a non-nil handler diverts every inbound non-PING IP packet
+// away from the channel that Tunnel().Read consumes, so Tunnel().Read
+// will block indefinitely. Pick one path or the other; mixing them
+// deadlocks.
+type IngressHandler func(ip []byte)
+
 // Config holds everything needed to bring up a session.
 type Config struct {
 	Network    string // "udp" | "tcp"
@@ -163,6 +180,19 @@ type Session struct {
 	lastOutboundErrNs atomic.Int64
 
 	ingressCh chan []byte
+
+	// handlerMu guards handler and serialises SetIngressHandler against
+	// in-flight handler invocations. RWMutex (not atomic.Pointer) so that
+	// SetIngressHandler(nil) synchronously drains every in-flight call
+	// before returning — Net.Close can then run stack.Close() on a
+	// quiescent gVisor stack without racing DeliverNetworkPacket from a
+	// straggler handler call.
+	//
+	// Hot-path cost: ~30–50 ns per RLock+RUnlock on M-series. At 100 kpps
+	// that's roughly 0.5% CPU — acceptable trade for clean teardown.
+	handlerMu sync.RWMutex
+	handler   IngressHandler
+
 	// workers owns the cancellation context shared by every long-running
 	// session goroutine (read/write/tick/watch loops). Replaces the
 	// ad-hoc ctx+cancel+wg trio with a single API surface that adds
@@ -384,6 +414,23 @@ func (s *Session) Stats() Stats {
 
 func (s *Session) UnderlayLocalAddr() net.Addr  { return s.transport.LocalAddr() }
 func (s *Session) UnderlayRemoteAddr() net.Addr { return s.transport.RemoteAddr() }
+
+// SetIngressHandler installs h as the fast-path receive callback. While
+// a non-nil handler is set, every decrypted non-PING IP packet is passed
+// synchronously to h on the read-loop goroutine instead of being queued
+// to the ingress channel that ReadCtx/Tunnel().Read consume. Pass nil to
+// detach and restore the channel path.
+//
+// SetIngressHandler holds the write side of handlerMu, which means it
+// blocks until every in-flight handler invocation has completed. A
+// netstack consumer can therefore call SetIngressHandler(nil) and
+// immediately proceed to tear down the gVisor stack without worrying
+// about a straggler invocation racing into DeliverNetworkPacket.
+func (s *Session) SetIngressHandler(h IngressHandler) {
+	s.handlerMu.Lock()
+	s.handler = h
+	s.handlerMu.Unlock()
+}
 
 // Read returns the next decrypted IP packet.
 func (s *Session) Read(p []byte) (int, error) {
@@ -842,12 +889,28 @@ func (s *Session) handleDataIn(pkt []byte, kid uint8) {
 	// separately. PINGs alone are not enough to call the data path healthy
 	// (server PINGs can keep flowing even when the data path is dead).
 	s.lastDataInbound.Store(now)
-	// Non-blocking send: if the consumer (gVisor link endpoint reader) is
-	// slow or stuck, drop rather than block the entire session.readLoop.
-	// Blocking here was the second half of the "tunnel freezes but PINGs
-	// flow" failure: handleDataIn would stall on a full channel, the OS
-	// UDP receive buffer would back up, and the session would deadlock
-	// silently. Drop-on-full lets gVisor TCP fill the gaps via the standard
+	// Fast path: when an ingress handler is installed (typically by
+	// pkg/netstack via openvpn.Client.SetIngressHandler), deliver
+	// synchronously and skip the channel + Tunnel.Read hop. The RLock
+	// blocks SetIngressHandler from returning mid-call, so the handler
+	// always runs against a live, fully-attached stack.
+	s.handlerMu.RLock()
+	h := s.handler
+	if h != nil {
+		s.statsForwarded.Add(1)
+		h(ip)
+		s.handlerMu.RUnlock()
+		return
+	}
+	s.handlerMu.RUnlock()
+	// Channel path (Tunnel().Read consumers): non-blocking send. If the
+	// consumer (gVisor link endpoint reader on the legacy slow path, or a
+	// user-supplied Tunnel().Read goroutine) is slow or stuck, drop
+	// rather than block the entire session.readLoop. Blocking here was
+	// the second half of the "tunnel freezes but PINGs flow" failure:
+	// handleDataIn would stall on a full channel, the OS UDP receive
+	// buffer would back up, and the session would deadlock silently.
+	// Drop-on-full lets gVisor TCP fill the gaps via the standard
 	// retransmit path; lost UDP packets are the caller's problem same as
 	// on any real link.
 	select {

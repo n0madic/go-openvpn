@@ -68,6 +68,15 @@ type HandshakeTracer = trace.HandshakeTracer
 // never see RestartError in that mode.
 type RestartError = session.RestartError
 
+// IngressHandler is a fast-path callback that receives one decrypted
+// inbound IP packet per call. See SetIngressHandler for the contract.
+//
+// The most important consumer is pkg/netstack, whose Net.New installs a
+// handler that wraps each plaintext IP packet in a gVisor PacketBuffer
+// and delivers it directly to the userspace TCP/IP stack — skipping the
+// channel hop and read-loop goroutine that Tunnel().Read otherwise needs.
+type IngressHandler = session.IngressHandler
+
 // ErrServerExit is returned from Tunnel().Read/Write after the server sent
 // a clean EXIT message.
 var ErrServerExit = session.ErrServerExit
@@ -217,6 +226,13 @@ type Client struct {
 	hooksMu     sync.Mutex
 	onReconnect []func(PushReply)
 
+	// ingressHandler is the latest handler installed via SetIngressHandler.
+	// Stored at the Client level so AutoReconnect can re-apply it to every
+	// freshly-dialled session before that session's first packet arrives.
+	// atomic.Pointer is fine here: Client never reads it on a hot path —
+	// the read happens once per Dial and once per reconnect.
+	ingressHandler atomic.Pointer[IngressHandler]
+
 	// statsMu guards cumStats, the running counter total absorbed
 	// from every prior session before a reconnect swap. The current
 	// session's counters are added on top whenever Stats is called.
@@ -245,6 +261,34 @@ func (c *Client) OnReconnect(fn func(PushReply)) {
 	c.hooksMu.Lock()
 	c.onReconnect = append(c.onReconnect, fn)
 	c.hooksMu.Unlock()
+}
+
+// SetIngressHandler installs h as the fast-path receive callback for the
+// current session and every session installed by AutoReconnect after.
+// Pass nil to detach and restore the channel-based Tunnel().Read path.
+//
+// While a non-nil handler is set, every decrypted non-PING inbound IP
+// packet is delivered synchronously to h on the session's read-loop
+// goroutine — h MUST be fast and non-blocking. The handler is wholly
+// incompatible with Tunnel().Read: with a non-nil handler installed,
+// Tunnel().Read blocks indefinitely because the ingress channel never
+// receives data.
+//
+// SetIngressHandler is idempotent and safe to call multiple times. The
+// pkg/netstack package installs a handler automatically when its Net is
+// constructed from a Client; callers don't normally call this directly.
+func (c *Client) SetIngressHandler(h IngressHandler) {
+	if h == nil {
+		c.ingressHandler.Store(nil)
+	} else {
+		c.ingressHandler.Store(&h)
+	}
+	c.mu.RLock()
+	s := c.s
+	c.mu.RUnlock()
+	if s != nil {
+		s.SetIngressHandler(h)
+	}
 }
 
 // Stats returns a consistent snapshot of the Client's packet-flow
@@ -476,6 +520,15 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 			c.statsMu.Unlock()
 			c.mu.Lock()
 			c.s = s
+			// Re-apply any persistent ingress handler to the fresh session
+			// before unlocking. Doing this in the same critical section as
+			// the c.s swap means no observer (including handleDataIn on the
+			// new readLoop) ever sees c.s = new without the handler attached,
+			// so the very first inbound packet on the new session takes the
+			// fast path instead of falling into the consumerless ingressCh.
+			if hp := c.ingressHandler.Load(); hp != nil {
+				s.SetIngressHandler(*hp)
+			}
 			c.mu.Unlock()
 			c.log.Info("reconnect successful", "attempt", attempt)
 			// Notify subscribers (e.g. pkg/netstack updating the gVisor NIC
