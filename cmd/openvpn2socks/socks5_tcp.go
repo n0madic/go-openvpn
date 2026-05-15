@@ -37,9 +37,13 @@ func (s *socks5Server) handleConnect(ctx context.Context, client net.Conn, br *b
 	// prefers v4; for direct v6 literals it short-circuits to host-unreach.
 	usable := filterUsableIPs(ips, s.ns.HasIPv4(), s.ns.HasIPv6())
 	if len(usable) == 0 {
-		s.log.Debug("CONNECT: no usable address family",
-			"host", req.host, "ips", ips,
-			"have_v4", s.ns.HasIPv4(), "have_v6", s.ns.HasIPv6())
+		// Expected case under happy-eyeballs: a v4-only tunnel sees
+		// a v6 literal (or vice versa). REP=0x04 host unreachable
+		// tells the SOCKS5 client to fall back to the other family
+		// inside the same session — the system works as designed,
+		// no log needed. Logging here floods -v output with one
+		// pair of identical lines per client retry attempt without
+		// adding diagnostic value.
 		_ = writeReply(client, repHostUnreach, netip.AddrPortFrom(netip.IPv4Unspecified(), 0))
 		return
 	}
