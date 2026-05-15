@@ -216,6 +216,43 @@ func TestSetIngressHandlerNilFallsBackToChannel(t *testing.T) {
 	}
 }
 
+// TestIngressHandlerReplacePropagates ensures a second SetIngressHandler
+// call replaces the first handler — the session must dispatch to the
+// LATEST registered handler, not the original. Mirrors what
+// openvpn.Client.SetIngressHandler does on every reconnect.
+func TestIngressHandlerReplacePropagates(t *testing.T) {
+	t.Parallel()
+	sess, cleanup := dialSessionWithEchoServer(t)
+	defer cleanup()
+
+	var firstFired, secondFired atomic.Int32
+	sess.SetIngressHandler(func(ip []byte) { firstFired.Add(1) })
+	// Replace before any traffic flows.
+	hit := make(chan struct{}, 1)
+	sess.SetIngressHandler(func(ip []byte) {
+		secondFired.Add(1)
+		select {
+		case hit <- struct{}{}:
+		default:
+		}
+	})
+
+	if _, err := sess.Write([]byte("after-replace")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	select {
+	case <-hit:
+	case <-time.After(3 * time.Second):
+		t.Fatal("replaced handler never fired")
+	}
+	if firstFired.Load() != 0 {
+		t.Fatalf("first handler should never have fired, got %d", firstFired.Load())
+	}
+	if secondFired.Load() == 0 {
+		t.Fatal("second handler did not fire")
+	}
+}
+
 // TestSetIngressHandlerDrainsInFlight covers the RWMutex contract: a
 // slow handler in progress must hold up SetIngressHandler(nil) until
 // the handler call returns. This is what makes Net.Close → stack.Close

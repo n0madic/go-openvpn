@@ -263,31 +263,60 @@ func (c *Client) OnReconnect(fn func(PushReply)) {
 	c.hooksMu.Unlock()
 }
 
-// SetIngressHandler installs h as the fast-path receive callback for the
-// current session and every session installed by AutoReconnect after.
-// Pass nil to detach and restore the channel-based Tunnel().Read path.
+// SetIngressHandler installs h as the fast-path receive callback for
+// the current session and every session installed by AutoReconnect
+// after. While a non-nil handler is set, every decrypted non-PING
+// inbound IP packet is delivered synchronously to h on the session's
+// read-loop goroutine — h MUST be fast and non-blocking.
 //
-// While a non-nil handler is set, every decrypted non-PING inbound IP
-// packet is delivered synchronously to h on the session's read-loop
-// goroutine — h MUST be fast and non-blocking. The handler is wholly
-// incompatible with Tunnel().Read: with a non-nil handler installed,
-// Tunnel().Read blocks indefinitely because the ingress channel never
-// receives data.
+// The handler is wholly incompatible with Tunnel().Read: while a
+// non-nil handler is installed, Tunnel().Read blocks indefinitely
+// because the ingress channel never receives data. The Client owns a
+// single ingress slot; SetIngressHandler is **not** a registration —
+// each call replaces the current handler. Pick one consumer.
+// pkg/netstack.New installs a handler automatically; callers using
+// netstack should not also call SetIngressHandler directly.
 //
-// SetIngressHandler is idempotent and safe to call multiple times. The
-// pkg/netstack package installs a handler automatically when its Net is
-// constructed from a Client; callers don't normally call this directly.
-func (c *Client) SetIngressHandler(h IngressHandler) {
+// SetIngressHandler returns a detach function that clears the handler
+// iff it is still the active one — useful from cleanup code where
+// another consumer may have replaced ours in the meantime, and you'd
+// rather leave them running than blindly rip them out. (pkg/netstack
+// uses it from Net.Close for exactly this reason.) Passing nil h is
+// the explicit force-clear path: it clears unconditionally and returns
+// a no-op detach.
+func (c *Client) SetIngressHandler(h IngressHandler) (detach func()) {
 	if h == nil {
 		c.ingressHandler.Store(nil)
-	} else {
-		c.ingressHandler.Store(&h)
+		c.mu.RLock()
+		s := c.s
+		c.mu.RUnlock()
+		if s != nil {
+			s.SetIngressHandler(nil)
+		}
+		return func() {}
 	}
+	token := &h
+	c.ingressHandler.Store(token)
 	c.mu.RLock()
 	s := c.s
 	c.mu.RUnlock()
 	if s != nil {
 		s.SetIngressHandler(h)
+	}
+	return func() {
+		// CompareAndSwap: clear iff our token is still the registered
+		// one. If a later SetIngressHandler call replaced us, the CAS
+		// fails and we leave the new handler intact — closing one
+		// consumer should not knock out an unrelated one.
+		if !c.ingressHandler.CompareAndSwap(token, nil) {
+			return
+		}
+		c.mu.RLock()
+		s := c.s
+		c.mu.RUnlock()
+		if s != nil {
+			s.SetIngressHandler(nil)
+		}
 	}
 }
 

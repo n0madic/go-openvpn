@@ -418,6 +418,13 @@ type Net struct {
 	closed  bool
 	cli     *openvpn.Client
 
+	// detachIngress is the detach function returned by
+	// cli.SetIngressHandler in New. Called from Close to remove our
+	// fast-path handler ONLY if it's still ours — guarding against a
+	// later consumer that replaced us via a fresh SetIngressHandler
+	// call. nil before New finishes wiring.
+	detachIngress func()
+
 	// statsStop closes when the periodic stats logger should exit.
 	// Started in New, drained in Close.
 	statsStop chan struct{}
@@ -566,11 +573,14 @@ func New(cli *openvpn.Client) (*Net, error) {
 
 	// Wire the fast-path: every decrypted inbound IP packet from the
 	// session lands here synchronously on the session's read loop,
-	// skipping ingressCh + Tunnel.Read + endpoint.readLoop. Net.Close
-	// will detach via SetIngressHandler(nil) — that call drains any
-	// in-flight handler invocations before returning, so the subsequent
-	// stack.Close() is race-free.
-	cli.SetIngressHandler(ep.deliverInbound)
+	// skipping ingressCh + Tunnel.Read + endpoint.readLoop. We keep
+	// the returned detach func and use it from Net.Close — that's a
+	// CAS-guarded clear that only fires if our handler is still the
+	// registered one, so if another consumer replaced us on the Client
+	// between New and Close we won't knock them out. The detach also
+	// drains any in-flight invocation (via session.handlerMu), making
+	// the subsequent stack.Close() race-free.
+	n.detachIngress = cli.SetIngressHandler(ep.deliverInbound)
 
 	// Track future reconnects: every successful AutoReconnect-driven session
 	// replacement hands us a fresh tunnel IP / gateway. Without re-syncing
@@ -817,13 +827,15 @@ func (n *Net) Close() error {
 		return nil
 	}
 	n.closed = true
-	// Detach the fast-path BEFORE tearing down the stack. The session's
-	// SetIngressHandler is RWMutex-guarded: this call blocks until every
-	// in-flight ep.deliverInbound returns, so stack.Close runs on a
-	// quiescent gVisor stack with no risk of a straggler
-	// DeliverNetworkPacket racing the teardown.
-	if n.cli != nil {
-		n.cli.SetIngressHandler(nil)
+	// Detach the fast-path BEFORE tearing down the stack. The detach
+	// func returned by SetIngressHandler is CAS-guarded — it only
+	// clears the Client's slot if our handler is still the registered
+	// one. The session-level SetIngressHandler is RWMutex-guarded too,
+	// so this call also blocks until every in-flight ep.deliverInbound
+	// returns: stack.Close then runs on a quiescent gVisor stack with
+	// no risk of a straggler DeliverNetworkPacket racing the teardown.
+	if n.detachIngress != nil {
+		n.detachIngress()
 	}
 	close(n.statsStop)
 	n.stack.Close()
