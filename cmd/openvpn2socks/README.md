@@ -320,10 +320,21 @@ The OpenVPN client is dialed with `Config.AutoReconnect=true`, so:
   *that query only*; the next lookup tries the tunnel again. A
   throttled warning announces the leak.
 - The SOCKS5 listener stays bound across reconnects.
-- In-flight TCP/UDP proxied connections will see their underlying
-  netstack connection drop and the client will get a closed socket,
-  which is the same semantics as any transient TCP error — most clients
-  retry.
+- In-flight TCP/UDP proxied connections are handled adaptively:
+  - **Same tunnel IP after reconnect** (the server reuses cached
+    session state — common with load balancers): existing gVisor
+    endpoints stay valid because their source address is still
+    correct. They keep working through the brief gap with no caller
+    visible breakage beyond the round-trip delay of the reconnect
+    itself.
+  - **New tunnel IP after reconnect**: the in-flight endpoints are
+    bound to a now-invalid source IP and would generate packets the
+    server silently drops, so they are force-closed. Caller-side
+    SOCKS5 connections receive a closed socket, same semantics as
+    any transient TCP error — most apps retry.
+
+  Either way the SOCKS5 listener stays bound and accepts new
+  connections immediately on the new session.
 
 There is no manual reconnect command; you can SIGHUP-restart the process
 if you want a fresh session.
