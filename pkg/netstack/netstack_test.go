@@ -217,11 +217,6 @@ func TestTrackedConnLifecycle(t *testing.T) {
 
 	n := &Net{}
 
-	type mockConn struct {
-		net.Conn // nil-Conn fine; we only exercise Close
-		closes   int
-	}
-	// Override Close via a struct that satisfies the type-assertion path.
 	closer1 := &fakeCloseCounter{}
 	closer2 := &fakeCloseCounter{}
 

@@ -112,8 +112,30 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 	cfg.HandshakeTimeout = opts.handshakeT
 	cfg.AutoReconnect = true
 
-	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	// Two-signal force-exit: the user must always be able to kill the
+	// process by pressing Ctrl-C twice, even if graceful shutdown stalls
+	// on stuck I/O (gVisor endpoint, kernel socket, deadlocked goroutine).
+	//
+	// Own one signal channel from the very start so there is no window
+	// between "first signal cancelled the ctx" and "second-signal handler
+	// installed" during which a fast second SIGINT could be absorbed by
+	// the runtime and silently lost.
+	rootCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 4)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-sigCh:
+			cancel()
+		case <-rootCtx.Done():
+			return
+		}
+		<-sigCh
+		logger.Warn("second signal received during shutdown; force-exiting")
+		os.Exit(130)
+	}()
 
 	// VPN dial (separate timeout — we want the dial to give up before the
 	// process-wide ctx is cancelled, so we can shut down cleanly).

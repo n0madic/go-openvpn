@@ -141,14 +141,13 @@ func TestWakeDetectorWatchFiresOnLongGap(t *testing.T) {
 
 	var fired atomic.Bool
 	go func() {
-		lastTick := time.Now()
 		ticker := time.NewTicker(period)
 		defer ticker.Stop()
 		// Burn one tick to set the baseline, then sleep through
 		// gapThreshold to simulate suspend.
 		<-ticker.C
 		time.Sleep(gapThreshold + 200*time.Millisecond)
-		lastTick = time.Now().Add(-gapThreshold - 200*time.Millisecond)
+		lastTick := time.Now().Add(-gapThreshold - 200*time.Millisecond)
 		for {
 			select {
 			case <-s.ctx.Done():
