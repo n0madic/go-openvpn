@@ -150,6 +150,23 @@ internal/session         Orchestrator. Goroutines per active session
   (explicit-exit-notify) and waits for the reliable layer to drain it.
 - `Config.AutoReconnect` + `ReconnectMaxAttempts` + `ReconnectMaxInterval`
   — when set, server `RESTART` is absorbed without surfacing to the user.
+  When AutoReconnect is on, `Dial` also spawns a background
+  `sessionWatcher` goroutine that polls `s.CloseErr()` every
+  `sessionWatchPeriod=500ms` and initiates reconnect on a `*RestartError`
+  WITHOUT requiring `Tunnel.Read`/`Tunnel.Write` to observe the error.
+  This matters: in netstack mode the data path runs through
+  `SetIngressHandler` and nobody sits in `Tunnel.Read`. If the host
+  suspends, `wakeDetectorWatch` closes the session with a RestartError —
+  but with no Read/Write caller to consume the error and no apps writing
+  outbound (gVisor TCP has long since timed out, apps haven't retried
+  yet), the zombie state persists until manual intervention. The
+  watcher is the second pair of hands that picks up RestartError on
+  behalf of the netstack-shaped consumer. It exits on terminal errors
+  (`ErrAuthFailed`, `ErrReconnectGaveUp`, `ErrClosed`, `ctx.Canceled`)
+  or when the session closes for a non-restart reason. `reconnectMu`
+  serialises with the `Tunnel.Read/Write` reconnect path so they don't
+  step on each other; whichever wins, the other sees `c.session() !=
+  failed` and returns nil.
 - `Client.RequestRestart(reason string)` — application-level escape hatch
   that forces the current session to close with a `*RestartError` so
   `AutoReconnect` re-dials. Useful for external monitoring / manual

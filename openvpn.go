@@ -455,6 +455,20 @@ func Dial(ctx context.Context, cfg *Config) (*Client, error) {
 	cCtx, cancel := context.WithCancel(context.Background())
 	c := &Client{cfg: cfg, log: log, s: s, ctx: cCtx, cancel: cancel}
 	c.tun = &tunnel{c: c}
+	// When AutoReconnect is on, spawn a background watcher that drives
+	// reconnect from session-internal triggers (wakeDetectorWatch,
+	// pingRestartWatch, hardResetWatch, dataActivityWatch). Without it,
+	// reconnect only happens when Tunnel.Read or Tunnel.Write observes
+	// the error — but consumers that drive the data path via
+	// SetIngressHandler (pkg/netstack and downstream gVisor) never sit
+	// in Tunnel.Read. With no outbound traffic either (the wake-up
+	// scenario where every gVisor TCP connection has long since timed
+	// out and apps haven't retried yet) the RestartError stays
+	// unconsumed and the tunnel sits in zombie state — exactly the
+	// post-suspend bug we hit live.
+	if cfg.AutoReconnect {
+		go c.sessionWatcher()
+	}
 	return c, nil
 }
 
@@ -631,6 +645,80 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 			return fmt.Errorf("%w: last error: %v", ErrReconnectGaveUp, err)
 		}
 		wait = backoffDelay(attempt, maxInterval)
+	}
+}
+
+// sessionWatchPeriod is how often the background watcher polls the
+// current session for a RestartError. Short enough that a wake-from-
+// suspend is detected within sub-second once wakeDetectorWatch fires,
+// long enough that an idle client costs nothing measurable.
+const sessionWatchPeriod = 500 * time.Millisecond
+
+// sessionWatcher polls the active session's CloseErr and drives
+// reconnect when it sees a *RestartError. Runs only when AutoReconnect
+// is enabled. The exit conditions mirror the Tunnel.Read/Write
+// reconnect path:
+//
+//   - Client closed (Close was called): exit immediately.
+//   - Reconnect returned ErrAuthFailed: terminal, do not retry.
+//   - Reconnect returned ErrReconnectGaveUp: max-attempts exhausted; the
+//     library has surrendered, watcher exits.
+//   - Session closed for a non-restart reason (caller-initiated Close,
+//     fatal protocol error): no reconnect, watcher exits.
+//
+// The watcher is intentionally race-tolerant with Tunnel.Read/Write
+// callers that also enter reconnect: c.reconnectMu serialises both
+// paths, and reconnect's "another goroutine already swapped the
+// session" early return makes the second caller a no-op.
+func (c *Client) sessionWatcher() {
+	ticker := time.NewTicker(sessionWatchPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if c.closed.Load() {
+			return
+		}
+		s := c.session()
+		if s == nil {
+			return
+		}
+		closeErr := s.CloseErr()
+		if closeErr == nil {
+			continue
+		}
+		var re *RestartError
+		if !errors.As(closeErr, &re) {
+			// Non-restart close (manual Close or unrecoverable error).
+			// AutoReconnect is not the right answer; let the user notice
+			// via Tunnel.Read/Write or Client.Close().
+			return
+		}
+		c.log.Info("session watcher: RestartError observed; initiating reconnect",
+			"reason", re.Reason, "delay", re.Delay)
+		rcErr := c.reconnect(c.ctx, s, re.Delay)
+		if rcErr == nil {
+			// Reconnect installed a fresh session; loop continues to
+			// monitor the new one.
+			continue
+		}
+		if errors.Is(rcErr, ErrAuthFailed) ||
+			errors.Is(rcErr, ErrReconnectGaveUp) ||
+			errors.Is(rcErr, ErrClosed) ||
+			errors.Is(rcErr, context.Canceled) {
+			c.log.Error("session watcher: terminal reconnect failure; stopping watcher",
+				"err", rcErr)
+			return
+		}
+		// Transient failure — reconnect itself has internal backoff so
+		// hammering would be redundant. Continue to the next tick;
+		// since the failed session still has CloseErr() set, the next
+		// iteration will retry immediately.
+		c.log.Warn("session watcher: reconnect failed; will retry on next tick",
+			"err", rcErr)
 	}
 }
 
