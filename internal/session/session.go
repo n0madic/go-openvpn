@@ -1047,6 +1047,33 @@ func isStrayUnwrap(pkt []byte, opcode proto.Opcode, layer *reliable.Layer) bool 
 func (s *Session) handleControlIn(pkt []byte, opcode proto.Opcode, kid uint8) {
 	layer := s.layers.Get(kid)
 	if layer == nil {
+		// Server-initiated rekey: a P_CONTROL_SOFT_RESET_V1 arrives on a
+		// key-id we have not yet created. PerformSoftReset installs the
+		// layer for nextKeyID(active) and sends our own SOFT_RESET; the
+		// server then retransmits its SOFT_RESET (reliable layer's
+		// 1s..16s exponential backoff) and the second copy reaches the
+		// now-existing layer through the normal handleControlIn path,
+		// completing the handshake.
+		if opcode == proto.PControlSoftResetV1 && s.rekeyMgr != nil {
+			active := s.slots.ActiveKID()
+			if kid == nextKeyID(active) {
+				s.log.Info("server-initiated rekey detected, kicking off our side",
+					"server_kid", kid, "active_kid", active)
+				go func() {
+					rkCtx, cancel := context.WithTimeout(s.ctx, 60*time.Second)
+					defer cancel()
+					if err := s.rekeyMgr.PerformSoftReset(rkCtx); err != nil &&
+						!errors.Is(err, ErrRekeyInProgress) {
+						s.log.Error("server-initiated rekey failed",
+							"err", err, "server_kid", kid)
+					}
+				}()
+				return
+			}
+			s.log.Debug("server SOFT_RESET on unexpected key-id",
+				"server_kid", kid, "active_kid", active, "expected_kid", nextKeyID(active))
+			return
+		}
 		s.log.Debug("control packet for unknown key-id", "kid", kid, "opcode", opcode)
 		return
 	}
