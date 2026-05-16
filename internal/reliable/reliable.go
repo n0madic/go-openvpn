@@ -492,8 +492,22 @@ func (l *Layer) Write(p []byte) (int, error) {
 	defer l.mu.Unlock()
 	// Block until peer's session-id is known (HARD_RESET_SERVER received).
 	// This adds the synchronization step that strict servers require.
-	for !l.remoteKnown && !l.closed {
+	// readClosed must also break the wait: when the read side is torn
+	// down (e.g. ctx-cancelled TLS handshake, peer EXIT mid-handshake)
+	// HARD_RESET_SERVER will never arrive and waiting on remoteKnown
+	// would leak this goroutine forever.
+	for !l.remoteKnown && !l.closed && !l.readClosed {
 		l.remoteCond.Wait()
+	}
+	// closed wins over readClosed so the full-Close path keeps surfacing
+	// ErrClosed (existing public contract). A read-only close that does
+	// not also flip l.closed reports the recorded readErr — usually the
+	// cause the TLS handshake was aborted with.
+	if !l.remoteKnown && l.readClosed && !l.closed {
+		if l.readErr != nil {
+			return 0, l.readErr
+		}
+		return 0, ErrClosed
 	}
 	written := 0
 	for len(p) > 0 {
@@ -535,6 +549,12 @@ func (l *Layer) CloseRead(err error) {
 		l.readErr = err
 	}
 	l.readCond.Broadcast()
+	// Wake up anyone parked in Write waiting on remoteCond for the peer's
+	// HARD_RESET_SERVER — if Read side is torn down (e.g. tls handshake
+	// aborted by ctx), the writer would otherwise sit there forever. Close
+	// already does this; doing it here too keeps Read- and full-Close on
+	// equal footing for liveness.
+	l.remoteCond.Broadcast()
 }
 
 // Close tears down the layer. After this, Read returns io.EOF and Write

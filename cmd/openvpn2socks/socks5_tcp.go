@@ -15,6 +15,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/n0madic/go-openvpn/pkg/netstack"
 )
 
 // handleConnect resolves the destination, dials TCP via the netstack, sends
@@ -161,6 +163,15 @@ func (w writeDeadliner) Write(p []byte) (int, error) {
 func mapDialError(err error) byte {
 	if err == nil {
 		return repSucceeded
+	}
+	// netstack.ErrTunnelIPChanged means an AutoReconnect-driven IP swap
+	// invalidated the in-flight dial. The conn has already been closed
+	// by netstack; the SOCKS5 client should retry, so signal host-
+	// unreachable rather than the generic failure code: most clients
+	// (curl, browsers) treat host-unreachable as transient and re-issue,
+	// while a generic failure terminates the request.
+	if errors.Is(err, netstack.ErrTunnelIPChanged) {
+		return repHostUnreach
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return repTTLExpired

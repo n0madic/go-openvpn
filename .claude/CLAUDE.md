@@ -155,16 +155,21 @@ internal/session         Orchestrator. Goroutines per active session
   `AutoReconnect` re-dials. Useful for external monitoring / manual
   session refresh / tests. The Tunnel handle survives — blocked Reads
   resume on the new session.
-- `Client.OnReconnect(fn func(PushReply))` — register a callback fired
-  every time AutoReconnect installs a fresh session. **Critical** for
-  anything that caches a tunnel-IP-dependent value: gVisor NIC address,
-  bound sockets, host routes. The server assigns a *new* `LocalIP` per
-  session (and may also change Gateway / Routes / MTU), so failing to
-  refresh those state means post-reconnect packets carry the OLD source
-  IP and the server silently drops them — that's the long-running
-  "tunnel works for a bit, reconnects, then nothing works forever"
-  zombie-loop bug we hit. `pkg/netstack/netstack.go::Net.New` registers
-  itself via this hook so the gVisor NIC stays in sync automatically.
+- `Client.OnReconnect(fn func(PushReply)) (detach func())` — register a
+  callback fired every time AutoReconnect installs a fresh session.
+  **Critical** for anything that caches a tunnel-IP-dependent value:
+  gVisor NIC address, bound sockets, host routes. The server assigns a
+  *new* `LocalIP` per session (and may also change Gateway / Routes /
+  MTU), so failing to refresh those state means post-reconnect packets
+  carry the OLD source IP and the server silently drops them — that's
+  the long-running "tunnel works for a bit, reconnects, then nothing
+  works forever" zombie-loop bug we hit. **Always call the returned
+  detach func from your Close path** if the hook's target lifetime is
+  shorter than the Client — otherwise the closure keeps that target
+  alive past its useful life and may dereference fields that have
+  already been torn down. `pkg/netstack/netstack.go::Net.New` registers
+  itself via this hook so the gVisor NIC stays in sync automatically;
+  `Net.Close` invokes the detach.
 
 ### Key protocol nuances (caught against real OpenVPN — preserve when editing)
 
@@ -235,11 +240,11 @@ internal/session         Orchestrator. Goroutines per active session
    tunnel was effectively dead because the server gave up on us. The
    correct behaviour is to **block the writer goroutine** for a brief
    backoff (`enobufInitialBackoff=500µs`, exponential up to
-   `enobufMaxBackoff=16ms`, capped at `enobufMaxTotalSleep=200ms` per
+   `enobufMaxBackoff=16ms`, capped at `enobufMaxTotalSleep=1500ms` per
    call) — same mechanism kernel TCP/IP stacks use to propagate
    backpressure to user-space via EAGAIN. gVisor's TCP send rate then
    naturally throttles to match the wire drain rate without
-   amplification. After 200ms total backoff, we DO return the error
+   amplification. After 1500ms total backoff, we DO return the error
    (gVisor TCP will retransmit on its own schedule, lossless; UDP/
    keepalive callers either retry at the next interval or are
    transient enough to lose). Successful retries are counted in

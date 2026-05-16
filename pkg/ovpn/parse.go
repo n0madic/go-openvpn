@@ -28,6 +28,15 @@ import (
 	"github.com/n0madic/go-openvpn"
 )
 
+// ErrNoServerIdentity is returned when an .ovpn profile has no
+// verify-x509-name directive, no hostname-style remote, and no
+// ServerNameOverride — i.e. nothing to match the presented server
+// certificate against. Dialling under those conditions would accept
+// any valid cert from the same CA (a different gateway in a multi-
+// tenant deployment, a malicious sibling cert, etc.). Callers that
+// accept the risk explicitly can set ParseOptions.AllowNoServerIdentity.
+var ErrNoServerIdentity = errors.New("ovpn: no verify-x509-name and no hostname-style remote — refusing to dial without server-identity verification")
+
 // Remote is one `remote HOST PORT [proto]` line.
 type Remote struct {
 	Host string
@@ -101,6 +110,17 @@ type ParseOptions struct {
 	// any `verify-x509-name`. Useful when the OVPN file has no SNI hint
 	// and the dial target is an IP.
 	ServerNameOverride string
+
+	// AllowNoServerIdentity, when true, lets New build a TLS config that
+	// only verifies the certificate chain against the CA roots, with NO
+	// hostname/SAN match. This is unsafe against an attacker holding any
+	// valid certificate from the same CA (multi-tenant CAs typical of
+	// commercial VPN providers): they can MITM the connection because
+	// the chain itself proves nothing about which server we wanted to
+	// talk to. By default New refuses such configs — the caller must
+	// either set ServerNameOverride, add a verify-x509-name directive,
+	// or explicitly opt into this risk by setting AllowNoServerIdentity.
+	AllowNoServerIdentity bool
 
 	// PickRemote chooses one of the parsed remotes. nil = pick the first
 	// (or a random one if the file declares `remote-random`).
@@ -613,10 +633,14 @@ func (s *parseState) readAuthFile(rel string) error {
 	sc := bufio.NewScanner(f)
 	var user, pass string
 	if sc.Scan() {
-		user = sc.Text()
+		// Strip CR so Windows-saved credential files (CRLF line endings)
+		// don't quietly send "user\r" / "pass\r" on the wire — the server
+		// rejects with AUTH_FAILED and the user-visible symptom is
+		// "wrong password" with no clue why.
+		user = strings.TrimRight(sc.Text(), "\r")
 	}
 	if sc.Scan() {
-		pass = sc.Text()
+		pass = strings.TrimRight(sc.Text(), "\r")
 	}
 	if err := sc.Err(); err != nil {
 		return fmt.Errorf("auth-user-pass: %w", err)
@@ -748,6 +772,15 @@ func (s *parseState) finalize() (*Parsed, error) {
 	// verification, so we install a VerifyConnection callback that does the
 	// chain check ourselves.
 	if serverNameForCheck == "" {
+		// Without a server name to match, we can only verify that the cert
+		// chains up to one of our trusted roots — we cannot prove the peer
+		// is the server we intended to talk to. Any valid certificate from
+		// the same CA (a different gateway in a multi-tenant deployment,
+		// a malicious mate of the operator, a leaked sibling cert) would
+		// pass. Refuse by default and require an explicit opt-in.
+		if !s.opt.AllowNoServerIdentity {
+			return nil, fmt.Errorf("%w; set ParseOptions.ServerNameOverride, add a verify-x509-name directive, or set ParseOptions.AllowNoServerIdentity to consciously accept the risk", ErrNoServerIdentity)
+		}
 		// Surface a warning when the user has no <ca> AND no
 		// verify-x509-name / hostname remote: with roots==nil, x509.Verify
 		// falls back to the system trust store, which may or may not be
@@ -755,6 +788,7 @@ func (s *parseState) finalize() (*Parsed, error) {
 		if len(s.caPEMs) == 0 && tlsCfg.RootCAs == nil {
 			s.warn(0, "ca", "no <ca> in config and no verify-x509-name; server cert will be verified against the system CA pool (set verify-x509-name or provide a <ca> block to be explicit)")
 		}
+		s.warn(0, "tls", "AllowNoServerIdentity=true — server certificate identity will NOT be checked; any valid cert from the same CA passes verification")
 		tlsCfg.InsecureSkipVerify = true
 		roots := tlsCfg.RootCAs
 		tlsCfg.VerifyConnection = func(cs tls.ConnectionState) error {

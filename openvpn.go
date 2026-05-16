@@ -27,9 +27,18 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/n0madic/go-openvpn/internal/control"
 	"github.com/n0madic/go-openvpn/internal/session"
 	"github.com/n0madic/go-openvpn/internal/trace"
 )
+
+// ErrAuthFailed is returned from Dial (and surfaced to the caller without
+// AutoReconnect retry) when the server replies AUTH_FAILED to our PUSH_REQUEST
+// — credentials are wrong, the token is expired, or the account is banned.
+// Retrying with the same Config would only repeat the failure and risks
+// triggering provider-side IP bans, so AutoReconnect bails out immediately on
+// this error.
+var ErrAuthFailed = control.ErrAuthFailed
 
 // HandshakeStage names a phase of the OpenVPN client handshake. It is
 // re-exported from the internal trace package so callers don't have to
@@ -224,7 +233,7 @@ type Client struct {
 
 	// hooksMu protects onReconnect.
 	hooksMu     sync.Mutex
-	onReconnect []func(PushReply)
+	onReconnect []*reconnectHook
 
 	// ingressHandler is the latest handler installed via SetIngressHandler.
 	// Stored at the Client level so AutoReconnect can re-apply it to every
@@ -240,6 +249,14 @@ type Client struct {
 	cumStats Stats
 }
 
+// reconnectHook bundles a registered callback with the slice element
+// pointer that the detach func uses to find and remove this specific
+// registration. Pointer identity is unique per registration, so the
+// detach func's linear scan does not need a separate token field.
+type reconnectHook struct {
+	fn func(PushReply)
+}
+
 // OnReconnect registers fn to be invoked every time AutoReconnect installs a
 // fresh session, AFTER the new session is published as the active one and
 // the PushReply is queryable. fn receives the new PUSH_REPLY values so it
@@ -252,15 +269,34 @@ type Client struct {
 // hooks are invoked in registration order. Hooks registered after the
 // session is closed will never fire.
 //
+// OnReconnect returns a detach func that removes the registration. Always
+// call it when the hook's target lifetime ends earlier than the Client
+// (e.g. a `pkg/netstack.Net` that is closed before its Client) — otherwise
+// the closure keeps that target alive past its useful life and may
+// dereference fields that have already been torn down. Calling the detach
+// func twice or after Client.Close is safe and a no-op.
+//
 // `pkg/netstack` registers a hook here automatically via Net.New so the
 // gVisor NIC tracks reconnects — no caller wiring required for that path.
-func (c *Client) OnReconnect(fn func(PushReply)) {
+// Net.Close invokes the returned detach.
+func (c *Client) OnReconnect(fn func(PushReply)) (detach func()) {
 	if fn == nil {
-		return
+		return func() {}
 	}
+	hook := &reconnectHook{fn: fn}
 	c.hooksMu.Lock()
-	c.onReconnect = append(c.onReconnect, fn)
+	c.onReconnect = append(c.onReconnect, hook)
 	c.hooksMu.Unlock()
+	return func() {
+		c.hooksMu.Lock()
+		for i, h := range c.onReconnect {
+			if h == hook {
+				c.onReconnect = append(c.onReconnect[:i], c.onReconnect[i+1:]...)
+				break
+			}
+		}
+		c.hooksMu.Unlock()
+	}
 }
 
 // SetIngressHandler installs h as the fast-path receive callback for
@@ -377,7 +413,9 @@ func (c *Client) foldStatsLocked(st session.Stats) {
 func (c *Client) FireOnReconnect(pr PushReply) {
 	c.hooksMu.Lock()
 	hooks := make([]func(PushReply), len(c.onReconnect))
-	copy(hooks, c.onReconnect)
+	for i, h := range c.onReconnect {
+		hooks[i] = h.fn
+	}
 	c.hooksMu.Unlock()
 	for _, h := range hooks {
 		h(pr)
@@ -515,8 +553,18 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 
 		// Dial under c.ctx (so the resulting session outlives callCtx) but
 		// watch callCtx so a per-call deadline can interrupt a slow Dial.
+		// defer close(stopWatch) covers the path where session.Dial panics
+		// — without it the watcher goroutine would leak until c.ctx fires.
 		dialCtx, dialCancel := context.WithCancel(c.ctx)
 		stopWatch := make(chan struct{})
+		stopWatchClosed := false
+		closeStopWatch := func() {
+			if !stopWatchClosed {
+				close(stopWatch)
+				stopWatchClosed = true
+			}
+		}
+		defer closeStopWatch()
 		go func() {
 			select {
 			case <-callCtx.Done():
@@ -525,8 +573,17 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 			}
 		}()
 		s, err := session.Dial(dialCtx, sessionCfg(c.cfg))
-		close(stopWatch)
+		closeStopWatch()
 		dialCancel()
+
+		if err != nil && errors.Is(err, ErrAuthFailed) {
+			// Terminal: re-dial with the same credentials will keep failing
+			// the same way. Surfacing this immediately also avoids hammering
+			// the server, which on many providers (ProtonVPN, etc.) leads to
+			// an IP ban.
+			c.log.Warn("auth failed during reconnect; giving up", "attempt", attempt, "err", err)
+			return fmt.Errorf("openvpn: authentication failed on reconnect: %w", err)
+		}
 
 		if err == nil {
 			if c.closed.Load() {

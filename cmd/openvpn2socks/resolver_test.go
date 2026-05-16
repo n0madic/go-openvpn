@@ -3,9 +3,13 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -149,4 +153,202 @@ func TestPublicDNSFallbackConstant(t *testing.T) {
 	if publicDNSFallback.Port() != 53 {
 		t.Errorf("publicDNSFallback.Port() = %v, want 53", publicDNSFallback.Port())
 	}
+}
+
+// TestIsProxiableLiteral verifies the address classes refused by
+// LookupIP for literal IP hosts. The filter prevents a SOCKS5 client
+// from using the proxy to probe the gVisor stack's internal addresses
+// (127.0.0.1, ::1) or to ship traffic to ranges that have no meaning
+// over the tunnel (multicast, link-local, unspecified).
+func TestIsProxiableLiteral(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		ip   string
+		want bool
+	}{
+		{"1.2.3.4", true},
+		{"127.0.0.1", false},      // loopback
+		{"0.0.0.0", false},        // unspecified
+		{"224.0.0.1", false},      // multicast
+		{"169.254.1.1", false},    // link-local v4
+		{"2606:4700:4700::1111", true},
+		{"::1", false},            // loopback v6
+		{"::", false},             // unspecified v6
+		{"fe80::1", false},        // link-local v6
+		{"ff02::1", false},        // link-local multicast v6
+	}
+	for _, tc := range cases {
+		t.Run(tc.ip, func(t *testing.T) {
+			t.Parallel()
+			ip := mustAddr(t, tc.ip)
+			if got := isProxiableLiteral(ip); got != tc.want {
+				t.Errorf("isProxiableLiteral(%s) = %v, want %v", tc.ip, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLookupIPLiteralFilter confirms that LookupIP refuses to proxy
+// literal IPs of the restricted classes. The error is wrapped so callers
+// can errors.Is(err, errDNSDisallowedLiteral) to distinguish from
+// resolution failures.
+func TestLookupIPLiteralFilter(t *testing.T) {
+	t.Parallel()
+	r := newTestResolver(t)
+	for _, literal := range []string{"127.0.0.1", "::1", "0.0.0.0", "ff02::1"} {
+		t.Run(literal, func(t *testing.T) {
+			ips, err := r.LookupIP(t.Context(), literal)
+			if err == nil {
+				t.Fatalf("LookupIP(%s) returned %v, expected error", literal, ips)
+			}
+			if !errors.Is(err, errDNSDisallowedLiteral) {
+				t.Fatalf("LookupIP(%s) err=%v, want errDNSDisallowedLiteral wrap", literal, err)
+			}
+		})
+	}
+}
+
+// TestLookupIPAuthoritativeNoDataSuppressesSystemFallback is the
+// regression test for the negative-cache leak guard: if any tunneled
+// resolver reports authoritative-negative (NXDOMAIN or NOERROR/0), the
+// system resolver MUST NOT be queried — that fallback would leak the
+// host name to the ISP DNS for no benefit, since the tunneled resolver
+// already gave a definitive answer for the usable address families.
+func TestLookupIPAuthoritativeNoDataSuppressesSystemFallback(t *testing.T) {
+	t.Parallel()
+	r := newTestResolver(t)
+	// Two pushed resolvers; the first reports authoritative-negative,
+	// the second (and any later attempts via publicDNSFallback) MUST
+	// still be reached for completeness — but the final fallback to
+	// the system resolver MUST stay cold.
+	r.pushed = []netip.Addr{mustAddr(t, "10.0.0.1"), mustAddr(t, "10.0.0.2")}
+	r.queryOverTunnelFn = func(_ context.Context, server netip.AddrPort, host string) ([]netip.Addr, error) {
+		return nil, fmt.Errorf("%w: NXDOMAIN via %s for %s", errDNSAuthoritativeNoData, server, host)
+	}
+	var systemCalls atomic.Int32
+	r.systemLookupFn = func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		systemCalls.Add(1)
+		return []netip.Addr{mustAddr(t, "9.9.9.9")}, nil
+	}
+
+	ips, err := r.LookupIP(t.Context(), "no-such-host.example.")
+	if err == nil {
+		t.Fatalf("LookupIP returned %v, expected authoritative-negative error", ips)
+	}
+	if systemCalls.Load() != 0 {
+		t.Fatalf("system resolver was called %d times despite authoritative-negative — DNS leak regressed", systemCalls.Load())
+	}
+}
+
+// TestLookupIPTransportFailFallsBackToSystem complements the
+// authoritative-negative test: when the tunneled resolvers return only
+// transport-class failures (timeout, SERVFAIL), the system resolver IS
+// the documented last-resort. Without this case the suppression logic
+// could over-fire and break tunnels with a flaky pushed DNS.
+func TestLookupIPTransportFailFallsBackToSystem(t *testing.T) {
+	t.Parallel()
+	r := newTestResolver(t)
+	r.pushed = []netip.Addr{mustAddr(t, "10.0.0.1")}
+	r.queryOverTunnelFn = func(_ context.Context, server netip.AddrPort, host string) ([]netip.Addr, error) {
+		return nil, fmt.Errorf("dial timeout via %s for %s", server, host)
+	}
+	want := mustAddr(t, "9.9.9.9")
+	var systemCalls atomic.Int32
+	r.systemLookupFn = func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		systemCalls.Add(1)
+		return []netip.Addr{want}, nil
+	}
+
+	ips, err := r.LookupIP(t.Context(), "example.com")
+	if err != nil {
+		t.Fatalf("LookupIP returned err=%v, want success via system fallback", err)
+	}
+	if systemCalls.Load() == 0 {
+		t.Fatal("system resolver was not called despite transport-class failures from tunneled resolver")
+	}
+	if len(ips) != 1 || ips[0] != want {
+		t.Fatalf("system fallback returned %v, want [%v]", ips, want)
+	}
+}
+
+// TestParseDNSAnswersNXDomain confirms RCODE=3 surfaces as
+// errDNSAuthoritativeNoData — the sentinel that prevents LookupIP from
+// falling back to the system resolver (which would leak the name).
+func TestParseDNSAnswersNXDomain(t *testing.T) {
+	t.Parallel()
+	// 12-byte header: id=0x1234, flags=0x8003 (QR=1, RCODE=3 NXDOMAIN),
+	// QDCOUNT=ANCOUNT=NSCOUNT=ARCOUNT=0.
+	resp := []byte{
+		0x12, 0x34,
+		0x80, 0x03,
+		0, 0, 0, 0, 0, 0, 0, 0,
+	}
+	_, err := parseDNSAnswers(resp, 0x1234, dnsTypeA)
+	if err == nil {
+		t.Fatal("expected error for NXDOMAIN response")
+	}
+	if !errorsIsAuthoritativeNoData(err) {
+		t.Fatalf("expected errDNSAuthoritativeNoData, got %v", err)
+	}
+}
+
+// TestParseDNSAnswersNoData confirms NOERROR with zero matching answers
+// is treated as authoritative — the host exists but has no record of
+// the requested type (e.g. AAAA-only host queried with A).
+func TestParseDNSAnswersNoData(t *testing.T) {
+	t.Parallel()
+	// Minimal NOERROR / 0 answers reply matching a "host." A query.
+	resp := []byte{
+		0x12, 0x34, // ID
+		0x81, 0x80, // flags: QR=1, RD=1, RA=1, RCODE=0
+		0, 1, 0, 0, 0, 0, 0, 0, // QDCOUNT=1, others=0
+		// question: "host.", QTYPE=A, QCLASS=IN
+		4, 'h', 'o', 's', 't', 0,
+		0, 1, // QTYPE=A
+		0, 1, // QCLASS=IN
+	}
+	_, err := parseDNSAnswers(resp, 0x1234, dnsTypeA)
+	if err == nil {
+		t.Fatal("expected error for NOERROR/0-answers response")
+	}
+	if !errorsIsAuthoritativeNoData(err) {
+		t.Fatalf("expected errDNSAuthoritativeNoData, got %v", err)
+	}
+}
+
+// TestParseDNSAnswersServfail confirms that non-NXDOMAIN error rcodes
+// (e.g. SERVFAIL=2) are NOT classified as authoritative — they signal
+// "resolver couldn't answer", which is exactly the condition that
+// SHOULD trigger fallback to a different resolver.
+func TestParseDNSAnswersServfail(t *testing.T) {
+	t.Parallel()
+	resp := []byte{
+		0x12, 0x34,
+		0x80, 0x02, // QR=1, RCODE=2 SERVFAIL
+		0, 0, 0, 0, 0, 0, 0, 0,
+	}
+	_, err := parseDNSAnswers(resp, 0x1234, dnsTypeA)
+	if err == nil {
+		t.Fatal("expected error for SERVFAIL response")
+	}
+	if errorsIsAuthoritativeNoData(err) {
+		t.Fatalf("SERVFAIL classified as authoritative; got %v", err)
+	}
+}
+
+// errorsIsAuthoritativeNoData is a tiny helper to avoid importing
+// "errors" purely for one call site in each test.
+func errorsIsAuthoritativeNoData(err error) bool {
+	for cur := err; cur != nil; {
+		if cur == errDNSAuthoritativeNoData {
+			return true
+		}
+		type unwrapper interface{ Unwrap() error }
+		u, ok := cur.(unwrapper)
+		if !ok {
+			return false
+		}
+		cur = u.Unwrap()
+	}
+	return false
 }

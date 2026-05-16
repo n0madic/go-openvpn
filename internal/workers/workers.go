@@ -46,6 +46,16 @@ type Manager struct {
 	// re-enter the manager.
 	onPanic func(worker string, recovered any)
 
+	// mu serialises Go and Shutdown. Without it, a Go that reads the
+	// not-yet-set shutdown flag, then calls wg.Add(1), can race with a
+	// Shutdown+Wait sequence on another goroutine — if all currently-
+	// running workers happen to Done() between the racing reader and its
+	// wg.Add, Wait returns and the late Add panics with "sync.WaitGroup
+	// is reused before previous Wait has returned". Locking around the
+	// Add and the shutdown read closes that window deterministically.
+	mu       sync.Mutex
+	shutdown bool
+
 	wg     sync.WaitGroup
 	active atomic.Int32
 }
@@ -92,9 +102,28 @@ func (m *Manager) Active() int32 { return m.active.Load() }
 // Go starts a named worker. The function receives the manager's context
 // and is expected to return when the context fires. Panics are recovered,
 // logged, and trigger Shutdown.
-func (m *Manager) Go(name string, fn func(ctx context.Context)) {
+//
+// Returns true if the worker was scheduled, false if the manager has
+// already started shutting down — callers writing tight startup paths
+// (e.g. mid-rekey while Close is racing) can use the return value to
+// avoid acting as if the worker exists. Most callers can ignore it.
+func (m *Manager) Go(name string, fn func(ctx context.Context)) bool {
+	m.mu.Lock()
+	if m.shutdown {
+		m.mu.Unlock()
+		// Warn rather than Debug: a worker rejected because the
+		// manager has already shut down is rare enough to be
+		// interesting (typical cause: mid-rekey reaching writeLoop
+		// installation while Close was racing), and silently
+		// dropping the worker would otherwise hide a half-attached
+		// layer from the operator. Visible by default so it
+		// surfaces without -v.
+		m.log.Warn("worker rejected after shutdown", "worker", name)
+		return false
+	}
 	m.wg.Add(1)
 	m.active.Add(1)
+	m.mu.Unlock()
 	go func() {
 		defer m.wg.Done()
 		defer m.active.Add(-1)
@@ -116,13 +145,23 @@ func (m *Manager) Go(name string, fn func(ctx context.Context)) {
 		fn(m.ctx)
 		m.log.Debug("worker stopped", "worker", name)
 	}()
+	return true
 }
 
 // Shutdown cancels the manager's context. Safe to call multiple times.
 // Workers observe the cancellation via Context().Done() or ShouldShutdown().
 // Use Wait to block until they have all returned.
+//
+// After Shutdown returns, any subsequent Go call is rejected and returns
+// false — without that interlock, a Go racing concurrent Wait could panic
+// with "WaitGroup is reused before previous Wait has returned".
 func (m *Manager) Shutdown() {
-	m.shutdownOnce.Do(m.cancel)
+	m.shutdownOnce.Do(func() {
+		m.mu.Lock()
+		m.shutdown = true
+		m.mu.Unlock()
+		m.cancel()
+	})
 }
 
 // Wait blocks until every worker has returned. Does NOT call Shutdown;

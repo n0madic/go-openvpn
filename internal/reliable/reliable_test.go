@@ -477,6 +477,65 @@ func TestWriteAfterCloseReturnsErr(t *testing.T) {
 	}
 }
 
+// TestWriteUnblockedByCloseRead reproduces the deadlock that occurred
+// when a TLS handshake was aborted before HARD_RESET_SERVER arrived: the
+// Write goroutine parked on remoteCond and CloseRead's broadcast woke it
+// up but the predicate (!remoteKnown && !closed) was still true, so it
+// re-parked forever. The fix adds !readClosed to the predicate and
+// returns the recorded readErr (or ErrClosed) when CloseRead is the
+// reason for the wake-up.
+func TestWriteUnblockedByCloseRead(t *testing.T) {
+	t.Parallel()
+	l := New(Config{LocalSessionID: 1})
+	sentinel := errors.New("handshake aborted")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := l.Write([]byte("data"))
+		done <- err
+	}()
+
+	// Give the Write goroutine time to enter the remoteCond wait.
+	time.Sleep(20 * time.Millisecond)
+	l.CloseRead(sentinel)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("Write returned %v, want %v", err, sentinel)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Write did not return after CloseRead — deadlock regressed")
+	}
+}
+
+// TestWriteUnblockedByCloseReadNilErr verifies that CloseRead(nil) still
+// breaks a parked Write — falling back to ErrClosed since no specific
+// reason was supplied. Without this the predicate would treat nil as
+// "no readErr stored" and silently keep the writer parked.
+func TestWriteUnblockedByCloseReadNilErr(t *testing.T) {
+	t.Parallel()
+	l := New(Config{LocalSessionID: 1})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := l.Write([]byte("data"))
+		done <- err
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	l.CloseRead(nil)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("Write returned %v, want ErrClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Write did not return after CloseRead(nil) — deadlock regressed")
+	}
+}
+
 func TestSessionIDMismatch(t *testing.T) {
 	t.Parallel()
 	l := New(Config{LocalSessionID: 1})

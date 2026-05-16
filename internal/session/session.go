@@ -593,19 +593,29 @@ func (s *Session) WriteCtx(ctx context.Context, p []byte) (int, error) {
 }
 
 // mergedContext returns a context that fires when either a or b fires.
-// Inherits Deadline from whichever side has the earlier one.
+// Inherits Deadline from whichever side has the earlier one. Uses
+// context.AfterFunc so no goroutine is spawned unless b actually
+// completes — at typical packet rates a per-WriteCtx goroutine would
+// dominate the hot path; AfterFunc is ~8x cheaper because it does
+// nothing until the watched ctx is cancelled.
+//
+// When b fires, the returned ctx's Err() is always context.Canceled
+// even if b carried context.DeadlineExceeded. Callers that need to
+// distinguish "caller timeout" from "session shutdown" should inspect
+// b.Err() directly; the merged ctx is for cancellation propagation
+// only, not for surfacing the original cause.
+//
+// b == nil is treated as "no extra cancellation source" so callers
+// don't have to guard against it — context.AfterFunc(nil, ...) would
+// otherwise panic.
 func mergedContext(a, b context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(a)
-	stop := make(chan struct{})
-	go func() {
-		select {
-		case <-b.Done():
-			cancel()
-		case <-stop:
-		}
-	}()
+	if b == nil {
+		return ctx, cancel
+	}
+	stop := context.AfterFunc(b, cancel)
 	return ctx, func() {
-		close(stop)
+		stop()
 		cancel()
 	}
 }
@@ -671,6 +681,28 @@ func (s *Session) setCloseErr(err error) {
 	s.closeErr.CompareAndSwap(nil, &err)
 }
 
+// closeAsync spawns a goroutine that calls Close, with panic recovery
+// scoped to a context tag. Shared by RequestRestart and tickLoop's
+// retransmit-exhausted path so a panic on close never crashes the
+// process, regardless of which trigger surfaced first.
+func (s *Session) closeAsync(reason string) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.log.Error("session close panicked",
+					"reason", reason, "recovered", r)
+				// Last-ditch guarantee that workers tear down
+				// even when the orderly Close path panicked
+				// mid-flight.
+				if s.workers != nil {
+					s.workers.Shutdown()
+				}
+			}
+		}()
+		_ = s.Close()
+	}()
+}
+
 // installTLSConn replaces the active TLS control-channel conn and starts a
 // reader goroutine that watches for server-initiated messages (RESTART,
 // INFO, EXIT). The previously-active conn is closed (which kills its reader).
@@ -704,7 +736,7 @@ func (s *Session) RequestRestart(reason string) {
 	s.log.Warn("session restart requested by application", "reason", reason)
 	re := &RestartError{Reason: reason}
 	s.setCloseErr(re)
-	go func() { _ = s.Close() }()
+	s.closeAsync("application restart: " + reason)
 }
 
 // Rekey triggers a soft-reset rekey synchronously. Useful for tests and for
@@ -1126,7 +1158,12 @@ func (s *Session) tickLoop(layer *reliable.Layer) {
 				// layer, in which case it's harmless.
 				if l := s.slots.Active(); l != nil && layer == s.layers.Get(l.KeyID) {
 					s.log.Warn("reliable tick fatal on active layer", "err", err)
-					_ = s.Close()
+					// Surface as RestartError so Tunnel.Read/Write triggers
+					// AutoReconnect — otherwise the user sees a generic
+					// ErrClosed and the tunnel dies silently after ~31s of
+					// retransmits with no recovery.
+					s.setCloseErr(&RestartError{Reason: "control-channel retransmits exceeded: " + err.Error()})
+					s.closeAsync("control-channel retransmits exhausted")
 				}
 				return
 			}

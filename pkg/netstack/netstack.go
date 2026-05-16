@@ -49,6 +49,16 @@ import (
 // nicID is the only NIC we register inside the stack.
 const nicID tcpip.NICID = 1
 
+// ErrTunnelIPChanged is returned from Net.DialContext when an
+// AutoReconnect-driven session swap installed a new tunnel-local IP
+// between the snapshot taken at entry and the snapshot taken after the
+// gonet dial. The conn is force-closed before this error is returned
+// (so callers don't leak a zombie endpoint bound to a stale source IP).
+// Use errors.Is to distinguish this from a generic dial failure — it's
+// safe to retry the same dial immediately, the second attempt binds to
+// the fresh local IP.
+var ErrTunnelIPChanged = errors.New("netstack: tunnel IP changed during dial")
+
 // safeInnerMTU caps the gVisor NIC's MTU so that, after OpenVPN
 // encryption + UDP/IP outer headers, the resulting wire datagram
 // fits within the lowest common path MTU we'll realistically see.
@@ -396,6 +406,18 @@ func (e *endpoint) dispatchInbound(ip []byte) (dispatcherMissing bool) {
 
 // WritePackets serialises each PacketBuffer to a single IP datagram and
 // writes it to the underlying tunnel Conn.
+//
+// TODO(perf): on Linux this loop is the choke point for bulk-egress
+// throughput. Each iteration becomes one sendmsg syscall down in
+// internal/transport — gVisor TCP frequently hands us batches of 8-32
+// PacketBuffers, so we're paying 8-32x the syscall cost we need to.
+// A real sendmmsg path would require: (a) sealing each plaintext
+// independently in Session, (b) collecting the wire-format encrypted
+// bytes into a [][]byte, (c) handing the batch to a new
+// transport.PacketBatchWriter optional interface, (d) implementing
+// that via golang.org/x/net/ipv4.PacketConn.WriteBatch on Linux only.
+// AEAD seal remains per-packet (the cipher state isn't batchable) so
+// the saving is the syscall ratio, not the crypto.
 func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	var wrote int
 	for _, pkt := range pkts.AsSlice() {
@@ -450,9 +472,19 @@ type Net struct {
 	// call. nil before New finishes wiring.
 	detachIngress func()
 
+	// detachOnReconnect unregisters the reconnect hook installed in New.
+	// Called from Close so a Client that outlives this Net (rare but
+	// possible — e.g. tests recreating Net for the same Client) doesn't
+	// keep firing into a torn-down NIC.
+	detachOnReconnect func()
+
 	// statsStop closes when the periodic stats logger should exit.
-	// Started in New, drained in Close.
+	// Started in New, drained in Close. statsWG joins the loop so
+	// Close doesn't return until the loop has finished its current
+	// snap() — without that, Close racing stack.Close() can panic in
+	// gVisor internals while the loop is reading Stats().
 	statsStop chan struct{}
+	statsWG   sync.WaitGroup
 
 	// activeConns tracks every net.Conn handed out by DialContext so
 	// they can be force-closed when the tunnel IP changes (see
@@ -611,7 +643,18 @@ func New(cli *openvpn.Client) (*Net, error) {
 	// replacement hands us a fresh tunnel IP / gateway. Without re-syncing
 	// the NIC, post-reconnect packets carry the OLD source IP and the
 	// server silently drops them.
-	cli.OnReconnect(func(pr openvpn.PushReply) {
+	n.detachOnReconnect = cli.OnReconnect(func(pr openvpn.PushReply) {
+		// Serialise against Close so a hook fire that overlapped with
+		// Net.Close — possible because FireOnReconnect snapshots the
+		// hook slice under hooksMu and then drops the lock before
+		// invoking — cannot touch the gVisor stack after it has been
+		// torn down. Lock order: closeMu → nicMu (Close also takes
+		// closeMu first).
+		n.closeMu.Lock()
+		defer n.closeMu.Unlock()
+		if n.closed {
+			return
+		}
 		// Snapshot the pre-reconnect local addresses so we can decide
 		// whether existing conns are still valid (same tunnel IP) or
 		// have become zombies (new tunnel IP). The server hands us
@@ -668,6 +711,7 @@ func New(cli *openvpn.Client) (*Net, error) {
 	// stuck data flows correspond to a problem in gVisor (e.g. growing
 	// retransmits / send errors / endpoint leak) or below it. Pure
 	// observability — does not take action on anything.
+	n.statsWG.Add(1)
 	go n.statsLoggerLoop()
 
 	return n, nil
@@ -862,7 +906,18 @@ func (n *Net) Close() error {
 	if n.detachIngress != nil {
 		n.detachIngress()
 	}
+	// Detach the reconnect hook so a Client outliving this Net never
+	// invokes our applyPushReply / closeActiveOnReconnect after the
+	// underlying stack has been torn down.
+	if n.detachOnReconnect != nil {
+		n.detachOnReconnect()
+	}
 	close(n.statsStop)
+	// Wait for statsLoggerLoop to finish its in-flight snap() before
+	// tearing down the gVisor stack — without this, n.stack.Close()
+	// can race a still-running n.stack.Stats() call inside the loop
+	// and trip gVisor internals.
+	n.statsWG.Wait()
 	n.stack.Close()
 	n.ep.Close()
 	return nil
@@ -892,6 +947,7 @@ const statsLogPeriod = 30 * time.Second
 //     in is growing but IP received isn't, gVisor's IP layer is rejecting
 //     the inbound (look at ip_malformed for confirmation).
 func (n *Net) statsLoggerLoop() {
+	defer n.statsWG.Done()
 	t := time.NewTicker(statsLogPeriod)
 	defer t.Stop()
 
@@ -1117,13 +1173,24 @@ func (n *Net) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 		return nil, fmt.Errorf("netstack: unsupported address %q", host)
 	}
 
+	// Snapshot the local IPs BEFORE the (potentially blocking) gonet dial
+	// so we can detect a tunnel-IP change that occurred during the dial.
+	// Without this guard, an OnReconnect hook running between
+	// gonet.Dial and trackConn would close every *currently-tracked*
+	// conn but miss the about-to-be-tracked one — its register call
+	// arrives after closeActiveOnReconnect has finished and the conn
+	// stays bound to the now-stale source IP, becoming a zombie that
+	// gVisor TCP only abandons after 60-120s of retransmits.
+	preV4, preV6 := n.snapshotLocalIPs()
+
+	var dialed net.Conn
 	switch network {
 	case "tcp", "tcp4", "tcp6":
 		c, err := gonet.DialContextTCP(ctx, n.stack, full, proto)
 		if err != nil {
 			return nil, err
 		}
-		return n.trackConn(c), nil
+		dialed = c
 	case "udp", "udp4", "udp6":
 		// gonet.DialUDP has no Context variant; it returns immediately because
 		// UDP is connectionless. We honor ctx best-effort by checking it first.
@@ -1137,10 +1204,35 @@ func (n *Net) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 		if err != nil {
 			return nil, err
 		}
-		return n.trackConn(c), nil
+		dialed = c
 	default:
 		return nil, &net.OpError{Op: "dial", Net: network, Err: errors.New("netstack: unsupported network")}
 	}
+
+	// Register BEFORE the final snapshot check so a reconnect hook that
+	// fires inside the [trackConn, snapshot post] window force-closes
+	// this conn via closeActiveOnReconnect — without this, the conn
+	// would be invisible to the hook and stay bound to a stale source
+	// IP until gVisor TCP's 60-120s retransmit timeout.
+	tracked := n.trackConn(dialed)
+	postV4, postV6 := n.snapshotLocalIPs()
+	if preV4 != postV4 || preV6 != postV6 {
+		_ = tracked.Close()
+		return nil, &net.OpError{
+			Op: "dial", Net: network,
+			Err: ErrTunnelIPChanged,
+		}
+	}
+	return tracked, nil
+}
+
+// snapshotLocalIPs returns a copy of the NIC's current IPv4 and IPv6
+// addresses under nicMu, so the caller can detect concurrent reconnect-
+// driven address changes.
+func (n *Net) snapshotLocalIPs() (netip.Addr, netip.Addr) {
+	n.nicMu.Lock()
+	defer n.nicMu.Unlock()
+	return n.localV4, n.localV6
 }
 
 // currentLocalFullAddress returns a FullAddress suitable as `laddr` for a

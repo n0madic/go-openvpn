@@ -284,6 +284,20 @@ func (m *udpRelayMgr) pumpClientToTunnel(ctx context.Context) {
 				"host", host, "have_v4", m.s.ns.HasIPv4(), "have_v6", m.s.ns.HasIPv6())
 			continue
 		}
+		// Per-target token bucket — symmetric to TCP CONNECT. UDP ASSOCIATE
+		// is otherwise unrestricted: one authorised client can fan out
+		// thousands of datagrams per second to amplification-capable
+		// services (open DNS, NTP, memcached) and ENOBUFS the tunnel via
+		// the very same retransmit-storm path that TCP rate-limiting was
+		// added to prevent. Sharing the limiter with TCP means the burst
+		// budget is per-destination total (UDP + TCP), which matches
+		// "this host is overloaded" semantics better than two independent
+		// buckets.
+		if m.s.connRate != nil && !m.s.connRate.allow(ips[0]) {
+			m.s.log.Debug("UDP relay: per-host rate limit",
+				"target", ips[0], "port", port, "host", host)
+			continue
+		}
 		targetAddr := net.JoinHostPort(ips[0].String(), strconv.Itoa(int(port)))
 
 		relay, err := m.getOrCreate(ctx, host, port, targetAddr, client)

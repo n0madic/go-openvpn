@@ -24,6 +24,22 @@ import (
 // upstream DNS server through a typical browsing session.
 const dnsCacheTTL = 60 * time.Second
 
+// errDNSAuthoritativeNoData is returned by queryOverTunnel when the tunneled
+// resolver gave a definitive negative answer for every queried qtype —
+// NXDOMAIN (RCODE=3) or NOERROR with zero answers. The host either does
+// not exist or does not have records of the requested family. Distinguishing
+// this from "resolver unreachable" (network error, timeout, SERVFAIL) is
+// critical: a definitive negative MUST NOT trigger a system-resolver
+// fallback, because that fallback would leak the query name to the ISP DNS.
+var errDNSAuthoritativeNoData = errors.New("dns: authoritative no data")
+
+// errDNSDisallowedLiteral is returned by LookupIP when host is an IP literal
+// of a class we never proxy through SOCKS5 — loopback, unspecified,
+// multicast, link-local. These would either let a SOCKS5 client probe the
+// gVisor stack's internal addresses or send traffic to ranges that have no
+// useful meaning over the tunnel.
+var errDNSDisallowedLiteral = errors.New("dns: refusing literal IP of restricted class")
+
 // publicDNSFallback is the well-known public resolver we query over the
 // tunnel when the pushed/override resolver doesn't respond. Picked over
 // 8.8.8.8 specifically because Cloudflare is the most aggressive about
@@ -67,6 +83,19 @@ type resolver struct {
 	// and useful for testing.
 	statsCacheHit  atomic.Uint64
 	statsCacheMiss atomic.Uint64
+
+	// queryOverTunnelFn, when non-nil, replaces the default
+	// queryOverTunnel implementation. Used by tests that need to
+	// inject a deterministic resolver without standing up a netstack.
+	// Production code leaves it nil.
+	queryOverTunnelFn func(ctx context.Context, server netip.AddrPort, host string) ([]netip.Addr, error)
+
+	// systemLookupFn, when non-nil, replaces net.DefaultResolver.
+	// LookupNetIP for the system-fallback branch of LookupIP. Used by
+	// tests to prove the fallback stays cold when a tunneled resolver
+	// reported authoritative-negative — the highest-impact leak vector
+	// the negative-cache logic prevents.
+	systemLookupFn func(ctx context.Context, network, host string) ([]netip.Addr, error)
 }
 
 // systemWarnThrottle is the minimum gap between two consecutive "falling
@@ -132,6 +161,9 @@ func (r *resolver) cacheSet(host string, ips []netip.Addr) {
 // accidentally prolong a DNS-leak window after the tunnel recovers.
 func (r *resolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
+		if !isProxiableLiteral(ip) {
+			return nil, fmt.Errorf("%w: %s", errDNSDisallowedLiteral, ip)
+		}
 		return []netip.Addr{ip}, nil
 	}
 
@@ -142,13 +174,18 @@ func (r *resolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, err
 	r.statsCacheMiss.Add(1)
 
 	tunnelAttempted := false
+	sawAuthoritativeNoData := false
 
 	// 1. -dns override.
 	if r.override.IsValid() {
 		tunnelAttempted = true
-		if ips, err := r.queryOverTunnel(ctx, r.override, host); err == nil && len(ips) > 0 {
+		ips, err := r.runTunneledQuery(ctx, r.override, host)
+		if err == nil && len(ips) > 0 {
 			r.cacheSet(host, ips)
 			return ips, nil
+		}
+		if errors.Is(err, errDNSAuthoritativeNoData) {
+			sawAuthoritativeNoData = true
 		}
 	}
 	// 2. Pushed DNS servers, in order.
@@ -158,9 +195,13 @@ func (r *resolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, err
 		}
 		tunnelAttempted = true
 		ap := netip.AddrPortFrom(srv, 53)
-		if ips, err := r.queryOverTunnel(ctx, ap, host); err == nil && len(ips) > 0 {
+		ips, err := r.runTunneledQuery(ctx, ap, host)
+		if err == nil && len(ips) > 0 {
 			r.cacheSet(host, ips)
 			return ips, nil
+		}
+		if errors.Is(err, errDNSAuthoritativeNoData) {
+			sawAuthoritativeNoData = true
 		}
 	}
 	// 3. publicDNSFallback over the tunnel — try a different resolver
@@ -170,25 +211,72 @@ func (r *resolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, err
 	// don't second-guess them).
 	if !r.override.IsValid() {
 		tunnelAttempted = true
-		if ips, err := r.queryOverTunnel(ctx, publicDNSFallback, host); err == nil && len(ips) > 0 {
+		ips, err := r.runTunneledQuery(ctx, publicDNSFallback, host)
+		if err == nil && len(ips) > 0 {
 			r.log.Debug("DNS-over-tunnel fallback succeeded via public resolver",
 				"host", host, "via", publicDNSFallback)
 			r.cacheSet(host, ips)
 			return ips, nil
 		}
+		if errors.Is(err, errDNSAuthoritativeNoData) {
+			sawAuthoritativeNoData = true
+		}
+	}
+	// Authoritative negative from any tunneled resolver is FINAL. Falling
+	// back to the system resolver would just leak the host name to the
+	// ISP DNS for no benefit — the tunneled resolver already told us the
+	// record doesn't exist for our usable address families.
+	if sawAuthoritativeNoData {
+		return nil, fmt.Errorf("no records for %q (authoritative)", host)
 	}
 	// 4. System fallback. Tunnel DNS will be re-attempted on the *next*
 	// LookupIP; this fallback is only for the current query. Result is
 	// intentionally NOT cached — caching a system-resolved IP could
-	// prolong DNS leakage after the tunnel recovers.
+	// prolong DNS leakage after the tunnel recovers. The result is also
+	// filtered to the tunnel's actual address families, so a v6 record
+	// returned by the system resolver doesn't reach gVisor on a v4-only
+	// tunnel (which would either error or, worse, retry through the
+	// system resolver chain and leak again).
 	if tunnelAttempted {
 		r.maybeWarnSystemFallback(host)
 	}
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	lookup := r.systemLookupFn
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupNetIP
+	}
+	ips, err := lookup(ctx, "ip", host)
 	if err != nil {
 		return nil, err
 	}
+	hasV4, hasV6 := true, true
+	if r.ns != nil {
+		hasV4 = r.ns.HasIPv4()
+		hasV6 = r.ns.HasIPv6()
+	}
+	ips = filterUsableIPs(ips, hasV4, hasV6)
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no usable address family for %q from system resolver", host)
+	}
 	return ips, nil
+}
+
+// isProxiableLiteral reports whether the SOCKS5 proxy will carry traffic to
+// the given IP literal. Loopback, unspecified, multicast and link-local
+// addresses are filtered to prevent a SOCKS5 client from using us to probe
+// the gVisor stack's internal address space (127.0.0.1, ::1) or to ship
+// traffic to ranges that have no meaning over the tunnel (multicast,
+// link-local). RFC1918 / ULA / CGNAT addresses are INTENTIONALLY allowed
+// through — many VPN deployments host private services (admin panels,
+// internal DNS, monitoring) inside the tunnel and refusing those classes
+// would silently break access to them.
+func isProxiableLiteral(ip netip.Addr) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return false
+	}
+	return true
 }
 
 // maybeWarnSystemFallback emits a throttled warning when we use the system
@@ -224,6 +312,18 @@ func pickQueryTypes(hasV4, hasV6 bool) []uint16 {
 		qtypes = append(qtypes, dnsTypeAAAA)
 	}
 	return qtypes
+}
+
+// runTunneledQuery dispatches a tunneled DNS query through the
+// queryOverTunnelFn seam when set (tests), otherwise through the real
+// queryOverTunnel. Centralising the dispatch keeps LookupIP free of
+// per-call seam checks and gives one place to inject deterministic
+// resolver behaviour from tests.
+func (r *resolver) runTunneledQuery(ctx context.Context, server netip.AddrPort, host string) ([]netip.Addr, error) {
+	if r.queryOverTunnelFn != nil {
+		return r.queryOverTunnelFn(ctx, server, host)
+	}
+	return r.queryOverTunnel(ctx, server, host)
 }
 
 // queryOverTunnel sends the relevant DNS queries (A and/or AAAA, see
@@ -272,18 +372,30 @@ func (r *resolver) queryOverTunnel(ctx context.Context, server netip.AddrPort, h
 		}(qt)
 	}
 	var out []netip.Addr
+	authoritativeNegatives := 0
+	hadTransportErr := false
 	for range qtypes {
 		res := <-ch
 		if res.err != nil {
 			r.log.Debug("DNS query failed", "server", server, "host", host, "qtype", res.qtype, "err", res.err)
+			if errors.Is(res.err, errDNSAuthoritativeNoData) {
+				authoritativeNegatives++
+			} else {
+				hadTransportErr = true
+			}
 			continue
 		}
 		out = append(out, res.ips...)
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("no records for %q from %s", host, server)
+	if len(out) > 0 {
+		return out, nil
 	}
-	return out, nil
+	// Every qtype gave a definitive negative — signal to the caller that
+	// this is a final answer and not a "try a different resolver" condition.
+	if authoritativeNegatives > 0 && !hadTransportErr {
+		return nil, fmt.Errorf("%w: %s via %s", errDNSAuthoritativeNoData, host, server)
+	}
+	return nil, fmt.Errorf("no records for %q from %s", host, server)
 }
 
 func (r *resolver) queryOne(conn net.Conn, host string, qtype uint16) ([]netip.Addr, error) {
@@ -385,7 +497,15 @@ func parseDNSAnswers(resp []byte, wantID uint16, wantType uint16) ([]netip.Addr,
 	if flags&0x8000 == 0 {
 		return nil, errors.New("dns: not a response")
 	}
-	if rcode := flags & 0x000F; rcode != 0 {
+	rcode := flags & 0x000F
+	switch rcode {
+	case 0: // NOERROR — answers may still be empty (no record for this qtype).
+	case 3: // NXDOMAIN — authoritative "does not exist".
+		return nil, fmt.Errorf("%w: NXDOMAIN", errDNSAuthoritativeNoData)
+	default:
+		// SERVFAIL (2), REFUSED (5), etc — resolver couldn't answer.
+		// Treated as a transport-class failure so the caller will try a
+		// different resolver / fall back.
 		return nil, fmt.Errorf("dns: rcode=%d", rcode)
 	}
 	qdcount := binary.BigEndian.Uint16(resp[4:6])
@@ -439,6 +559,13 @@ func parseDNSAnswers(resp []byte, wantID uint16, wantType uint16) ([]netip.Addr,
 			}
 			out = append(out, netip.AddrFrom16([16]byte(rdata)))
 		}
+	}
+	// NOERROR with zero answers of the requested type is an authoritative
+	// "this host has no record of this family" — signal it explicitly so
+	// callers don't promote a perfectly valid negative into a system-resolver
+	// fallback (which would leak the name to the ISP DNS).
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%w: NOERROR / 0 answers", errDNSAuthoritativeNoData)
 	}
 	return out, nil
 }

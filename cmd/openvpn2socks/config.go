@@ -28,9 +28,10 @@ func loadConfig(opts *cliOpts, logger *slog.Logger) (*openvpn.Config, error) {
 // loadFromOvpnFile parses a .ovpn profile and applies flag overrides.
 func loadFromOvpnFile(opts *cliOpts, logger *slog.Logger) (*openvpn.Config, error) {
 	parsed, err := ovpn.ParseFile(opts.configFile, &ovpn.ParseOptions{
-		Username:           opts.user,
-		Password:           opts.pass,
-		ServerNameOverride: opts.sni,
+		Username:              opts.user,
+		Password:              opts.pass,
+		ServerNameOverride:    opts.sni,
+		AllowNoServerIdentity: opts.allowNoServerIdentity,
 		PickRemote: func(remotes []ovpn.Remote) ovpn.Remote {
 			if opts.port != "" {
 				for _, r := range remotes {

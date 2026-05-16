@@ -15,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -50,8 +51,9 @@ type cliOpts struct {
 	dns string
 
 	// Misc.
-	idle    time.Duration
-	verbose bool
+	idle                  time.Duration
+	verbose               bool
+	allowNoServerIdentity bool
 }
 
 func parseFlags() *cliOpts {
@@ -83,6 +85,8 @@ func parseFlags() *cliOpts {
 	// Misc.
 	flag.DurationVar(&o.idle, "idle", 10*time.Minute, "close idle proxied TCP after this duration (0 disables)")
 	flag.BoolVar(&o.verbose, "v", false, "verbose logging (slog Debug)")
+	flag.BoolVar(&o.allowNoServerIdentity, "allow-no-server-identity", false,
+		"accept a .ovpn profile that has no verify-x509-name and an IP-only remote (the TLS chain is still validated against the CA, but any cert from that CA passes — MITM risk on multi-tenant CAs). Use only if you know the operator and explicitly trust the CA pool.")
 	flag.Parse()
 
 	return o
@@ -171,13 +175,62 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 		if err != nil {
 			return err
 		}
+		// Match -dns address family against the tunnel's actual NIC.
+		// Without this, an IPv6 -dns target on a v4-only ProtonVPN
+		// tunnel (the common case) silently fails every query, which
+		// then trips the resolver's system-fallback path and leaks
+		// query names to the ISP DNS for every lookup. Hard error
+		// up-front is much friendlier than the slow degradation.
+		if override.Addr().Is4() && !ns.HasIPv4() {
+			return fmt.Errorf("-dns is IPv4 (%s) but tunnel has no IPv4 address", override)
+		}
+		if override.Addr().Is6() && !ns.HasIPv6() {
+			return fmt.Errorf("-dns is IPv6 (%s) but tunnel has no IPv6 address", override)
+		}
 	}
 	r := newResolver(ns, pr.DNS, override, logger)
+
+	// Warn loudly when the SOCKS5 listener is bound to a non-loopback
+	// interface without SOCKS5 authentication: anyone on the LAN can
+	// route their traffic through this user's VPN. The CLI default is
+	// 127.0.0.1:1080 so this almost always indicates an intentional
+	// "expose to LAN" with a forgotten -socks-auth.
+	if opts.socksAuth == "" && !isLoopbackListen(opts.listen) {
+		logger.Warn("SOCKS5 is open without authentication on a non-loopback address — anyone on the network can use this VPN",
+			"listen", opts.listen,
+			"hint", "set -socks-auth user:pass or bind to 127.0.0.1")
+	}
 
 	srv := newSOCKS5(ns, r, opts.listen, opts.socksAuth, opts.idle, logger)
 	logger.Info("SOCKS5 listening", "addr", opts.listen)
 
 	return srv.ListenAndServe(rootCtx)
+}
+
+// isLoopbackListen reports whether the SOCKS5 listen address binds only to
+// the loopback interface. Recognises both IP-literal forms
+// ("127.0.0.1:1080", "[::1]:1080") and the symbolic "localhost:1080".
+// Empty host (bare ":1080") binds to 0.0.0.0/[::] — NOT loopback — so
+// the warning fires as expected.
+func isLoopbackListen(addr string) bool {
+	if ap, err := netip.ParseAddrPort(addr); err == nil {
+		return ap.Addr().IsLoopback()
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // parseDNSFlag accepts "IP" or "IP:port". Default port is 53.
