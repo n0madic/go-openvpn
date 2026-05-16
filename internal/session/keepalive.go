@@ -39,6 +39,25 @@ const (
 	// misses this because server-side PINGs keep lastInbound fresh.
 	dataActivityStuckThreshold = 60 * time.Second
 
+	// dataActivityWarmupFast / dataActivityStuckThresholdFast /
+	// dataActivityFastWindow tighten the watchdog during the first
+	// FastWindow after session-up. A freshly-installed session is
+	// empirically much more likely to be wedged than a steady-state
+	// one: post-reconnect failure modes include server-side state
+	// loss for the previous peer-id, source-port-keyed rate limits
+	// surviving the reconnect, NAT mapping drift, and gVisor TCP
+	// zombies retransmitting on the previous tunnel IP. Spending
+	// the full 60s steady threshold confirming each of those is the
+	// difference between "tunnel jitters for a few seconds" and
+	// "tunnel froze for over a minute". Two minutes is generous
+	// enough that any genuine handshake/app-discovery latency
+	// straddling a reconnect falls inside the window; past that we
+	// trust the relationship enough to revert to the more
+	// false-positive-resistant steady values.
+	dataActivityWarmupFast         = 10 * time.Second
+	dataActivityStuckThresholdFast = 20 * time.Second
+	dataActivityFastWindow         = 2 * time.Minute
+
 	// hardResetCheckPeriod is how often hardResetWatch samples the
 	// statsHardResetIn counter.
 	hardResetCheckPeriod = 5 * time.Second
@@ -271,25 +290,59 @@ func (s *Session) statsLogger(ctx context.Context) {
 // the process manually.
 //
 // This watch fires when the user is actively sending traffic but no
-// real (non-PING) inbound packet has arrived for dataActivityStuckThreshold.
+// real (non-PING) inbound packet has arrived for the active threshold.
 // The "user actively sending" guard prevents spurious restarts during
 // idle periods (no outbound → no expectation of inbound).
+//
+// Adaptive thresholds: for the first DataActivityFastWindow after
+// session-up we use the tighter fast warmup / threshold pair; after
+// that we relax to the steady values. A freshly-installed session is
+// empirically more likely to be wedged than a steady-state one — see
+// the constant block above for the failure-mode catalogue. Outside
+// the fast window the longer steady threshold keeps the watchdog from
+// false-firing on normal app-level slowdowns.
 //
 // Closing is dispatched on a fresh goroutine so this watcher (managed
 // by s.workers) returns before Close calls s.workers.Wait, avoiding a
 // self-wait deadlock — same pattern as pingRestartWatch.
 func (s *Session) dataActivityWatch(ctx context.Context) {
-	warmup := s.cfg.DataActivityWarmup
-	if warmup <= 0 {
-		warmup = dataActivityWarmup
+	warmupSteady := s.cfg.DataActivityWarmup
+	if warmupSteady <= 0 {
+		warmupSteady = dataActivityWarmup
 	}
-	threshold := s.cfg.DataActivityStuckThreshold
-	if threshold <= 0 {
-		threshold = dataActivityStuckThreshold
+	thresholdSteady := s.cfg.DataActivityStuckThreshold
+	if thresholdSteady <= 0 {
+		thresholdSteady = dataActivityStuckThreshold
+	}
+	warmupFast := s.cfg.DataActivityWarmupFast
+	if warmupFast <= 0 {
+		warmupFast = dataActivityWarmupFast
+	}
+	thresholdFast := s.cfg.DataActivityStuckThresholdFast
+	if thresholdFast <= 0 {
+		thresholdFast = dataActivityStuckThresholdFast
+	}
+	fastWindow := s.cfg.DataActivityFastWindow
+	if fastWindow <= 0 {
+		fastWindow = dataActivityFastWindow
+	}
+	// Clamp fast values so they never EXCEED steady — a "fast" phase
+	// that's actually slower than steady is incoherent. Hit when a
+	// caller (almost always a test) sets very short steady values and
+	// leaves the fast fields at zero, so the package defaults of
+	// 10s/20s would otherwise paradoxically stretch the test before
+	// the steady values could fire.
+	if warmupFast > warmupSteady {
+		warmupFast = warmupSteady
+	}
+	if thresholdFast > thresholdSteady {
+		thresholdFast = thresholdSteady
 	}
 	// Sample at no faster than 100ms (avoid CPU burn on tiny test thresholds)
 	// and no slower than dataActivityCheckPeriod (default sampling rate).
-	period := threshold / 4
+	// Drive the sampling rate off the FAST threshold so the fast phase
+	// reacts on its own cadence, not at the slower steady cadence.
+	period := thresholdFast / 4
 	switch {
 	case period < 100*time.Millisecond:
 		period = 100 * time.Millisecond
@@ -304,26 +357,31 @@ func (s *Session) dataActivityWatch(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			if now.Sub(start) < warmup {
+			age := now.Sub(start)
+			warmup, threshold := warmupSteady, thresholdSteady
+			phase := "steady"
+			if age < fastWindow {
+				warmup, threshold = warmupFast, thresholdFast
+				phase = "fast"
+			}
+			if age < warmup {
 				continue
 			}
-			lastOut := time.Unix(0, s.lastUserOutbound.Load())
-			lastIn := time.Unix(0, s.lastDataInbound.Load())
-			sinceOut := now.Sub(lastOut)
-			sinceIn := now.Sub(lastIn)
-			// The user is "actively sending" if they wrote something
-			// within the stuck-threshold window. If they're idle, we
-			// have no business demanding inbound data.
-			if sinceOut >= threshold {
-				continue
-			}
-			if sinceIn < threshold {
+			decision := decideActivityStall(now, age, threshold,
+				s.lastUserOutbound.Load(), s.lastDataInbound.Load(),
+				s.lastUserOutboundTCP.Load(), s.lastDataInboundTCP.Load(),
+				s.lastUserOutboundUDP.Load(), s.lastDataInboundUDP.Load(),
+			)
+			if decision.reason == "" {
 				continue
 			}
 			s.log.Warn("data-activity watch: user sending but no inbound data; forcing reconnect",
-				"since_outbound", sinceOut,
-				"since_inbound", sinceIn,
+				"signal", decision.reason,
+				"since_outbound", decision.sinceOut,
+				"since_inbound", decision.sinceIn,
 				"threshold", threshold,
+				"phase", phase,
+				"age", age,
 				"forwarded", s.statsForwarded.Load(),
 				"dropped_full", s.statsDroppedFull.Load(),
 				"ping_in", s.statsPingIn.Load(),
@@ -334,6 +392,129 @@ func (s *Session) dataActivityWatch(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// L4 protocol numbers used by sniffL4. Mirrors the values from
+// pkg/netstack/endpoint.dispatchInbound — kept private to session so
+// the watchdog doesn't pull a cross-module dependency on netstack just
+// to recognise TCP/UDP.
+const (
+	l4ProtoTCP uint8 = 6
+	l4ProtoUDP uint8 = 17
+)
+
+// sniffL4 returns the IPv4/IPv6 L4 protocol number from a plaintext IP
+// datagram, or 0 for "unknown / not-bucketable" (ICMP, fragments,
+// IPv6 extension chains we don't walk, malformed). Used by
+// handleDataIn / WriteCtx to feed the per-L4 liveness timestamps.
+// Same parser as pkg/netstack — keeping a single-line implementation
+// here is cheaper than threading a helper across module boundaries.
+func sniffL4(pkt []byte) uint8 {
+	if len(pkt) < 1 {
+		return 0
+	}
+	switch pkt[0] >> 4 {
+	case 4:
+		// IPv4 protocol field at byte 9; minimum IHL=5 (20 bytes).
+		if len(pkt) < 20 {
+			return 0
+		}
+		return pkt[9]
+	case 6:
+		// IPv6 NextHeader at byte 6. Extension headers (HBH,
+		// Routing, Fragment) would chain to the real L4; we
+		// don't walk them — mis-bucketing a packet with extension
+		// headers as "other" is harmless for the watchdog because
+		// it just means we don't update the L4-specific timestamp
+		// and the aggregate path still tracks it.
+		if len(pkt) < 40 {
+			return 0
+		}
+		return pkt[6]
+	}
+	return 0
+}
+
+// activityStallDecision is the verdict from decideActivityStall. A
+// non-empty reason indicates the watchdog should fire; the timestamps
+// are surfaced in the log line for diagnostics. Encoded as a struct
+// rather than (reason, sinceOut, sinceIn) returns so callers and the
+// test table stay readable.
+type activityStallDecision struct {
+	reason   string // "" = healthy; "aggregate" / "tcp" / "udp" = fire
+	sinceOut time.Duration
+	sinceIn  time.Duration
+}
+
+// decideActivityStall is the pure decision core of dataActivityWatch.
+// It returns a non-empty reason when the user is actively sending
+// (within `threshold`) but the matching direction of inbound traffic
+// has been silent for at least `threshold`. Per-L4 signals (TCP, UDP)
+// fire BEFORE the aggregate so the trigger log records the most
+// specific cause — that's the difference between "the tunnel is dead"
+// (aggregate) and "TCP is dead while UDP DNS still works" (tcp).
+//
+// `age` is the watch's own elapsed time since session-up; it's used
+// as the inbound floor when the per-L4 inbound has never been
+// observed (otherwise a session that started with zero TCP would
+// never accumulate `sinceIn >= threshold` since both timestamps stay
+// at zero). The aggregate channel intentionally does NOT use that
+// floor — historically dataActivityWatch required both sides to be
+// observed at least once, and we keep that semantic to avoid
+// regressing the existing test suite.
+func decideActivityStall(now time.Time, age, threshold time.Duration,
+	lastOutNs, lastInNs,
+	lastTCPOutNs, lastTCPInNs,
+	lastUDPOutNs, lastUDPInNs int64,
+) activityStallDecision {
+	// Per-L4 first — most specific reason wins so the log line
+	// tells the operator exactly which family is wedged.
+	if d := checkStallWithFloor(now, age, threshold, lastTCPOutNs, lastTCPInNs); d.reason != "" {
+		d.reason = "tcp"
+		return d
+	}
+	if d := checkStallWithFloor(now, age, threshold, lastUDPOutNs, lastUDPInNs); d.reason != "" {
+		d.reason = "udp"
+		return d
+	}
+	// Aggregate fallback. Both sides must have been observed at
+	// least once — preserving the behaviour the existing
+	// test suite expects.
+	if lastOutNs > 0 && lastInNs > 0 {
+		sinceOut := now.Sub(time.Unix(0, lastOutNs))
+		sinceIn := now.Sub(time.Unix(0, lastInNs))
+		if sinceOut < threshold && sinceIn >= threshold {
+			return activityStallDecision{reason: "aggregate", sinceOut: sinceOut, sinceIn: sinceIn}
+		}
+	}
+	return activityStallDecision{}
+}
+
+// checkStallWithFloor runs the per-L4 decision: returns a non-empty
+// reason ("matched", to be relabelled by the caller) when the user is
+// actively sending on this L4 and the matching inbound has been
+// silent for at least `threshold`. When lastInNs is 0 (never received
+// on this L4), we use `age` as the floor — a session that's been up
+// for `threshold` while sending TCP without a single TCP reply IS
+// stuck, and pretending otherwise lets the wedge persist forever.
+func checkStallWithFloor(now time.Time, age, threshold time.Duration, lastOutNs, lastInNs int64) activityStallDecision {
+	if lastOutNs == 0 {
+		return activityStallDecision{}
+	}
+	sinceOut := now.Sub(time.Unix(0, lastOutNs))
+	if sinceOut >= threshold {
+		return activityStallDecision{}
+	}
+	var sinceIn time.Duration
+	if lastInNs > 0 {
+		sinceIn = now.Sub(time.Unix(0, lastInNs))
+	} else {
+		sinceIn = age
+	}
+	if sinceIn < threshold {
+		return activityStallDecision{}
+	}
+	return activityStallDecision{reason: "matched", sinceOut: sinceOut, sinceIn: sinceIn}
 }
 
 // pingRestartWatch closes the session with a *RestartError when no inbound

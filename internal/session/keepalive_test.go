@@ -713,6 +713,97 @@ func TestDataActivityWatchSurvivesIdle(t *testing.T) {
 	}
 }
 
+// TestDataActivityWatchFastPhaseFiresBeforeSteady exercises the adaptive
+// two-phase behaviour: a long steady threshold (would not fire for 10s)
+// is combined with a short fast threshold inside a 3s fast window. The
+// watchdog must use the fast values during the window and fire well
+// before the steady threshold would have allowed.
+//
+// Regression for the production failure where a freshly-reconnected
+// session sat wedged for nearly a minute before the steady 60s
+// dataActivityStuckThreshold finally tripped — the post-reconnect
+// failure mode is empirically more likely than steady-state, so we
+// want the watchdog to react in seconds, not minutes.
+func TestDataActivityWatchFastPhaseFiresBeforeSteady(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var staticKey [tlscrypt.StaticKeyLen]byte
+	rand.Read(staticKey[:])
+	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
+	cert, pool := genSelfSignedCert(t)
+	cTr, sTr := transport.MemoryPair()
+
+	ks := newKeepaliveServer()
+	ks.pingInterval = 1
+	ks.pingRestart = 60
+	ks.echoData = false
+
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- ks.run(ctx, sTr, serverWrap, cert, 21, "AES-256-GCM", t) }()
+
+	sess, err := session.DialWithTransport(ctx, session.Config{
+		Network:    "memory",
+		RemoteAddr: "memB",
+		TLSConfig: &tls.Config{
+			ServerName: "localhost", RootCAs: pool, MinVersion: tls.VersionTLS13,
+		},
+		TLSCryptV1: staticKey[:],
+		Ciphers:    []string{"AES-256-GCM"},
+		// Steady values are far too long to fire within the test window —
+		// if the fast phase didn't kick in, this test would have to wait
+		// 10s for RestartError, exceeding the 2s budget below.
+		DataActivityWarmup:         10 * time.Second,
+		DataActivityStuckThreshold: 10 * time.Second,
+		// Fast phase: 200ms warmup, 400ms threshold, 3s window. Expect
+		// RestartError ~600ms into the session.
+		DataActivityWarmupFast:         200 * time.Millisecond,
+		DataActivityStuckThresholdFast: 400 * time.Millisecond,
+		DataActivityFastWindow:         3 * time.Second,
+	}, cTr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	stopWriting := make(chan struct{})
+	defer close(stopWriting)
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		payload := []byte("test-user-data")
+		for {
+			select {
+			case <-stopWriting:
+				return
+			case <-ticker.C:
+				_, _ = sess.Write(payload)
+			}
+		}
+	}()
+
+	buf := make([]byte, 1500)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := sess.Read(buf)
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		var re *session.RestartError
+		if !errors.As(err, &re) {
+			t.Fatalf("got %T (%v), want *RestartError", err, err)
+		}
+		if re.Reason != "data-activity stuck" {
+			t.Errorf("Reason = %q, want %q", re.Reason, "data-activity stuck")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fast-phase dataActivityWatch did not fire within 2s — adaptive phase not active?")
+	}
+}
+
 // TestHandleDataInDropsWhenIngressFull verifies that handleDataIn no
 // longer blocks the session.readLoop when the ingress channel is full.
 // Before the fix this was a silent deadlock: the consumer (gVisor link

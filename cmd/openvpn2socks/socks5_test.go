@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"log/slog"
@@ -334,6 +335,66 @@ func TestFilterUsableIPs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestServeShutdownReleasesStuckHandler reproduces the production deadlock
+// where Serve's wg.Wait() blocked forever because an in-flight handler was
+// stalled on a Read with no ctx awareness (greet succeeded, readRequest was
+// blocked waiting for client bytes that never came). Without the ctx-watcher
+// inside handle, this test hangs indefinitely; with it, Serve returns
+// promptly after ctx cancellation.
+func TestServeShutdownReleasesStuckHandler(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+
+	srv := &socks5Server{
+		log:      discardLog(),
+		connRate: newConnRateLimiter(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve(ctx, ln) }()
+
+	// Client: connect, finish greet (so the handler clears its 30s deadline
+	// and moves on to readRequest), then go silent. Without the handle
+	// ctx-watcher the server now blocks on conn.Read forever.
+	client, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatalf("write greet: %v", err)
+	}
+	var greetResp [2]byte
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(client, greetResp[:]); err != nil {
+		t.Fatalf("read greet reply: %v", err)
+	}
+	_ = client.SetReadDeadline(time.Time{})
+	if greetResp != [2]byte{0x05, 0x00} {
+		t.Fatalf("unexpected greet reply: %x", greetResp)
+	}
+
+	// Trigger graceful shutdown.
+	cancel()
+
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not return within 3s after ctx cancellation — handle ctx-watcher missing?")
 	}
 }
 

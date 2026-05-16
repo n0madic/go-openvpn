@@ -276,12 +276,58 @@ internal/session         Orchestrator. Goroutines per active session
    intentionally NOT touched by `keepaliveLoop` which goes direct to
    `transport.WritePacket`). When the user is actively sending
    (`sinceOut < threshold`) but no real data has arrived in
-   `DataActivityStuckThreshold` (default 60s), it fires `RestartError`
-   the same way pingRestartWatch does, surfacing through `Read`/`Write`
-   for AutoReconnect. Thresholds are configurable via Config so tests
-   can run with sub-second windows. Don't unify with pingRestartWatch
-   — the two are intentionally independent so we get one of them no
-   matter which signal is fake.
+   `DataActivityStuckThreshold` (steady default 60s), it fires
+   `RestartError` the same way pingRestartWatch does, surfacing through
+   `Read`/`Write` for AutoReconnect.
+   **Adaptive two-phase threshold:** for the first
+   `DataActivityFastWindow` (default 2 minutes) after session-up, the
+   watchdog uses the tighter `DataActivityWarmupFast` (default 10s) /
+   `DataActivityStuckThresholdFast` (default 20s) pair; after the
+   window elapses it relaxes to the steady values. Rationale: a
+   freshly-handshaken session is empirically MUCH more likely to be
+   wedged than a steady-state one — post-reconnect failure modes
+   include server-side state loss for the prior peer-id,
+   source-port-keyed rate limits surviving the reconnect, NAT mapping
+   drift, and gVisor TCP zombies retransmitting on the previous
+   tunnel IP. Spending the full 60s steady threshold confirming each
+   of those (we observed it in a 2026-05-15 prod log: tunnel was wedged
+   ~32s when the user gave up and SIGKILL'd) is the difference between
+   "tunnel jitters for a few seconds" and "tunnel froze for over a
+   minute". The fast values are clamped at runtime to <= steady so
+   tests that set explicit short steady values (e.g. 200ms warmup,
+   500ms threshold) keep their behaviour without being slowed down by
+   the package defaults. The trigger log records `phase=fast/steady`
+   plus the elapsed `age` so an operator can tell which side fired.
+   **L4-aware liveness — `aggregate` alone is not enough.** Aggregate
+   `lastDataInbound` is fed by ANY decrypted non-PING inbound IP
+   packet, regardless of L4 family. The user hit 2026-05-15
+   19:51-19:55: ~4s after a reconnect the server started selectively
+   dropping all TCP responses while UDP DNS replies kept dribbling
+   in once a minute or so. From the aggregate channel's perspective
+   `sinceIn` reset on every DNS reply, the watchdog never crossed
+   the threshold, and the tunnel sat wedged for ~4 minutes until
+   the user reached for Ctrl-C. To detect this `Session` also
+   tracks `lastDataInboundTCP` / `lastDataInboundUDP` /
+   `lastUserOutboundTCP` / `lastUserOutboundUDP`, populated from the
+   `sniffL4` helper in `handleDataIn` and `Session.WriteCtx`. The
+   pure `decideActivityStall` core checks all three pairs and fires
+   on the first match — per-L4 wins over aggregate so the trigger
+   log records the most specific cause (`signal=tcp` /
+   `signal=udp` / `signal=aggregate`). When an L4 inbound has never
+   been observed (e.g. fresh session that's only sent TCP) we use
+   the session `age` as the inbound floor, so a never-replied-to
+   TCP flow eventually trips the watchdog instead of hiding behind
+   the never-touched zero timestamp. The aggregate channel
+   intentionally does NOT use that floor — historically it required
+   both sides to be observed at least once, preserved to keep
+   existing tests stable. `sniffL4` mirrors the parser in
+   `pkg/netstack/endpoint.dispatchInbound`; kept private to session
+   so the watchdog doesn't drag a netstack dependency into the core
+   library.
+   Thresholds are configurable via Config; tests can run with
+   sub-second windows. Don't unify with pingRestartWatch — the two
+   are intentionally independent so we get one of them no matter
+   which signal is fake.
 
 10. **`handleDataIn` must NOT block on `ingressCh`.** The
     decrypt-and-forward path runs inside `session.readLoop`'s single

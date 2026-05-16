@@ -75,15 +75,41 @@ type Config struct {
 	TransitionWindow time.Duration
 	IngressBuffer    int // user-side ingress chan capacity; default 256
 
-	// DataActivityWarmup is the grace period after session-up during
-	// which dataActivityWatch never fires. Default 60s. Set to a very
-	// small value in tests.
+	// DataActivityWarmup is the steady-state grace period after
+	// session-up during which dataActivityWatch never fires. Default
+	// 60s. Set to a very small value in tests.
 	DataActivityWarmup time.Duration
-	// DataActivityStuckThreshold is the max allowed gap between
-	// "user actively sending" and "real (non-PING) inbound data
-	// arriving" before the data-path is considered stuck and a
+	// DataActivityStuckThreshold is the steady-state max allowed gap
+	// between "user actively sending" and "real (non-PING) inbound
+	// data arriving" before the data-path is considered stuck and a
 	// RestartError is fired. Default 60s.
 	DataActivityStuckThreshold time.Duration
+	// DataActivityWarmupFast is the warmup applied during the first
+	// DataActivityFastWindow after session-up. Default 10s — short
+	// enough for the watchdog to start contributing within seconds of
+	// a fresh session, instead of waiting the full steady warmup.
+	// Always clamped at runtime to <= DataActivityWarmup, so tests
+	// that set a smaller steady warmup don't get accidentally
+	// stretched by this default. Set <= 0 to use the package default.
+	DataActivityWarmupFast time.Duration
+	// DataActivityStuckThresholdFast is the stuck-threshold applied
+	// during the first DataActivityFastWindow after session-up.
+	// Default 20s — tight enough to detect a wedged tunnel quickly
+	// after AutoReconnect (when stale server state, server-side rate
+	// limits or zombie gVisor TCP conns make the post-reconnect
+	// wedge more likely than a steady-state wedge), but long enough
+	// to absorb normal application handshake latency on a healthy
+	// fresh session. Always clamped at runtime to <=
+	// DataActivityStuckThreshold so tests with short steady
+	// thresholds are unaffected. Set <= 0 to use the package default.
+	DataActivityStuckThresholdFast time.Duration
+	// DataActivityFastWindow is how long after session-up the fast
+	// values apply. After this elapses the watchdog falls back to
+	// DataActivityWarmup / DataActivityStuckThreshold. Default 2min,
+	// chosen to comfortably cover the empirical "post-reconnect
+	// wedge" window observed in production logs. Set <= 0 to use
+	// the package default.
+	DataActivityFastWindow time.Duration
 
 	// PeerInfoVersion overrides the IV_VER field advertised in peer-info.
 	// Empty defaults to "2.6.0".
@@ -148,6 +174,22 @@ type Session struct {
 	// PINGs which bypass Write). Paired with lastDataInbound to tell
 	// "the user is actively asking for data" apart from "the user is idle".
 	lastUserOutbound atomic.Int64
+
+	// Per-L4 liveness timestamps. The aggregate lastDataInbound /
+	// lastUserOutbound pair above is too coarse for one real failure
+	// mode: when the server (or any middlebox along the path)
+	// selectively drops TCP while UDP still flows, a single DNS
+	// reply or QUIC packet every minute keeps lastDataInbound fresh
+	// — so dataActivityWatch sees "I sent stuff, I'm getting stuff
+	// back" and never fires, even though every TCP socket the user
+	// cares about is wedged. dataActivityWatch checks all three
+	// pairs (aggregate, TCP, UDP) and fires on the first one that
+	// matches the "user sending but no data back" pattern. Updated
+	// from sniffL4 in handleDataIn / WriteCtx; 0 = "never observed".
+	lastDataInboundTCP  atomic.Int64
+	lastDataInboundUDP  atomic.Int64
+	lastUserOutboundTCP atomic.Int64
+	lastUserOutboundUDP atomic.Int64
 
 	// Packet-flow counters (lifetime). Sampled by statsLogger.
 	statsForwarded      atomic.Uint64 // delivered to ingressCh
@@ -535,7 +577,18 @@ func (s *Session) WriteCtx(ctx context.Context, p []byte) (int, error) {
 	// actively sending but nothing coming back" apart from "session idle".
 	// Keepalive PINGs intentionally bypass this — they use
 	// transport.WritePacket directly.
-	s.lastUserOutbound.Store(time.Now().UnixNano())
+	nowNs := time.Now().UnixNano()
+	s.lastUserOutbound.Store(nowNs)
+	// Per-L4: same rationale as the inbound side — without this, a
+	// user pushing both TCP and DNS UDP can't be told apart from a
+	// user pushing only DNS. The L4-aware watchdog needs the
+	// outbound family to know which inbound family to expect.
+	switch sniffL4(p) {
+	case l4ProtoTCP:
+		s.lastUserOutboundTCP.Store(nowNs)
+	case l4ProtoUDP:
+		s.lastUserOutboundUDP.Store(nowNs)
+	}
 	return len(p), nil
 }
 
@@ -889,6 +942,17 @@ func (s *Session) handleDataIn(pkt []byte, kid uint8) {
 	// separately. PINGs alone are not enough to call the data path healthy
 	// (server PINGs can keep flowing even when the data path is dead).
 	s.lastDataInbound.Store(now)
+	// Per-L4 timestamps catch the case the aggregate misses: a steady
+	// trickle of UDP (DNS replies, QUIC keepalives) keeps lastDataInbound
+	// fresh while TCP is completely dead. Updated only for recognised
+	// L4 protocols — unknown / fragmented / IPv6-extension-laden packets
+	// still feed the aggregate but not the L4-specific channels.
+	switch sniffL4(ip) {
+	case l4ProtoTCP:
+		s.lastDataInboundTCP.Store(now)
+	case l4ProtoUDP:
+		s.lastDataInboundUDP.Store(now)
+	}
 	// Fast path: when an ingress handler is installed (typically by
 	// pkg/netstack via openvpn.Client.SetIngressHandler), deliver
 	// synchronously and skip the channel + Tunnel.Read hop. The RLock

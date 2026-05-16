@@ -138,8 +138,25 @@ func (s *socks5Server) Serve(ctx context.Context, ln net.Listener) error {
 }
 
 // handle is one accepted-conn lifetime: greet, auth, dispatch request.
+//
+// A ctx-watcher goroutine closes conn on shutdown so any in-flight Read
+// (greet, readRequest with cleared deadline, or io.Copy(io.Discard, ctrl)
+// inside handleAssociate) unblocks promptly. Without this, a SOCKS5
+// client that connects and stalls — or a long-running UDP ASSOCIATE
+// session — would pin Serve's wg.Wait() forever after ctx cancellation,
+// which in turn would block the deferred cli.Close() in main and leave
+// the process alive until SIGKILL.
 func (s *socks5Server) handle(ctx context.Context, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 	br := bufio.NewReader(conn)
 

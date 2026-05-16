@@ -182,3 +182,177 @@ func TestWakeDetectorWatchFiresOnLongGap(t *testing.T) {
 		t.Fatalf("closedErr = %v, want wake-from-sleep RestartError", err)
 	}
 }
+
+// TestSniffL4 covers the IPv4 / IPv6 paths plus the unknown/short-packet
+// fallbacks. Kept tiny — the parser itself is six lines.
+func TestSniffL4(t *testing.T) {
+	t.Parallel()
+	// Minimal IPv4 header (20 bytes): version=4, IHL=5, length=20, proto at [9].
+	v4tcp := make([]byte, 20)
+	v4tcp[0] = 0x45
+	v4tcp[9] = 6
+	v4udp := make([]byte, 20)
+	v4udp[0] = 0x45
+	v4udp[9] = 17
+	v4icmp := make([]byte, 20)
+	v4icmp[0] = 0x45
+	v4icmp[9] = 1
+	// Minimal IPv6 header (40 bytes): version=6 in top nibble, NextHeader at [6].
+	v6tcp := make([]byte, 40)
+	v6tcp[0] = 0x60
+	v6tcp[6] = 6
+	v6udp := make([]byte, 40)
+	v6udp[0] = 0x60
+	v6udp[6] = 17
+	short := []byte{0x45}
+
+	cases := []struct {
+		name string
+		in   []byte
+		want uint8
+	}{
+		{"v4 tcp", v4tcp, 6},
+		{"v4 udp", v4udp, 17},
+		{"v4 icmp (not bucketed)", v4icmp, 1},
+		{"v6 tcp", v6tcp, 6},
+		{"v6 udp", v6udp, 17},
+		{"empty", nil, 0},
+		{"v4 truncated", short, 0},
+		{"unknown version", []byte{0x70, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sniffL4(tc.in); got != tc.want {
+				t.Fatalf("sniffL4 = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDecideActivityStall is the table-driven core test for the L4-aware
+// watchdog decision logic. Each case lays out the timestamp landscape that
+// dataActivityWatch would see at one tick and asserts the verdict — which
+// (if any) signal fires, and that the matched reason string is the most
+// specific one available (per-L4 wins over aggregate). Covers the exact
+// production failure mode that prompted this rework: TCP dead, UDP
+// trickling DNS responses, aggregate channel deceptively healthy.
+func TestDecideActivityStall(t *testing.T) {
+	t.Parallel()
+	const threshold = 20 * time.Second
+	now := time.Unix(1_000_000, 0) // arbitrary fixed reference
+	ns := func(d time.Duration) int64 { return now.Add(-d).UnixNano() }
+
+	cases := []struct {
+		name string
+		// Aggregate
+		lastOut, lastIn time.Duration
+		// L4
+		lastTCPOut, lastTCPIn time.Duration
+		lastUDPOut, lastUDPIn time.Duration
+		// Session age — used as inbound floor when an L4 inbound has
+		// never been observed (lastIn == 0).
+		age time.Duration
+		// Pass -1 in any "last*" field to encode "never observed (0)".
+		// We translate -1 → 0 before calling decideActivityStall.
+		wantReason string
+	}{
+		{
+			name:       "healthy: aggregate fresh, no L4 signals",
+			lastOut:    1 * time.Second,
+			lastIn:     1 * time.Second,
+			lastTCPOut: -1, lastTCPIn: -1,
+			lastUDPOut: -1, lastUDPIn: -1,
+			age:        30 * time.Second,
+			wantReason: "",
+		},
+		{
+			name:       "idle: nobody sent anything recently",
+			lastOut:    60 * time.Second,
+			lastIn:     60 * time.Second,
+			lastTCPOut: -1, lastTCPIn: -1,
+			lastUDPOut: -1, lastUDPIn: -1,
+			age:        90 * time.Second,
+			wantReason: "",
+		},
+		{
+			// The 2026-05-15 failure mode: server selectively
+			// drops TCP, occasional UDP reply keeps aggregate
+			// fresh — without L4 awareness this would never
+			// fire.
+			name:       "tcp dead, udp alive masks aggregate",
+			lastOut:    1 * time.Second,
+			lastIn:     2 * time.Second,
+			lastTCPOut: 1 * time.Second, lastTCPIn: 30 * time.Second,
+			lastUDPOut: 5 * time.Second, lastUDPIn: 2 * time.Second,
+			age:        90 * time.Second,
+			wantReason: "tcp",
+		},
+		{
+			name:       "udp dead, tcp alive",
+			lastOut:    1 * time.Second,
+			lastIn:     2 * time.Second,
+			lastTCPOut: 1 * time.Second, lastTCPIn: 2 * time.Second,
+			lastUDPOut: 1 * time.Second, lastUDPIn: 30 * time.Second,
+			age:        90 * time.Second,
+			wantReason: "udp",
+		},
+		{
+			name:       "aggregate-only stall (no L4 timestamps yet)",
+			lastOut:    1 * time.Second,
+			lastIn:     30 * time.Second,
+			lastTCPOut: -1, lastTCPIn: -1,
+			lastUDPOut: -1, lastUDPIn: -1,
+			age:        90 * time.Second,
+			wantReason: "aggregate",
+		},
+		{
+			// Session is sending TCP but has never received any TCP
+			// at all. Age past threshold ⇒ definitely stuck.
+			name:       "tcp never received and age past threshold",
+			lastOut:    -1, lastIn: -1,
+			lastTCPOut: 1 * time.Second, lastTCPIn: -1,
+			lastUDPOut: -1, lastUDPIn: -1,
+			age:        90 * time.Second,
+			wantReason: "tcp",
+		},
+		{
+			// Same as above but session is still young — sinceIn
+			// (= age) hasn't reached the threshold yet, so we wait.
+			name:       "tcp never received but still within threshold age",
+			lastOut:    -1, lastIn: -1,
+			lastTCPOut: 1 * time.Second, lastTCPIn: -1,
+			lastUDPOut: -1, lastUDPIn: -1,
+			age:        5 * time.Second,
+			wantReason: "",
+		},
+		{
+			// Outbound is stale: user stopped sending. Even if
+			// inbound is silent we don't fire — they're idle.
+			name:       "user idle on tcp, inbound stale",
+			lastOut:    -1, lastIn: -1,
+			lastTCPOut: 60 * time.Second, lastTCPIn: 60 * time.Second,
+			lastUDPOut: -1, lastUDPIn: -1,
+			age:        120 * time.Second,
+			wantReason: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			encode := func(d time.Duration) int64 {
+				if d < 0 {
+					return 0
+				}
+				return ns(d)
+			}
+			got := decideActivityStall(now, tc.age, threshold,
+				encode(tc.lastOut), encode(tc.lastIn),
+				encode(tc.lastTCPOut), encode(tc.lastTCPIn),
+				encode(tc.lastUDPOut), encode(tc.lastUDPIn),
+			)
+			if got.reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q (sinceOut=%v sinceIn=%v)",
+					got.reason, tc.wantReason, got.sinceOut, got.sinceIn)
+			}
+		})
+	}
+}
