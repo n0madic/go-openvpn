@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"sync"
@@ -116,7 +117,9 @@ func (r *resolver) Stats() (hits, misses uint64) {
 }
 
 // dnsCacheHitRate returns the percentage of lookups served from cache
-// in the supplied window. Returns 0 when the window is empty so the
+// in the supplied window, rounded to two decimal places so the log
+// line stays readable (otherwise float64 prints noise like
+// "25.925925925925927"). Returns 0 when the window is empty so the
 // log line doesn't carry a misleading 100% for an idle interval.
 // Pulled out as a pure function for direct unit testing.
 func dnsCacheHitRate(hits, misses uint64) float64 {
@@ -124,7 +127,8 @@ func dnsCacheHitRate(hits, misses uint64) float64 {
 	if total == 0 {
 		return 0
 	}
-	return 100 * float64(hits) / float64(total)
+	pct := 100 * float64(hits) / float64(total)
+	return math.Round(pct*100) / 100
 }
 
 // startStatsLogger spawns a goroutine that logs DNS cache statistics

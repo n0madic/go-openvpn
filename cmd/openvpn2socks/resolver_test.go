@@ -350,6 +350,14 @@ func TestDNSCacheHitRate(t *testing.T) {
 		{"all misses", 0, 10, 0},
 		{"half and half", 5, 5, 50},
 		{"three quarter", 30, 10, 75},
+		// Rounding to two decimals: 7/27 = 25.9259...% → 25.93%.
+		// Catches a regression where the helper would log float64
+		// noise like "25.925925925925927".
+		{"two-decimal rounding 7/27", 7, 20, 25.93},
+		// 1/3 → 33.3333...% → 33.33% (rounds DOWN).
+		{"two-decimal rounding 1/3", 1, 2, 33.33},
+		// 2/3 → 66.6666...% → 66.67% (rounds UP).
+		{"two-decimal rounding 2/3", 2, 1, 66.67},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
