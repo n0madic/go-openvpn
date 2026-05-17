@@ -907,6 +907,14 @@ func parseRestart(msg string) *RestartError {
 	return re
 }
 
+// shutdownWaitTimeout bounds workers.Wait so a single stuck goroutine
+// (typical culprits: controlChannelReader parked in tls.Conn.Read after
+// a half-dead UDP socket on macOS post-suspend; transport.ReadPacket
+// blocked on a kernel socket that didn't return on Close) cannot pin
+// the whole process. After the timeout we log who's still active and
+// proceed — main eventually exit()s and the kernel reaps everything.
+const shutdownWaitTimeout = 2 * time.Second
+
 func (s *Session) shutdown() {
 	s.workers.Shutdown()
 	// Close all layers (cascades into their write/tick goroutines via
@@ -916,10 +924,39 @@ func (s *Session) shutdown() {
 			_ = l.Close()
 		}
 	}
+	// Close the active TLS conn explicitly so controlChannelReader's
+	// blocking tls.Conn.Read unblocks. The layer close above drops the
+	// reliable adapter underneath it, but TLS may still be parked
+	// inside its own internal state machine waiting for bytes — closing
+	// the conn directly is the documented way to break that.
+	s.tlsMu.Lock()
+	tc := s.tlsConn
+	s.tlsConn = nil
+	s.tlsMu.Unlock()
+	if tc != nil {
+		_ = tc.Close()
+	}
 	if s.transport != nil {
 		_ = s.transport.Close()
 	}
-	s.workers.Wait()
+	// Bounded wait. If a worker is wedged in a syscall that doesn't honour
+	// context cancellation (common after a host suspend that left a
+	// kernel socket in an undefined state), we surrender after the
+	// timeout rather than hang the process. The remaining goroutines
+	// will be reaped by os.Exit in main.
+	done := make(chan struct{})
+	go func() {
+		s.workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownWaitTimeout):
+		s.log.Warn("shutdown: workers.Wait timed out; leaking workers to allow process exit",
+			"active", s.workers.Active(),
+			"timeout", shutdownWaitTimeout,
+		)
+	}
 }
 
 // readLoop demuxes inbound packets by opcode + key-id.

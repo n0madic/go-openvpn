@@ -116,9 +116,18 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 	cfg.HandshakeTimeout = opts.handshakeT
 	cfg.AutoReconnect = true
 
-	// Two-signal force-exit: the user must always be able to kill the
-	// process by pressing Ctrl-C twice, even if graceful shutdown stalls
-	// on stuck I/O (gVisor endpoint, kernel socket, deadlocked goroutine).
+	// Shutdown policy:
+	//   - First signal: cancel rootCtx so graceful shutdown begins.
+	//   - Second signal OR forceExitGrace elapsed: os.Exit(130).
+	//
+	// The deadline path matters because graceful shutdown traverses
+	// cli.Close → session.shutdown → workers.Wait, and any one stuck
+	// goroutine (TLS Read on a half-dead UDP socket post-suspend, a
+	// kernel close that never returns) could otherwise leave the
+	// process alive until the user reaches for a second Ctrl-C.
+	// session.shutdown carries its own internal bounded Wait, but this
+	// deadline backstops every other layer too (netstack close, dial in
+	// flight, etc.).
 	//
 	// Own one signal channel from the very start so there is no window
 	// between "first signal cancelled the ctx" and "second-signal handler
@@ -129,6 +138,7 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 	sigCh := make(chan os.Signal, 4)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
+	const forceExitGrace = 5 * time.Second
 	go func() {
 		select {
 		case <-sigCh:
@@ -136,8 +146,13 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 		case <-rootCtx.Done():
 			return
 		}
-		<-sigCh
-		logger.Warn("second signal received during shutdown; force-exiting")
+		select {
+		case <-sigCh:
+			logger.Warn("second signal received during shutdown; force-exiting")
+		case <-time.After(forceExitGrace):
+			logger.Warn("graceful shutdown grace period elapsed; force-exiting",
+				"grace", forceExitGrace)
+		}
 		os.Exit(130)
 	}()
 
