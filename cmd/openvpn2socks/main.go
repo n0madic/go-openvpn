@@ -220,6 +220,18 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 	srv := newSOCKS5(ns, r, opts.listen, opts.socksAuth, opts.idle, logger)
 	logger.Info("SOCKS5 listening", "addr", opts.listen)
 
+	// Reset the per-host CONNECT burst limiter after every reconnect.
+	// Reconnect immediately closes every active conn via the netstack
+	// hook; clients respond by retrying en masse to the same target IPs
+	// (browser tab fan-out to e.g. Telegram CDN). Without resetting we
+	// would refuse those legitimate retries with REP=0x05 in the first
+	// second after reconnect even though the new tunnel is healthy.
+	// The detach is unused because the limiter shares the Client's
+	// lifetime — the process exits when the Client does.
+	_ = cli.OnReconnect(func(openvpn.PushReply) {
+		srv.connRate.Reset()
+	})
+
 	return srv.ListenAndServe(rootCtx)
 }
 

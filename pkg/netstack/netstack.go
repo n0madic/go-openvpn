@@ -655,13 +655,17 @@ func New(cli *openvpn.Client) (*Net, error) {
 		if n.closed {
 			return
 		}
-		// Snapshot the pre-reconnect local addresses so we can decide
-		// whether existing conns are still valid (same tunnel IP) or
-		// have become zombies (new tunnel IP). The server hands us
-		// back the same IP often enough — observed in production when
-		// the edge keeps session state cached — that doing a blind
-		// force-close on every reconnect would needlessly disrupt
-		// app conns that would otherwise have kept working.
+		// Snapshot the pre-reconnect local addresses purely for log
+		// context — we used to skip closing conns when the tunnel IP
+		// stayed the same, but empirically that policy left zombie
+		// TCP endpoints behind: ProtonVPN often hands us back the
+		// same local IP (10.96.0.19 → 10.96.0.19) while the
+		// server-side OpenVPN session is brand new (different
+		// peer_id). The previous session's connection state is
+		// gone, so even with the same 4-tuple the server doesn't
+		// route packets for our old conns — gVisor TCP retransmits
+		// 60-120s before giving up and apps stall. Always force-
+		// close after reconnect.
 		n.nicMu.Lock()
 		oldV4, oldV6 := n.localV4, n.localV6
 		n.nicMu.Unlock()
@@ -677,32 +681,18 @@ func New(cli *openvpn.Client) (*Net, error) {
 		newV4, newV6 := n.localV4, n.localV6
 		n.nicMu.Unlock()
 
-		ipChanged := oldV4 != newV4 || oldV6 != newV6
-		if !ipChanged {
-			// Same tunnel IP across reconnect → existing gVisor TCP
-			// 4-tuples remain valid (server's NAT/conntrack routes
-			// by IP, not by OpenVPN peer-id), so active conns are
-			// NOT zombies and we leave them alone. Apps see a brief
-			// blip during the protocol handshake, then traffic
-			// resumes on the same conns.
-			if n.log != nil {
-				n.log.Info("netstack: reconnect kept same tunnel IP, leaving active conns intact",
-					"local_v4", newV4, "local_v6", newV6)
-			}
-			return
-		}
-		// Tunnel IP changed → existing conns are bound to the OLD
-		// local IP, their packets now carry an IP the server no
-		// longer routes for our session. Force-close them so apps
-		// see ECONNRESET immediately and retry on the new local IP,
-		// instead of waiting 60-120s for gVisor's TCP retransmit to
-		// give up. Architectural equivalent of the OS kernel's
-		// RTM_CHANGE on utun when the interface address changes.
-		if closed := n.closeActiveOnReconnect(); closed > 0 && n.log != nil {
-			n.log.Info("netstack: force-closed conns bound to old tunnel IP after reconnect",
+		// Force-close every tracked conn unconditionally. Architectural
+		// equivalent of the OS kernel's RTM_CHANGE on utun: apps see
+		// ECONNRESET immediately and retry on a fresh endpoint, which
+		// binds to whatever the current local IP is and registers
+		// with the new server session.
+		closed := n.closeActiveOnReconnect()
+		if closed > 0 && n.log != nil {
+			n.log.Info("netstack: force-closed conns after reconnect",
 				"count", closed,
 				"old_v4", oldV4, "new_v4", newV4,
 				"old_v6", oldV6, "new_v6", newV6,
+				"ip_changed", oldV4 != newV4 || oldV6 != newV6,
 			)
 		}
 	})

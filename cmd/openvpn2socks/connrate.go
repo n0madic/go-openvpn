@@ -120,3 +120,17 @@ func (l *connRateLimiter) gcLocked(now time.Time) {
 		}
 	}
 }
+
+// Reset drops every bucket. Called from the AutoReconnect hook so a
+// client that legitimately needs to re-open many conns to the same
+// destination immediately after reconnect (browser tab fan-out after
+// every old conn turned zombie) is not refused by stale bucket state.
+// Without this the visible symptom is a flood of REP=0x05 replies in
+// the first second after reconnect, even though the new tunnel is
+// otherwise healthy.
+func (l *connRateLimiter) Reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.buckets = make(map[netip.Addr]*rateBucket)
+	l.lastGC = time.Now()
+}

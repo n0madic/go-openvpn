@@ -460,25 +460,40 @@ kernel sockets with `ECONNRESET` the moment the interface address
 changes), `Net` tracks every `net.Conn` it hands out via
 `DialContext` in an `activeConns sync.Map` (wrapped in a
 `trackedConn` that deregisters on `Close`). The OnReconnect hook
-snapshots the pre-reconnect `(localV4, localV6)`, calls
-`applyPushReply` to install the new addresses, then compares:
+calls `applyPushReply` to install the new addresses, then
+**unconditionally** force-closes every tracked conn via
+`closeActiveOnReconnect` — apps see an immediate error on the next
+Read/Write, retry, and the retry's new gVisor endpoint binds to
+whatever the current local IP is and registers with the new server
+session. Pre-/post-reconnect IPs are logged for diagnostics but no
+longer drive a policy decision.
 
-  - **IP changed** → call `closeActiveOnReconnect` to force-close
-    every tracked conn; apps see an immediate error on the next
-    Read/Write, retry, and the retry's new gVisor endpoint binds
-    to the fresh local IP.
-  - **IP unchanged** → leave active conns alone. Same tunnel IP
-    across reconnect means existing 4-tuples are still valid
-    (server's NAT/conntrack routes by IP, not by OpenVPN peer-id),
-    so a blind force-close would needlessly disrupt conns that
-    would otherwise have kept working. Logged at Info as
-    "reconnect kept same tunnel IP, leaving active conns intact".
-
-ProtonVPN was observed handing back the same IP often enough to
-make this check worthwhile. The `trackedConn` wrapper explicitly
-forwards `CloseWrite()` and `CloseRead()` so the type assertion in
+**Why unconditional, not just "IP changed":** an earlier version
+preserved active conns when the tunnel IP stayed the same, on the
+theory that existing 4-tuples remained valid (server's NAT routes
+by IP, not by OpenVPN peer-id). Field evidence killed that theory:
+ProtonVPN routinely hands back the same local IP across reconnects
+while the server-side OpenVPN session is brand new (different
+peer_id), and the previous session's connection state is gone. Even
+with the same 4-tuple the server doesn't route packets for our old
+conns — gVisor TCP retransmits 60-120s before giving up, apps stall,
+and `dataActivityWatch` ends up firing a *second* reconnect a few
+seconds later. The visible symptom in the log was a healthy-looking
+"reconnect successful" followed by `tcp_current_established>0` with
+zero TCP delta_in for a full minute, then another reconnect.
+Force-closing everything restores app-level liveness in under a
+second. The `trackedConn` wrapper explicitly forwards `CloseWrite()`
+and `CloseRead()` so the type assertion in
 `socks5_tcp.go::proxy` (`interface{ CloseWrite() error }`) still
 matches for TCP-backed conns; for UDP the methods are no-op safe.
+
+**openvpn2socks-level companion fix:** `connRateLimiter.Reset()` is
+invoked from a second `cli.OnReconnect` hook installed in `main.go`.
+Without it, the per-host CONNECT burst limiter would refuse the
+flood of legitimate retries that follow the netstack-level
+force-close (browser tab fan-out reopening dozens of conns to the
+same target IP in <1s) with `repConnRefused` for the first window,
+even though the new tunnel is otherwise healthy.
 
 **Data-path observability:** the LinkEndpoint exposes atomic
 counters for every IP packet it sees in each direction, bucketed

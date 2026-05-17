@@ -27,6 +27,31 @@ func TestConnRateLimiterBurst(t *testing.T) {
 	}
 }
 
+// TestConnRateLimiterResetClearsAllBuckets covers the AutoReconnect
+// path: after Reset every previously-drained bucket starts at full
+// capacity again so the post-reconnect burst from a browser
+// reopening dozens of conns to the same target is not refused.
+func TestConnRateLimiterResetClearsAllBuckets(t *testing.T) {
+	t.Parallel()
+	l := newConnRateLimiter()
+	tgt1 := netip.MustParseAddr("1.2.3.4")
+	tgt2 := netip.MustParseAddr("5.6.7.8")
+	for range connRateBurst {
+		_ = l.allow(tgt1)
+		_ = l.allow(tgt2)
+	}
+	if l.allow(tgt1) || l.allow(tgt2) {
+		t.Fatalf("buckets should be drained before Reset")
+	}
+	l.Reset()
+	if !l.allow(tgt1) {
+		t.Fatalf("after Reset, tgt1 should be allowed at full capacity")
+	}
+	if !l.allow(tgt2) {
+		t.Fatalf("after Reset, tgt2 should be allowed at full capacity")
+	}
+}
+
 // TestConnRateLimiterRefillRecovers waits long enough for the bucket
 // to refill some tokens and confirms allow() starts returning true
 // again. The slept duration is generous to keep the test stable on
