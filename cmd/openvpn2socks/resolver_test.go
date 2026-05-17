@@ -336,6 +336,81 @@ func TestParseDNSAnswersServfail(t *testing.T) {
 	}
 }
 
+// TestDNSCacheHitRate covers the pure rate formula including the
+// empty-window guard (would otherwise be a 0/0 NaN that hits the log).
+func TestDNSCacheHitRate(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name         string
+		hits, misses uint64
+		want         float64
+	}{
+		{"empty window returns 0 not NaN", 0, 0, 0},
+		{"all hits", 10, 0, 100},
+		{"all misses", 0, 10, 0},
+		{"half and half", 5, 5, 50},
+		{"three quarter", 30, 10, 75},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := dnsCacheHitRate(tc.hits, tc.misses); got != tc.want {
+				t.Errorf("dnsCacheHitRate(%d,%d)=%v, want %v",
+					tc.hits, tc.misses, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolverStats checks that hit/miss counters move in lock-step
+// with cache lookups — the contract Stats exposes to operators via
+// the periodic stats logger.
+func TestResolverStats(t *testing.T) {
+	t.Parallel()
+	r := newTestResolver(t)
+	want := []netip.Addr{mustAddr(t, "1.2.3.4")}
+	r.cacheSet("example.com", want)
+
+	if _, _ = r.cacheGet("example.com"); true {
+	}
+	if _, _ = r.cacheGet("example.com"); true {
+	}
+	if _, _ = r.cacheGet("nope"); true {
+	}
+
+	hits, misses := r.Stats()
+	// cacheGet does not bump the counters itself — LookupIP does.
+	// So at this point both should still be zero.
+	if hits != 0 || misses != 0 {
+		t.Fatalf("raw cacheGet should not move resolver.Stats; hits=%d misses=%d", hits, misses)
+	}
+
+	// Drive Stats via the LookupIP path: first lookup is a miss
+	// (cache wasn't populated for "miss-host"), then the override
+	// path fails, no records — but the cacheMiss counter increments.
+	r.queryOverTunnelFn = func(_ context.Context, _ netip.AddrPort, _ string) ([]netip.Addr, error) {
+		return nil, errors.New("simulated transport failure")
+	}
+	r.systemLookupFn = func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		return nil, errors.New("no system lookup in test")
+	}
+	_, _ = r.LookupIP(t.Context(), "miss-host.example.")
+	if h, m := r.Stats(); m == 0 {
+		t.Fatalf("expected miss after first LookupIP, got hits=%d misses=%d", h, m)
+	}
+
+	// Now populate the cache directly and confirm the next lookup
+	// counts as a hit.
+	r.cacheSet("hit-host.example.", want)
+	if _, err := r.LookupIP(t.Context(), "hit-host.example."); err != nil {
+		t.Fatalf("LookupIP returned err=%v on cached host", err)
+	}
+	hits, misses = r.Stats()
+	if hits != 1 {
+		t.Fatalf("expected hits=1 after cached lookup, got %d (misses=%d)", hits, misses)
+	}
+}
+
 // errorsIsAuthoritativeNoData is a tiny helper to avoid importing
 // "errors" purely for one call site in each test.
 func errorsIsAuthoritativeNoData(err error) bool {

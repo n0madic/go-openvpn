@@ -204,6 +204,7 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 		}
 	}
 	r := newResolver(ns, pr.DNS, override, logger)
+	r.startStatsLogger(rootCtx)
 
 	// Warn loudly when the SOCKS5 listener is bound to a non-loopback
 	// interface without SOCKS5 authentication: anyone on the LAN can

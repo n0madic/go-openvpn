@@ -79,8 +79,9 @@ type resolver struct {
 	cacheMu sync.Mutex
 	cache   map[string]dnsCacheEntry
 
-	// Diagnostic counters; sampled by no one yet but cheap to maintain
-	// and useful for testing.
+	// Diagnostic counters surfaced by Stats / startStatsLogger so the
+	// operator can see whether the DNS cache is doing useful work or
+	// every lookup is paying the tunneled-query cost.
 	statsCacheHit  atomic.Uint64
 	statsCacheMiss atomic.Uint64
 
@@ -101,6 +102,73 @@ type resolver struct {
 // systemWarnThrottle is the minimum gap between two consecutive "falling
 // back to system resolver" warnings.
 const systemWarnThrottle = 60 * time.Second
+
+// dnsStatsLogPeriod is how often startStatsLogger emits a snapshot.
+// Matched to the netstack stats logger period so the two interleave
+// on the same cadence — easier to read in a live tail.
+const dnsStatsLogPeriod = 30 * time.Second
+
+// Stats returns lifetime cumulative cache-hit and cache-miss counters.
+// Snapshot is consistent per field but the two are read independently;
+// the slight observation skew is acceptable for an observability counter.
+func (r *resolver) Stats() (hits, misses uint64) {
+	return r.statsCacheHit.Load(), r.statsCacheMiss.Load()
+}
+
+// dnsCacheHitRate returns the percentage of lookups served from cache
+// in the supplied window. Returns 0 when the window is empty so the
+// log line doesn't carry a misleading 100% for an idle interval.
+// Pulled out as a pure function for direct unit testing.
+func dnsCacheHitRate(hits, misses uint64) float64 {
+	total := hits + misses
+	if total == 0 {
+		return 0
+	}
+	return 100 * float64(hits) / float64(total)
+}
+
+// startStatsLogger spawns a goroutine that logs DNS cache statistics
+// every dnsStatsLogPeriod, both as deltas (the actionable form for
+// the current window — "is the cache helping THIS window") and as
+// lifetime totals (sanity check for long-running daemons). Exits on
+// ctx.Done().
+//
+// Logged at Debug. Cache hit/miss ratios don't escalate to Warn on
+// their own — a 0% hit rate during a window of one cold lookup is
+// expected, not alarming. Use the netstack stats log line for "is
+// data flowing at all" and this one for "are repeat lookups fast".
+func (r *resolver) startStatsLogger(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(dnsStatsLogPeriod)
+		defer ticker.Stop()
+		var prevHits, prevMisses uint64
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			hits, misses := r.Stats()
+			dHits := hits - prevHits
+			dMisses := misses - prevMisses
+			prevHits, prevMisses = hits, misses
+			// Skip emitting an all-zero line on a quiet tunnel —
+			// nothing to say and the log gets noisier than the
+			// signal warrants.
+			if dHits == 0 && dMisses == 0 && hits == 0 && misses == 0 {
+				continue
+			}
+			r.log.Debug("dns cache stats",
+				"hits_total", hits,
+				"misses_total", misses,
+				"delta_hits", dHits,
+				"delta_misses", dMisses,
+				"hit_rate_pct", dnsCacheHitRate(dHits, dMisses),
+				"hit_rate_pct_lifetime", dnsCacheHitRate(hits, misses),
+			)
+		}
+	}()
+}
 
 func newResolver(ns *netstack.Net, pushed []netip.Addr, override netip.AddrPort, log *slog.Logger) *resolver {
 	return &resolver{
