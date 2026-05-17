@@ -320,21 +320,29 @@ The OpenVPN client is dialed with `Config.AutoReconnect=true`, so:
   *that query only*; the next lookup tries the tunnel again. A
   throttled warning announces the leak.
 - The SOCKS5 listener stays bound across reconnects.
-- In-flight TCP/UDP proxied connections are handled adaptively:
-  - **Same tunnel IP after reconnect** (the server reuses cached
-    session state — common with load balancers): existing gVisor
-    endpoints stay valid because their source address is still
-    correct. They keep working through the brief gap with no caller
-    visible breakage beyond the round-trip delay of the reconnect
-    itself.
-  - **New tunnel IP after reconnect**: the in-flight endpoints are
-    bound to a now-invalid source IP and would generate packets the
-    server silently drops, so they are force-closed. Caller-side
-    SOCKS5 connections receive a closed socket, same semantics as
-    any transient TCP error — most apps retry.
+- In-flight TCP/UDP proxied connections are force-closed
+  unconditionally on every reconnect (the server's view of our
+  prior session state is gone even when the tunnel IP looks
+  unchanged, so old gVisor endpoints would silently black-hole).
+  Caller-side SOCKS5 connections see a closed socket, the same
+  semantics as any transient TCP error — most apps retry, and the
+  retry binds to whatever the current tunnel IP is.
 
-  Either way the SOCKS5 listener stays bound and accepts new
-  connections immediately on the new session.
+  The SOCKS5 listener stays bound and accepts new connections
+  immediately on the new session.
+
+**Surrender on a stuck tunnel.** When the server-side path is
+broken in a way that survives reconnect (a source-port-keyed
+rate-limit, an edge blackhole — handshakes succeed but no real
+inbound data ever arrives), AutoReconnect would otherwise spin
+forever. The daemon defaults `Config.MaxConsecutiveStalls=3`: after
+three consecutive AutoReconnect cycles where the freshly-installed
+session died within `Config.StableSessionThreshold` (default 60s)
+from a "data-activity stuck" `RestartError`, the daemon exits with
+code 1. A process supervisor (launchd, systemd, or a shell `until
+openvpn2socks ...; do sleep 1; done` loop) should restart it — a
+fresh process gets a new kernel UDP socket and a new ephemeral
+source port, which typically clears the rate-limit.
 
 There is no manual reconnect command; you can SIGHUP-restart the process
 if you want a fresh session.

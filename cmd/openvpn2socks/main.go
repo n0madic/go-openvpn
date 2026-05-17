@@ -115,6 +115,15 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 	cfg.Logger = logger
 	cfg.HandshakeTimeout = opts.handshakeT
 	cfg.AutoReconnect = true
+	// Surrender after 3 consecutive short-lived "data-activity stuck"
+	// reconnects. The signature reliably indicates a server-side
+	// blackhole / source-port-keyed rate-limit that survives a fresh
+	// OpenVPN handshake — only a full process relaunch (new kernel UDP
+	// socket → new ephemeral source port) breaks it. We cancel rootCtx
+	// on cli.Unrecoverable() below so the daemon exits with code 1 and
+	// a process-supervisor (launchd / systemd / a shell wrapper) can
+	// relaunch us.
+	cfg.MaxConsecutiveStalls = 3
 
 	// Shutdown policy:
 	//   - First signal: cancel rootCtx so graceful shutdown begins.
@@ -232,7 +241,32 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 		srv.connRate.Reset()
 	})
 
-	return srv.ListenAndServe(rootCtx)
+	// AutoReconnect-surrender watcher: when the library decides further
+	// reconnects are pointless (see cfg.MaxConsecutiveStalls), tear the
+	// process down so a supervisor can relaunch us with a fresh kernel
+	// UDP socket. Cancelling rootCtx makes srv.ListenAndServe return,
+	// the deferred cli.Close / ns.Close fire, and run() returns
+	// ErrReconnectGaveUp to main which exits with code 1.
+	go func() {
+		select {
+		case <-cli.Unrecoverable():
+			logger.Error("AutoReconnect surrendered; shutting down for supervisor relaunch")
+			cancel()
+		case <-rootCtx.Done():
+		}
+	}()
+
+	err = srv.ListenAndServe(rootCtx)
+	// When the surrender path fired, rootCtx is cancelled and
+	// ListenAndServe returns context.Canceled. Promote that to
+	// ErrReconnectGaveUp so main exits non-zero and the supervisor sees
+	// a clear cause in the exit message.
+	select {
+	case <-cli.Unrecoverable():
+		return openvpn.ErrReconnectGaveUp
+	default:
+	}
+	return err
 }
 
 // isLoopbackListen reports whether the SOCKS5 listen address binds only to

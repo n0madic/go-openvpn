@@ -145,6 +145,32 @@ type Config struct {
 	// reconnect attempts. Default 60s.
 	ReconnectMaxInterval time.Duration
 
+	// MaxConsecutiveStalls is the number of consecutive AutoReconnect
+	// cycles where the freshly-installed session died from a
+	// "data-activity stuck" RestartError within StableSessionThreshold of
+	// session-up, after which the library surrenders with
+	// ErrReconnectGaveUp instead of dialling another doomed session. Zero
+	// disables the surrender path (unbounded reconnect, the historical
+	// behaviour). Default 0.
+	//
+	// The signature this guards against is a server-side blackhole or
+	// source-port-keyed rate limit (e.g. ProtonVPN edge giving up on us)
+	// that survives a fresh OpenVPN handshake: each new session reports
+	// "session up" but no real inbound data ever arrives, the
+	// dataActivityWatch fast-phase tripwire fires within ~20s, and the
+	// process otherwise spins forever. A process-supervisor that
+	// observes ErrReconnectGaveUp can then relaunch the process — which
+	// gets a new ephemeral UDP source port and typically clears the
+	// rate-limit.
+	MaxConsecutiveStalls int
+	// StableSessionThreshold is the minimum lifetime a session must
+	// reach before it counts as "healthy enough" to reset the
+	// consecutive-stall counter. A session that dies before this
+	// threshold with reason "data-activity stuck" increments the
+	// counter. Zero applies the default of 60s. Only consulted when
+	// MaxConsecutiveStalls > 0.
+	StableSessionThreshold time.Duration
+
 	// PeerInfoVersion overrides the IV_VER value sent in the peer-info
 	// payload of KEY_METHOD 2. Empty defaults to "2.6.0". Use this to
 	// mimic specific OpenVPN versions when the server enforces a minimum.
@@ -247,6 +273,40 @@ type Client struct {
 	// session's counters are added on top whenever Stats is called.
 	statsMu  sync.Mutex
 	cumStats Stats
+
+	// sessionUp is the wall-clock-only timestamp (monotonic component
+	// stripped via .Round(0)) of the most recent successful
+	// handshake — initial Dial or each successful reconnect. Used by
+	// decideStallSurrender to tell short-lived (born-broken) sessions
+	// apart from sessions that worked for a while before stalling.
+	// Wall-clock matters here too: AutoReconnect must survive macOS
+	// suspend, and a monotonic-only Since() reads ~0 across a suspend
+	// boundary (see sessionWatcher for the longer rationale).
+	sessionUp atomic.Pointer[time.Time]
+
+	// consecutiveStalls counts how many AutoReconnect cycles in a row
+	// the freshly-installed session died short-lived from a
+	// "data-activity stuck" RestartError. Reset to 0 whenever a
+	// session lives past Config.StableSessionThreshold or dies for any
+	// other reason. Reaching Config.MaxConsecutiveStalls flips gaveUp.
+	consecutiveStalls atomic.Int32
+
+	// gaveUp latches true once decideStallSurrender concluded we should
+	// surrender. Concurrent reconnect callers (Tunnel Read/Write +
+	// sessionWatcher) all serialise through reconnectMu but they each
+	// observe the same failed session; the latch short-circuits the
+	// second caller so it returns ErrReconnectGaveUp without
+	// double-counting the stall.
+	gaveUp atomic.Bool
+
+	// unrecoverable is closed exactly once when AutoReconnect
+	// surrenders (gaveUp transitions false→true). Exposed via
+	// Unrecoverable() so a process-supervisor — typically the CLI's
+	// main — can react by tearing down and letting the supervisor
+	// relaunch with a fresh kernel UDP socket. unrecoverableOnce
+	// guards the close.
+	unrecoverable     chan struct{}
+	unrecoverableOnce sync.Once
 }
 
 // reconnectHook bundles a registered callback with the slice element
@@ -453,8 +513,20 @@ func Dial(ctx context.Context, cfg *Config) (*Client, error) {
 	// SIGINT to also unblock Tunnel I/O should run their own
 	// `go func() { <-ctx.Done(); cli.Close() }()` watcher.
 	cCtx, cancel := context.WithCancel(context.Background())
-	c := &Client{cfg: cfg, log: log, s: s, ctx: cCtx, cancel: cancel}
+	c := &Client{
+		cfg:           cfg,
+		log:           log,
+		s:             s,
+		ctx:           cCtx,
+		cancel:        cancel,
+		unrecoverable: make(chan struct{}),
+	}
 	c.tun = &tunnel{c: c}
+	// Mark the initial session-up time so decideStallSurrender can
+	// measure subsequent session lifetimes from the handshake itself,
+	// not from sessionWatcher's first tick.
+	now := time.Now().Round(0)
+	c.sessionUp.Store(&now)
 	// When AutoReconnect is on, spawn a background watcher that drives
 	// reconnect from session-internal triggers (wakeDetectorWatch,
 	// pingRestartWatch, hardResetWatch, dataActivityWatch). Without it,
@@ -529,6 +601,45 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 	// under c.mu.
 	if cur := c.session(); cur != nil && cur != failed {
 		return nil
+	}
+
+	// Consecutive-stall surrender: when the freshly-installed session
+	// keeps dying short-lived from "data-activity stuck" (the
+	// fast-phase tripwire in session.dataActivityWatch), each fresh
+	// reconnect just gets another doomed peer-id while the underlying
+	// upstream cause (most often a source-port-keyed rate limit at
+	// the VPN edge) survives untouched. A bounded counter latches
+	// gaveUp once Config.MaxConsecutiveStalls is reached so the
+	// library returns ErrReconnectGaveUp instead of spinning forever;
+	// a process-supervisor can then relaunch with a fresh kernel UDP
+	// socket and break the source-port-keyed limit.
+	if c.gaveUp.Load() {
+		return fmt.Errorf("%w: previous surrender latched", ErrReconnectGaveUp)
+	}
+	if c.cfg.MaxConsecutiveStalls > 0 && failed != nil {
+		var lifetime time.Duration
+		if t := c.sessionUp.Load(); t != nil {
+			lifetime = time.Now().Round(0).Sub(*t)
+		}
+		newCounter, surrender := decideStallSurrender(
+			lifetime,
+			failed.CloseErr(),
+			c.consecutiveStalls.Load(),
+			c.cfg.MaxConsecutiveStalls,
+			c.cfg.StableSessionThreshold,
+		)
+		c.consecutiveStalls.Store(newCounter)
+		if surrender {
+			c.gaveUp.Store(true)
+			c.unrecoverableOnce.Do(func() { close(c.unrecoverable) })
+			c.log.Warn("AutoReconnect surrendering: consecutive short-lived activity-stall sessions",
+				"consecutive_stalls", newCounter,
+				"max", c.cfg.MaxConsecutiveStalls,
+				"last_session_lifetime", lifetime,
+			)
+			return fmt.Errorf("%w: %d consecutive short-lived activity-stall sessions",
+				ErrReconnectGaveUp, newCounter)
+		}
 	}
 
 	maxInterval := c.cfg.ReconnectMaxInterval
@@ -630,6 +741,11 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 				s.SetIngressHandler(*hp)
 			}
 			c.mu.Unlock()
+			// Reset the session-up wall clock so the NEXT call to
+			// decideStallSurrender measures the new session's lifetime
+			// from this point, not from the previous handshake.
+			now := time.Now().Round(0)
+			c.sessionUp.Store(&now)
 			c.log.Info("reconnect successful", "attempt", attempt)
 			// Notify subscribers (e.g. pkg/netstack updating the gVisor NIC
 			// to the new tunnel IP). Fire AFTER publishing the new session
@@ -752,6 +868,69 @@ func (c *Client) sessionWatcher() {
 	}
 }
 
+// defaultStableSessionThreshold is the lifetime a session must reach
+// before its existence is counted as "the AutoReconnect worked" — used
+// when Config.StableSessionThreshold is left at zero. Picked to be
+// slightly longer than the dataActivityWatch fast-phase window so a
+// session that died in fast-phase always counts as short-lived.
+const defaultStableSessionThreshold = 60 * time.Second
+
+// stallRestartReason is the RestartError.Reason emitted by
+// session.dataActivityWatch when it gives up on a stuck session. Kept
+// in sync by hand — only this one reason participates in the
+// consecutive-stall surrender path.
+const stallRestartReason = "data-activity stuck"
+
+// decideStallSurrender encodes the consecutive-short-lived-stall policy
+// as a pure function so it can be table-tested without dragging in a
+// live session. Returns the updated counter and whether AutoReconnect
+// should now surrender with ErrReconnectGaveUp.
+//
+// Inputs:
+//
+//	lifetime         how long the failed session lived before close
+//	closeErr         the failed session's CloseErr()
+//	counter          the current consecutive-stall counter
+//	maxStalls        Config.MaxConsecutiveStalls (≤0 disables surrender)
+//	stableThreshold  Config.StableSessionThreshold (≤0 → default)
+//
+// Behaviour:
+//
+//   - maxStalls ≤ 0          → counter forced to 0, never surrender
+//   - closeErr is not a       → counter forced to 0, never surrender
+//     RestartError with
+//     Reason == stallRestartReason
+//   - lifetime ≥ threshold   → counter forced to 0 (session lived
+//     long enough to "prove" the tunnel — treat as a healthy reset)
+//   - otherwise              → counter += 1; surrender iff counter ≥ maxStalls
+func decideStallSurrender(
+	lifetime time.Duration,
+	closeErr error,
+	counter int32,
+	maxStalls int,
+	stableThreshold time.Duration,
+) (newCounter int32, surrender bool) {
+	if maxStalls <= 0 {
+		return 0, false
+	}
+	if stableThreshold <= 0 {
+		stableThreshold = defaultStableSessionThreshold
+	}
+	var re *RestartError
+	isStall := errors.As(closeErr, &re) && re != nil && re.Reason == stallRestartReason
+	if !isStall {
+		return 0, false
+	}
+	if lifetime >= stableThreshold {
+		return 0, false
+	}
+	n := counter + 1
+	if int(n) >= maxStalls {
+		return n, true
+	}
+	return n, false
+}
+
 // backoffDelay computes the exponential backoff for reconnect attempt n
 // (1-indexed). Starts at 1s and doubles each attempt, capped at maxInterval.
 // Conservative cap on the shift (30) prevents overflow on absurd attempt
@@ -775,6 +954,21 @@ func backoffDelay(attempt int, maxInterval time.Duration) time.Duration {
 // replacements: a Read that was blocked when the server sent RESTART will
 // transparently resume on the new session (assuming reconnect succeeds).
 func (c *Client) Tunnel() net.Conn { return c.tun }
+
+// Unrecoverable returns a channel that is closed when the library has
+// surrendered AutoReconnect — currently the only trigger is reaching
+// Config.MaxConsecutiveStalls consecutive short-lived "data-activity
+// stuck" sessions. A process-supervisor wrapping this Client should
+// treat the channel close as "tear down and exit so I can be
+// relaunched": a fresh process gets a new ephemeral kernel UDP source
+// port, which is what typically clears the source-port-keyed
+// rate-limit that AutoReconnect cannot otherwise escape.
+//
+// The channel is never re-opened. Reading after Close is well-defined:
+// the channel is closed iff the Client surrendered before Close was
+// called; otherwise it remains open and Close itself signals via the
+// usual Tunnel.Read/Write paths.
+func (c *Client) Unrecoverable() <-chan struct{} { return c.unrecoverable }
 
 // PushedOptions returns the parsed PUSH_REPLY from the current session.
 // After AutoReconnect, the values reflect the latest session's reply.

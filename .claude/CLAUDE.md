@@ -544,28 +544,37 @@ genuinely useful for diagnosing what's going on. The lesson:
 self-healing layer already exists** — those metrics are inherently
 noisier than the underlying protocol's own keepalive/restart
 mechanisms, and acting on them turns false signals into real
-outages. All three have been observed against a
-real ProtonVPN edge under sustained load; mitigation is taking a fresh
-session. `healthCooldown=60s` mutes the watchdog after each trigger,
-and the snapshot ring is dropped on trigger so the next decision
-window evaluates ONLY the new session's data. Decision logic is split
-into the pure `decideHealthTrigger(dUDPSent, dEpInUDP, dTCPSent,
-dEpInTCP, dTCPRST, window)` so it's unit-tested via table-driven
-cases. **Escalation**: consecutive triggers (no clean window
-between them) increment a counter; at `healthUnrecoverableLimit=2`
-the watchdog calls the `OnUnrecoverable` callback registered via
-`Net.SetOnUnrecoverable` — `cmd/openvpn2socks/main.go` wires this
-to `os.Exit(99)`. Rationale: ProtonVPN sometimes hands us back the
-*same* tunnel IP across `RequestRestart` (we've watched it live,
-`local_ip=10.96.0.34` before and after) and the same broken state
-follows, so AutoReconnect alone isn't enough — only a full process
-relaunch (new kernel UDP socket → new ephemeral source port) breaks
-a source-port-keyed rate limit. Don't merge this watchdog into
-`session.dataActivityWatch` — that one fires on "user is sending
-but no inbound at all"; this one fires on "user is sending UDP/TCP
-but the same family comes back as 0" while *other* traffic
-(keepalives) keeps `lastDataInbound` fresh and would mask the
-failure.
+outages.
+
+**Consecutive-stall surrender (protocol-level, NOT
+application-level).** A different failure mode — server-side
+source-port-keyed rate-limit / blackhole — has been observed
+where every AutoReconnect lands a fresh OpenVPN handshake but
+the new session is born broken: TCP outbound flows, keepalive
+PINGs arrive, but no real inbound data ever does, so
+`session.dataActivityWatch` fast-phase trips at age ~20s, we
+reconnect, get another doomed peer-id, trip again, and the
+process spins forever. The fix lives in `openvpn.Client.reconnect`
+(NOT in netstack — see above for why the netstack-side application
+watchdog kept doing the wrong thing). The pure
+`decideStallSurrender(lifetime, closeErr, counter, max, threshold)`
+returns the updated counter and a surrender flag: a stall close
+shorter than `Config.StableSessionThreshold` (default 60s)
+increments the counter; any other reason or any long-lived
+session resets it to 0; reaching `Config.MaxConsecutiveStalls`
+latches `c.gaveUp` and closes the `Client.Unrecoverable()` chan.
+`cmd/openvpn2socks/main.go` defaults `MaxConsecutiveStalls=3`
+and runs a watcher that cancels `rootCtx` on the chan close, so
+the daemon exits with code 1 and a supervisor (launchd /
+systemd / a shell `until openvpn2socks; do sleep 1; done`
+wrapper) relaunches us with a fresh kernel UDP socket → new
+ephemeral source port → the rate-limit clears. The signal is
+strictly protocol-level so it survives the lesson above: only
+`session.dataActivityWatch`-emitted `RestartError{Reason:
+"data-activity stuck"}` counts, and only when the session it
+sank lived less than the threshold; normal browsing-period
+stalls (longer-lived sessions, other RestartError reasons)
+never increment the counter.
 
 **IPv6 plumbing:** the parser splits dual-stack data into separate
 fields — `PushReply.LocalIP6` (a `netip.Prefix` from `ifconfig-ipv6
