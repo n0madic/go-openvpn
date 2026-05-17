@@ -927,6 +927,20 @@ func (s *Session) readLoop() {
 	for {
 		pkt, err := s.transport.ReadPacket(s.ctx)
 		if err != nil {
+			// Promote a transport-level read failure to a RestartError so
+			// the surrounding Client.sessionWatcher / Tunnel.Read paths
+			// see something actionable. Without this the readLoop exits
+			// silently, leaving closeErr nil and AutoReconnect never
+			// triggers — exactly the "tunnel frozen, no logs" state
+			// observed after host suspend on macOS, where the UDP
+			// socket can return EOF/io.ErrClosedPipe but no upstream
+			// watch fires fast enough to setCloseErr first.
+			if s.ctx.Err() == nil && !s.closed.Load() {
+				s.log.Warn("readLoop exiting on transport error; forcing reconnect",
+					"err", err)
+				s.setCloseErr(&RestartError{Reason: "transport read failed: " + err.Error()})
+				s.closeAsync("transport read failed")
+			}
 			return
 		}
 		if len(pkt) < 1 {

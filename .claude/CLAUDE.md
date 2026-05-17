@@ -98,7 +98,13 @@ internal/workers         Tiny lifecycle manager for the session's
 internal/session         Orchestrator. Goroutines per active session
                          (all managed by workers.Manager — named for
                          logs, recovered on panic, cancelled together):
-                         readLoop (demuxes incoming by opcode+key-id),
+                         readLoop (demuxes incoming by opcode+key-id;
+                         on transport-level read error before s.ctx is
+                         cancelled, it setCloseErr's a *RestartError and
+                         spawns closeAsync so AutoReconnect picks the
+                         failure up — without this the socket-died-but-
+                         no-watch-fired post-suspend path leaves the
+                         tunnel frozen with closeErr=nil),
                          writeLoop + tickLoop (per reliable.Layer, so 2 per
                          key-id), rekeyWatch (rekey trigger watchdog),
                          controlChannelReader (post-handshake RESTART/EXIT/
@@ -383,6 +389,16 @@ internal/session         Orchestrator. Goroutines per active session
     larger is almost certainly suspend; fires
     `RestartError{Reason:"wake from sleep"}` so AutoReconnect kicks in
     immediately rather than waiting on ping-restart with stale keys.
+    **Both timestamps used by `wakeDetectorWatch` are
+    `time.Now().Round(0)` — stripping the monotonic component is
+    MANDATORY on macOS.** Go's monotonic clock is backed by
+    `mach_absolute_time`, which does NOT advance during suspend, so a
+    monotonic-only diff across a suspend boundary returns ~0 and the
+    watch never fires. Wall-clock comparison (forced by `.Round(0)`)
+    survives. `openvpn.Client.sessionWatcher` performs the same
+    wall-clock gap check at 500ms cadence as a second layer — if the
+    session-level watch's ticker glitches across suspend, the
+    Client-level one observes the same gap and calls `RequestRestart`.
     `pingRestartWatch` alone misses this scenario because inbound
     HARD_RESET packets bump `lastInbound` (handleControlIn updates it
     before discarding strays) — so without these two extra watchdogs

@@ -612,15 +612,24 @@ func (s *Session) hardResetWatch(ctx context.Context) {
 // A normal tick lands within tens of milliseconds; anything larger than
 // wakeDetectGapThreshold (10s) means the runtime was paused, which on a
 // healthy host only happens during suspend.
+//
+// MUST use wall-clock-only readings (via .Round(0) to strip the monotonic
+// component) — on macOS the Go runtime's monotonic clock is backed by
+// mach_absolute_time, which does NOT advance during suspend. A
+// time.Time.Sub of two monotonic readings across a suspend boundary
+// returns ~0, defeating the gap check entirely. Stripping the monotonic
+// component forces the comparison to use the wall clock instead, which
+// does advance across suspend on every supported platform.
 func (s *Session) wakeDetectorWatch(ctx context.Context) {
-	lastTick := time.Now()
+	lastTick := time.Now().Round(0)
 	ticker := time.NewTicker(wakeDetectPeriod)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-ticker.C:
+		case <-ticker.C:
+			now := time.Now().Round(0)
 			gap := now.Sub(lastTick)
 			lastTick = now
 			if gap < wakeDetectGapThreshold {

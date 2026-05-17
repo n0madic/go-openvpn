@@ -654,6 +654,15 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 // long enough that an idle client costs nothing measurable.
 const sessionWatchPeriod = 500 * time.Millisecond
 
+// sessionWatchWakeGapThreshold is the wall-clock gap between two
+// consecutive sessionWatcher ticks that we treat as evidence the host
+// suspended. Belt-and-suspenders for session.wakeDetectorWatch — if
+// that goroutine's ticker glitches across a macOS suspend (Go's
+// monotonic clock is backed by mach_absolute_time which does not
+// advance during sleep), this one wakes up on the same boundary and
+// forces a reconnect from the Client side instead.
+const sessionWatchWakeGapThreshold = 10 * time.Second
+
 // sessionWatcher polls the active session's CloseErr and drives
 // reconnect when it sees a *RestartError. Runs only when AutoReconnect
 // is enabled. The exit conditions mirror the Tunnel.Read/Write
@@ -673,6 +682,10 @@ const sessionWatchPeriod = 500 * time.Millisecond
 func (c *Client) sessionWatcher() {
 	ticker := time.NewTicker(sessionWatchPeriod)
 	defer ticker.Stop()
+	// Wall-clock-only timestamp: .Round(0) strips the monotonic
+	// component so .Sub falls back to wall clock. This survives a
+	// macOS suspend; a monotonic-only comparison would not.
+	lastWallTick := time.Now().Round(0)
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -685,6 +698,23 @@ func (c *Client) sessionWatcher() {
 		s := c.session()
 		if s == nil {
 			return
+		}
+		// Wall-clock wake detection: if our ticker resumes after a
+		// gap that's wildly larger than our period, the host slept
+		// and the existing session is now operating on stale keys.
+		// Force a restart from the Client side; if
+		// session.wakeDetectorWatch already fired, RequestRestart
+		// is a no-op because setCloseErr is first-writer-wins.
+		now := time.Now().Round(0)
+		gap := now.Sub(lastWallTick)
+		lastWallTick = now
+		if gap > sessionWatchWakeGapThreshold {
+			c.log.Warn("session watcher: wall-clock gap suggests host slept; forcing reconnect",
+				"gap", gap, "threshold", sessionWatchWakeGapThreshold)
+			s.RequestRestart("wake from sleep (client watcher)")
+			// Fall through to the normal CloseErr poll so we drive
+			// reconnect on this same iteration rather than waiting
+			// another sessionWatchPeriod.
 		}
 		closeErr := s.CloseErr()
 		if closeErr == nil {
