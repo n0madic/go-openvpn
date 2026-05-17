@@ -331,18 +331,23 @@ The OpenVPN client is dialed with `Config.AutoReconnect=true`, so:
   The SOCKS5 listener stays bound and accepts new connections
   immediately on the new session.
 
-**Surrender on a stuck tunnel.** When the server-side path is
-broken in a way that survives reconnect (a source-port-keyed
-rate-limit, an edge blackhole — handshakes succeed but no real
-inbound data ever arrives), AutoReconnect would otherwise spin
-forever. The daemon defaults `Config.MaxConsecutiveStalls=3`: after
-three consecutive AutoReconnect cycles where the freshly-installed
-session died within `Config.StableSessionThreshold` (default 60s)
-from a "data-activity stuck" `RestartError`, the daemon exits with
-code 1. A process supervisor (launchd, systemd, or a shell `until
-openvpn2socks ...; do sleep 1; done` loop) should restart it — a
-fresh process gets a new kernel UDP socket and a new ephemeral
-source port, which typically clears the rate-limit.
+**Surrender on a stuck tunnel.** When the upstream path is broken
+in a way that survives reconnect (an edge rate-limit or blackhole
+keyed on our public IP / peer-info — handshakes succeed but no
+real inbound data ever arrives), AutoReconnect would otherwise
+spin forever in a tight ~20s loop and keep the upstream timer
+"fresh" so its cooldown never expires. The daemon defaults
+`Config.MaxConsecutiveStalls=3`: after three consecutive
+AutoReconnect cycles where the freshly-installed session died
+within `Config.StableSessionThreshold` (default 60s) from a
+"data-activity stuck" `RestartError`, the daemon exits with code
+1. A process supervisor (launchd, systemd, or a shell `until
+openvpn2socks ...; do sleep 5; done` loop) should restart it; the
+**restart delay**, not the new process itself, is what gives the
+upstream state time to expire by its own clock. AutoReconnect
+already rotates the ephemeral UDP source port on every cycle
+(each `transport.Dial` is a fresh `connect(2)`), so that is not
+what restart gains us.
 
 There is no manual reconnect command; you can SIGHUP-restart the process
 if you want a fresh session.

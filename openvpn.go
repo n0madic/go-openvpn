@@ -154,14 +154,19 @@ type Config struct {
 	// behaviour). Default 0.
 	//
 	// The signature this guards against is a server-side blackhole or
-	// source-port-keyed rate limit (e.g. ProtonVPN edge giving up on us)
+	// per-client rate limit (e.g. a ProtonVPN edge giving up on us)
 	// that survives a fresh OpenVPN handshake: each new session reports
 	// "session up" but no real inbound data ever arrives, the
 	// dataActivityWatch fast-phase tripwire fires within ~20s, and the
-	// process otherwise spins forever. A process-supervisor that
-	// observes ErrReconnectGaveUp can then relaunch the process — which
-	// gets a new ephemeral UDP source port and typically clears the
-	// rate-limit.
+	// process otherwise spins forever. AutoReconnect alone already
+	// gets a fresh kernel UDP socket with a new ephemeral source port
+	// (transport.Dial re-issues connect(2)), so source-port rotation
+	// is not what surrender adds — what it adds is *time*: a
+	// process-supervisor that observes ErrReconnectGaveUp typically
+	// delays the relaunch (systemd RestartSec, a shell `until`-loop
+	// sleep, an operator alert), giving the upstream rate-limit a
+	// chance to expire by its own clock instead of resetting our
+	// short-stall counter every 20s and starving the cooldown.
 	MaxConsecutiveStalls int
 	// StableSessionThreshold is the minimum lifetime a session must
 	// reach before it counts as "healthy enough" to reset the
@@ -607,12 +612,13 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 	// keeps dying short-lived from "data-activity stuck" (the
 	// fast-phase tripwire in session.dataActivityWatch), each fresh
 	// reconnect just gets another doomed peer-id while the underlying
-	// upstream cause (most often a source-port-keyed rate limit at
-	// the VPN edge) survives untouched. A bounded counter latches
-	// gaveUp once Config.MaxConsecutiveStalls is reached so the
-	// library returns ErrReconnectGaveUp instead of spinning forever;
-	// a process-supervisor can then relaunch with a fresh kernel UDP
-	// socket and break the source-port-keyed limit.
+	// upstream cause (rate-limit / blackhole on the VPN edge keyed on
+	// something stable across reconnect — most plausibly our external
+	// public IP) survives untouched. A bounded counter latches gaveUp
+	// once Config.MaxConsecutiveStalls is reached so the library
+	// returns ErrReconnectGaveUp instead of spinning forever; the
+	// process-supervisor's restart delay is what lets the upstream
+	// state expire by time.
 	if c.gaveUp.Load() {
 		return fmt.Errorf("%w: previous surrender latched", ErrReconnectGaveUp)
 	}
@@ -960,9 +966,12 @@ func (c *Client) Tunnel() net.Conn { return c.tun }
 // Config.MaxConsecutiveStalls consecutive short-lived "data-activity
 // stuck" sessions. A process-supervisor wrapping this Client should
 // treat the channel close as "tear down and exit so I can be
-// relaunched": a fresh process gets a new ephemeral kernel UDP source
-// port, which is what typically clears the source-port-keyed
-// rate-limit that AutoReconnect cannot otherwise escape.
+// relaunched": AutoReconnect already rotates the ephemeral UDP
+// source port on every cycle (transport.Dial issues a fresh
+// connect(2)), so what relaunch actually buys is the supervisor's
+// restart delay — letting an upstream rate-limit/blackhole keyed on
+// our public IP or peer-info expire by its own clock instead of
+// being continuously refreshed by the short-stall reconnect loop.
 //
 // The channel is never re-opened. Reading after Close is well-defined:
 // the channel is closed iff the Client surrendered before Close was

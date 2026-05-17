@@ -314,10 +314,11 @@ internal/session         Orchestrator. Goroutines per active session
    window elapses it relaxes to the steady values. Rationale: a
    freshly-handshaken session is empirically MUCH more likely to be
    wedged than a steady-state one — post-reconnect failure modes
-   include server-side state loss for the prior peer-id,
-   source-port-keyed rate limits surviving the reconnect, NAT mapping
-   drift, and gVisor TCP zombies retransmitting on the previous
-   tunnel IP. Spending the full 60s steady threshold confirming each
+   include server-side state loss for the prior peer-id, upstream
+   rate-limits / blackholes keyed on something stable across reconnect
+   (public IP, peer-info fingerprint) that the new handshake does not
+   actually clear, NAT mapping drift, and gVisor TCP zombies
+   retransmitting on the previous tunnel IP. Spending the full 60s steady threshold confirming each
    of those (we observed it in a 2026-05-15 prod log: tunnel was wedged
    ~32s when the user gave up and SIGKILL'd) is the difference between
    "tunnel jitters for a few seconds" and "tunnel froze for over a
@@ -547,16 +548,21 @@ mechanisms, and acting on them turns false signals into real
 outages.
 
 **Consecutive-stall surrender (protocol-level, NOT
-application-level).** A different failure mode — server-side
-source-port-keyed rate-limit / blackhole — has been observed
-where every AutoReconnect lands a fresh OpenVPN handshake but
-the new session is born broken: TCP outbound flows, keepalive
-PINGs arrive, but no real inbound data ever does, so
+application-level).** A different failure mode — upstream
+rate-limit / blackhole keyed on something stable across our
+reconnects (most plausibly our external public IP or peer-info
+fingerprint, NOT our UDP source port: `transport.Dial`
+re-issues `connect(2)` every cycle, so the kernel hands us a
+fresh ephemeral port already) — has been observed where every
+AutoReconnect lands a fresh OpenVPN handshake but the new
+session is born broken: TCP outbound flows, keepalive PINGs
+arrive, but no real inbound data ever does, so
 `session.dataActivityWatch` fast-phase trips at age ~20s, we
-reconnect, get another doomed peer-id, trip again, and the
-process spins forever. The fix lives in `openvpn.Client.reconnect`
-(NOT in netstack — see above for why the netstack-side application
-watchdog kept doing the wrong thing). The pure
+reconnect, trip again, and the process spins forever, the tight
+loop keeping the upstream cooldown timer continuously refreshed.
+The fix lives in `openvpn.Client.reconnect` (NOT in netstack — see
+above for why the netstack-side application watchdog kept doing
+the wrong thing). The pure
 `decideStallSurrender(lifetime, closeErr, counter, max, threshold)`
 returns the updated counter and a surrender flag: a stall close
 shorter than `Config.StableSessionThreshold` (default 60s)
@@ -566,15 +572,16 @@ latches `c.gaveUp` and closes the `Client.Unrecoverable()` chan.
 `cmd/openvpn2socks/main.go` defaults `MaxConsecutiveStalls=3`
 and runs a watcher that cancels `rootCtx` on the chan close, so
 the daemon exits with code 1 and a supervisor (launchd /
-systemd / a shell `until openvpn2socks; do sleep 1; done`
-wrapper) relaunches us with a fresh kernel UDP socket → new
-ephemeral source port → the rate-limit clears. The signal is
-strictly protocol-level so it survives the lesson above: only
-`session.dataActivityWatch`-emitted `RestartError{Reason:
-"data-activity stuck"}` counts, and only when the session it
-sank lived less than the threshold; normal browsing-period
-stalls (longer-lived sessions, other RestartError reasons)
-never increment the counter.
+systemd / a shell `until openvpn2socks; do sleep 5; done`
+wrapper) relaunches us. **The restart delay is what helps**, not
+the relaunch per se: it gives the upstream rate-limit time to
+expire by its own clock instead of being continuously starved by
+the 20s fast-phase loop. The signal is strictly protocol-level so
+it survives the lesson above: only `session.dataActivityWatch`-
+emitted `RestartError{Reason:"data-activity stuck"}` counts, and
+only when the session it sank lived less than the threshold;
+normal browsing-period stalls (longer-lived sessions, other
+RestartError reasons) never increment the counter.
 
 **IPv6 plumbing:** the parser splits dual-stack data into separate
 fields — `PushReply.LocalIP6` (a `netip.Prefix` from `ifconfig-ipv6

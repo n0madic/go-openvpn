@@ -116,13 +116,16 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 	cfg.HandshakeTimeout = opts.handshakeT
 	cfg.AutoReconnect = true
 	// Surrender after 3 consecutive short-lived "data-activity stuck"
-	// reconnects. The signature reliably indicates a server-side
-	// blackhole / source-port-keyed rate-limit that survives a fresh
-	// OpenVPN handshake — only a full process relaunch (new kernel UDP
-	// socket → new ephemeral source port) breaks it. We cancel rootCtx
-	// on cli.Unrecoverable() below so the daemon exits with code 1 and
-	// a process-supervisor (launchd / systemd / a shell wrapper) can
-	// relaunch us.
+	// reconnects. The signature reliably indicates an upstream
+	// blackhole / rate-limit that survives a fresh handshake;
+	// reconnecting in a tight 20s loop only keeps the upstream
+	// timer "fresh" and starves the cooldown. We cancel rootCtx on
+	// cli.Unrecoverable() so the daemon exits 1 and a supervisor
+	// (launchd / systemd / shell `until`-loop) reaps + restarts us
+	// after its own delay, giving the upstream state time to expire
+	// by its own clock. Source-port rotation happens on every
+	// AutoReconnect cycle already (transport.Dial → connect(2)),
+	// so that is not what this gains us.
 	cfg.MaxConsecutiveStalls = 3
 
 	// Shutdown policy:
