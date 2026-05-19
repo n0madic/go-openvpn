@@ -48,6 +48,52 @@ func ReleaseSealedBuf(b []byte) {
 	sealBufPool.Put(&full)
 }
 
+// openBufSize is the working size for inbound plaintext buffers used by
+// Slot.OpenInto. Sized to 1500 — one MTU-class IP packet, which is
+// strictly larger than every plaintext the AEAD layer can produce given
+// the tunnel's clamped inner MTU (1400 in netstack mode). Oversize
+// inbound packets fall back to a per-call allocation, same model as
+// sealBufSize.
+const openBufSize = 1500
+
+// openBufPool recycles inbound plaintext buffers across calls to
+// Slot.OpenInto. Without it the AEAD's Open path allocates the plaintext
+// fresh on every inbound packet — at sustained bulk-download rates this
+// is the dominant garbage source in the entire client, observed to cost
+// 15-30% CPU in mallocgc + GC scan on a single hot readLoop goroutine.
+//
+// Released via GetOpenBuf / PutOpenBuf below; the session ingress path
+// gets a pool buffer just before Open and returns it after the consumer
+// has finished with the plaintext (handler path returns synchronously;
+// channel path copies out and releases immediately).
+var openBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, openBufSize)
+		return &b
+	},
+}
+
+// GetOpenBuf returns a zero-length slice with cap=openBufSize from the
+// inbound buffer pool. Caller must hand it back via PutOpenBuf after the
+// plaintext has been consumed (synchronously delivered to a handler, or
+// copied out for the channel path).
+func GetOpenBuf() []byte {
+	bp := openBufPool.Get().(*[]byte)
+	return (*bp)[:0]
+}
+
+// PutOpenBuf returns a buffer obtained via GetOpenBuf (or returned by
+// OpenInto) to the pool. Buffers whose cap is not the pool's working
+// size are dropped — they were one-off oversize allocations. Safe to
+// call with nil.
+func PutOpenBuf(b []byte) {
+	if cap(b) != openBufSize {
+		return
+	}
+	full := b[:0]
+	openBufPool.Put(&full)
+}
+
 // ErrPacketIDExhausted is returned when the outbound packet-id has crossed
 // the soft-rekey threshold; the session should perform a soft reset before
 // the counter saturates at 2^32 (which would risk nonce reuse).
@@ -217,6 +263,53 @@ func (s *Slot) Open(packet []byte) ([]byte, error) {
 	// Mark only after authenticity is confirmed. Accept may return false in
 	// the rare case of a concurrent identical-pid acceptance (single-threaded
 	// readLoop makes this practically impossible) — surface as replay.
+	if !s.recvWin.Accept(hdr.PacketID) {
+		return nil, fmt.Errorf("data: replay or out-of-window pid %d", hdr.PacketID)
+	}
+	return plaintext, nil
+}
+
+// OpenInto is like Open but appends the plaintext to the supplied dst
+// buffer (typically obtained via GetOpenBuf) instead of allocating a
+// fresh slice. Use this on the inbound hot path so per-packet plaintext
+// storage amortises across the buffer pool. Returns the dst with
+// plaintext appended (or a freshly allocated slice if dst was too small,
+// matching cipher.AEAD.Open semantics). The caller owns the returned
+// slice and must return it to the pool via PutOpenBuf when done.
+//
+// Pre-checks and replay accounting are identical to Open.
+func (s *Slot) OpenInto(dst, packet []byte) ([]byte, error) {
+	hdr, body, err := proto.ParseDataV2Header(packet)
+	if err != nil {
+		return nil, err
+	}
+	if hdr.KeyID != s.KeyID {
+		return nil, fmt.Errorf("data: packet key-id %d does not match slot %d", hdr.KeyID, s.KeyID)
+	}
+	if hdr.PeerID != s.PeerID {
+		return nil, fmt.Errorf("data: packet peer-id %d does not match slot %d", hdr.PeerID, s.PeerID)
+	}
+	if len(body) < TagLen {
+		return nil, fmt.Errorf("data: packet too short for AEAD tag: %d", len(body))
+	}
+	if !s.recvWin.Test(hdr.PacketID) {
+		return nil, fmt.Errorf("data: replay or out-of-window pid %d", hdr.PacketID)
+	}
+	// On-wire layout is tag||ciphertext; Go expects ciphertext||tag. Same
+	// in-place reorder Open does — packet/body backing memory is owned by
+	// the wire receive buffer which is overwritten on the next ReadPacket.
+	var tagBuf [TagLen]byte
+	copy(tagBuf[:], body[:TagLen])
+	copy(body[:len(body)-TagLen], body[TagLen:])
+	copy(body[len(body)-TagLen:], tagBuf[:])
+
+	opcodeKID := packet[0]
+	nonce := makeNonce(hdr.PacketID, s.recvIV)
+	aad := makeAAD(opcodeKID, hdr.PeerID, hdr.PacketID)
+	plaintext, err := s.recvAEAD.openInto(dst, nonce[:], body, aad[:])
+	if err != nil {
+		return nil, fmt.Errorf("data: AEAD open: %w", err)
+	}
 	if !s.recvWin.Accept(hdr.PacketID) {
 		return nil, fmt.Errorf("data: replay or out-of-window pid %d", hdr.PacketID)
 	}

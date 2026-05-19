@@ -420,11 +420,42 @@ func (e *endpoint) dispatchInbound(ip []byte) (dispatcherMissing bool) {
 // the saving is the syscall ratio, not the crypto.
 func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	var wrote int
+	var scratch []byte
 	for _, pkt := range pkts.AsSlice() {
-		v := pkt.ToView()
-		data := v.AsSlice()
+		// Fast path: most IP packets out of gVisor live as a single view
+		// (we built the NIC with no link header, and IP fragmentation is
+		// rare given our 1400-byte inner MTU). Single-view means we can
+		// pass the underlying bytes directly to conn.Write — zero copy,
+		// zero allocation. ToView (the previous implementation)
+		// unconditionally allocated and memcpy'd the whole packet.
+		slices := pkt.AsSlices()
+		var data []byte
+		switch len(slices) {
+		case 0:
+			continue
+		case 1:
+			data = slices[0]
+		default:
+			// Multi-view packet: must concat because conn.Write is a
+			// single sendmsg per call (a UDP datagram boundary). Reuse
+			// one growing scratch buffer across the batch so the cost
+			// is one alloc per WritePackets call max, not per packet.
+			total := 0
+			for _, s := range slices {
+				total += len(s)
+			}
+			if cap(scratch) < total {
+				scratch = make([]byte, total)
+			} else {
+				scratch = scratch[:total]
+			}
+			off := 0
+			for _, s := range slices {
+				off += copy(scratch[off:], s)
+			}
+			data = scratch
+		}
 		_, err := e.conn.Write(data)
-		v.Release()
 		if err != nil {
 			e.statsOutErrors.Add(1)
 			if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
@@ -725,8 +756,24 @@ func (n *Net) applyPushReply(pr openvpn.PushReply) error {
 	oldV4, oldHasV4 := n.localV4, n.hasV4
 	oldV6, oldHasV6 := n.localV6, n.hasV6
 
-	if pr.LocalIP.IsValid() && pr.LocalIP.Is4() && (!oldHasV4 || oldV4 != pr.LocalIP) {
-		ip := pr.LocalIP.As4()
+	// Compute the desired post-apply state. Treat invalid / wrong-family
+	// PushReply fields as "drop the family entirely" — otherwise a server
+	// that switched from dual-stack to v6-only (or vice versa) would leave
+	// the NIC carrying a stale address that HasIPv4/HasIPv6 still advertise,
+	// causing gVisor to bind sockets to an IP the server no longer routes.
+	var newV4 netip.Addr
+	newHasV4 := pr.LocalIP.IsValid() && pr.LocalIP.Is4()
+	if newHasV4 {
+		newV4 = pr.LocalIP
+	}
+	var newV6 netip.Addr
+	newHasV6 := pr.LocalIP6.IsValid() && pr.LocalIP6.Addr().Is6()
+	if newHasV6 {
+		newV6 = pr.LocalIP6.Addr()
+	}
+
+	if newHasV4 && (!oldHasV4 || oldV4 != newV4) {
+		ip := newV4.As4()
 		addrProto := tcpip.ProtocolAddress{
 			Protocol: ipv4.ProtocolNumber,
 			AddressWithPrefix: tcpip.AddressWithPrefix{
@@ -737,16 +784,16 @@ func (n *Net) applyPushReply(pr openvpn.PushReply) error {
 		if err := n.stack.AddProtocolAddress(nicID, addrProto, stack.AddressProperties{}); err != nil {
 			return fmt.Errorf("AddProtocolAddress v4: %s", err)
 		}
-		n.localV4 = pr.LocalIP
+		n.localV4 = newV4
 		n.hasV4 = true
 	}
 	// IPv6 NIC address comes from "ifconfig-ipv6 <local>/<plen> <peer>" and
 	// is parsed into pr.LocalIP6 (a Prefix). The peer address is RemoteIP6
 	// and serves as the default v6 gateway, mirroring how "route-gateway"
 	// supplies the IPv4 default.
-	if v6 := pr.LocalIP6; v6.IsValid() && v6.Addr().Is6() && (!oldHasV6 || oldV6 != v6.Addr()) {
-		ip := v6.Addr().As16()
-		prefixLen := v6.Bits()
+	if newHasV6 && (!oldHasV6 || oldV6 != newV6) {
+		ip := newV6.As16()
+		prefixLen := pr.LocalIP6.Bits()
 		if prefixLen < 0 || prefixLen > 128 {
 			prefixLen = 128
 		}
@@ -760,7 +807,7 @@ func (n *Net) applyPushReply(pr openvpn.PushReply) error {
 		if err := n.stack.AddProtocolAddress(nicID, addrProto, stack.AddressProperties{}); err != nil {
 			return fmt.Errorf("AddProtocolAddress v6: %s", err)
 		}
-		n.localV6 = v6.Addr()
+		n.localV6 = newV6
 		n.hasV6 = true
 	}
 
@@ -769,13 +816,24 @@ func (n *Net) applyPushReply(pr openvpn.PushReply) error {
 	// automatically.
 	n.stack.SetRouteTable(buildRoutes(pr))
 
-	// Drop the stale address last so there's no instant where the NIC has
-	// no IPv4/IPv6 configured.
-	if oldHasV4 && oldV4 != n.localV4 {
+	// Drop stale addresses last so there's no instant where the NIC has no
+	// IPv4/IPv6 configured. Two cases: (a) family kept, address changed
+	// (oldV4 != newV4); (b) family disappeared from the new PushReply
+	// (!newHasV4 while oldHasV4) — without this branch the NIC silently
+	// retains the old address and HasIPv4 keeps reporting true.
+	if oldHasV4 && (!newHasV4 || oldV4 != newV4) {
 		_ = n.stack.RemoveAddress(nicID, tcpip.AddrFrom4(oldV4.As4()))
+		if !newHasV4 {
+			n.localV4 = netip.Addr{}
+			n.hasV4 = false
+		}
 	}
-	if oldHasV6 && oldV6 != n.localV6 {
+	if oldHasV6 && (!newHasV6 || oldV6 != newV6) {
 		_ = n.stack.RemoveAddress(nicID, tcpip.AddrFrom16(oldV6.As16()))
+		if !newHasV6 {
+			n.localV6 = netip.Addr{}
+			n.hasV6 = false
+		}
 	}
 
 	return nil

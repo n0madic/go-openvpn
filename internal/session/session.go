@@ -670,6 +670,13 @@ func (s *Session) CloseErr() error {
 	return nil
 }
 
+// IsClosed reports whether Close has been initiated on the session. Useful
+// for background watchers that need to exit when the session is finished
+// regardless of whether a protocol-level CloseErr was recorded — Close
+// from a non-restart path (manual teardown, tests, panic-recovered worker)
+// leaves CloseErr nil, so polling CloseErr alone never returns true.
+func (s *Session) IsClosed() bool { return s.closed.Load() }
+
 // ErrClosed is the generic error returned by Read/Write when the session has
 // been closed without a more specific reason. RestartError is returned when
 // the server requested a RESTART.
@@ -706,8 +713,18 @@ func (s *Session) closeAsync(reason string) {
 // installTLSConn replaces the active TLS control-channel conn and starts a
 // reader goroutine that watches for server-initiated messages (RESTART,
 // INFO, EXIT). The previously-active conn is closed (which kills its reader).
+//
+// If the session is already shutting down, the supplied conn is closed
+// immediately and no reader is started — otherwise a rekey racing with
+// Close would leave the fresh conn open forever (workers.Go silently rejects
+// the reader registration, but the conn itself would never be closed).
 func (s *Session) installTLSConn(c *tls.Conn) {
 	s.tlsMu.Lock()
+	if c != nil && s.closed.Load() {
+		s.tlsMu.Unlock()
+		_ = c.Close()
+		return
+	}
 	prev := s.tlsConn
 	s.tlsConn = c
 	s.tlsMu.Unlock()
@@ -813,23 +830,27 @@ func (s *Session) controlChannelReader(conn *tls.Conn) {
 		}
 		switch {
 		case msg == "EXIT" || strings.HasPrefix(msg, "EXIT,"):
-			// Server has cleanly disconnected.
+			// Server has cleanly disconnected. Close asynchronously
+			// because s.Close → shutdown → workers.Wait would
+			// otherwise deadlock against this very goroutine (we
+			// are a worker), forcing a 2-second shutdownWaitTimeout
+			// on every clean RESTART/EXIT and polluting the log.
 			s.log.Info("server sent EXIT")
 			s.setCloseErr(ErrServerExit)
-			_ = s.Close()
+			s.closeAsync("server EXIT")
 			return
 		case msg == "RESTART" || strings.HasPrefix(msg, "RESTART,"):
 			re := parseRestart(msg)
 			s.log.Info("server requested RESTART", "delay", re.Delay, "reason", re.Reason)
 			s.setCloseErr(re)
-			_ = s.Close()
+			s.closeAsync("server RESTART")
 			return
 		case strings.HasPrefix(msg, "AUTH_FAILED"):
 			s.log.Warn("server AUTH_FAILED post-handshake", "msg", msg)
 			body := strings.TrimPrefix(msg, "AUTH_FAILED")
 			body = strings.TrimPrefix(body, ",")
 			s.setCloseErr(&AuthFailedError{Message: body})
-			_ = s.Close()
+			s.closeAsync("server AUTH_FAILED")
 			return
 		case strings.HasPrefix(msg, "INFO"):
 			payload := msg
@@ -1000,8 +1021,18 @@ func (s *Session) handleDataIn(pkt []byte, kid uint8) {
 	if slot == nil {
 		return // pre-handshake or post-retire: drop
 	}
-	ip, err := slot.Open(pkt)
+	// Decrypt into a pooled buffer. The previous implementation called
+	// slot.Open which allocated the plaintext fresh on every packet —
+	// the dominant garbage source under sustained inbound load. On the
+	// handler fast path we release the buffer synchronously after the
+	// handler returns (the IngressHandler contract forbids retention).
+	// On the channel slow path we copy out and release immediately so
+	// the existing Tunnel.Read consumer doesn't have to learn about
+	// the pool.
+	buf := data.GetOpenBuf()
+	ip, err := slot.OpenInto(buf, pkt)
 	if err != nil {
+		data.PutOpenBuf(buf)
 		s.statsOpenFailed.Add(1)
 		s.log.Debug("data open failed", "kid", kid, "err", err)
 		return
@@ -1012,6 +1043,7 @@ func (s *Session) handleDataIn(pkt []byte, kid uint8) {
 	now := time.Now().UnixNano()
 	s.lastInbound.Store(now)
 	if proto.IsPing(ip) {
+		data.PutOpenBuf(buf)
 		s.statsPingIn.Add(1)
 		// Server-side keepalive PINGs are the half of the keepalive
 		// loop that's invisible from outbound logs alone. Logging them
@@ -1047,6 +1079,10 @@ func (s *Session) handleDataIn(pkt []byte, kid uint8) {
 		s.statsForwarded.Add(1)
 		h(ip)
 		s.handlerMu.RUnlock()
+		// Per the IngressHandler contract the handler does NOT retain
+		// ip past the call (gVisor's buffer.MakeWithData in our
+		// netstack adapter copies on entry); safe to recycle.
+		data.PutOpenBuf(buf)
 		return
 	}
 	s.handlerMu.RUnlock()
@@ -1060,8 +1096,17 @@ func (s *Session) handleDataIn(pkt []byte, kid uint8) {
 	// Drop-on-full lets gVisor TCP fill the gaps via the standard
 	// retransmit path; lost UDP packets are the caller's problem same as
 	// on any real link.
+	//
+	// Allocate a fresh slice for the channel hand-off so we can return
+	// the pooled buffer immediately — the consumer (Tunnel.Read) doesn't
+	// know about the pool and only owns the bytes until its copy(p, pkt)
+	// completes. Channel path is the rare path; users who care about
+	// throughput attach an IngressHandler.
+	out := make([]byte, len(ip))
+	copy(out, ip)
+	data.PutOpenBuf(buf)
 	select {
-	case s.ingressCh <- ip:
+	case s.ingressCh <- out:
 		s.statsForwarded.Add(1)
 	default:
 		s.statsDroppedFull.Add(1)

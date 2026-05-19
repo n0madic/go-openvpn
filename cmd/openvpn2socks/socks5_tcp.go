@@ -96,6 +96,12 @@ func (s *socks5Server) proxy(ctx context.Context, client net.Conn, br *bufio.Rea
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// Initial idle deadline applies to both directions because nothing
+	// has flowed yet. Per-direction writeDeadliner refreshes only the
+	// WRITE side on subsequent activity (see below), so a long-silent
+	// direction can still stall out via its own SetReadDeadline path
+	// rather than being kept artificially alive by writes flowing the
+	// other way.
 	idleDeadline := func() {
 		if s.idle > 0 {
 			_ = client.SetDeadline(time.Now().Add(s.idle))
@@ -143,7 +149,11 @@ func (s *socks5Server) proxy(ctx context.Context, client net.Conn, br *bufio.Rea
 	close(done)
 }
 
-// writeDeadliner wraps a net.Conn so each Write extends the idle deadline.
+// writeDeadliner wraps a net.Conn so each Write extends the WRITE-side
+// idle deadline. Uses SetWriteDeadline (not SetDeadline) so the busy
+// direction does not also keep resetting the OPPOSITE side's read
+// deadline — that masking would let an asymmetric stall (one direction
+// flowing keepalives while the other is genuinely dead) hide forever.
 type writeDeadliner struct {
 	net.Conn
 	idle time.Duration
@@ -151,7 +161,7 @@ type writeDeadliner struct {
 
 func (w writeDeadliner) Write(p []byte) (int, error) {
 	if w.idle > 0 {
-		_ = w.SetDeadline(time.Now().Add(w.idle))
+		_ = w.SetWriteDeadline(time.Now().Add(w.idle))
 	}
 	return w.Conn.Write(p)
 }

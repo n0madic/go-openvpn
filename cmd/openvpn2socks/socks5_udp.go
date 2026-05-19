@@ -284,21 +284,25 @@ func (m *udpRelayMgr) pumpClientToTunnel(ctx context.Context) {
 				"host", host, "have_v4", m.s.ns.HasIPv4(), "have_v6", m.s.ns.HasIPv6())
 			continue
 		}
-		// Per-target token bucket — symmetric to TCP CONNECT. UDP ASSOCIATE
-		// is otherwise unrestricted: one authorised client can fan out
-		// thousands of datagrams per second to amplification-capable
-		// services (open DNS, NTP, memcached) and ENOBUFS the tunnel via
-		// the very same retransmit-storm path that TCP rate-limiting was
-		// added to prevent. Sharing the limiter with TCP means the burst
-		// budget is per-destination total (UDP + TCP), which matches
-		// "this host is overloaded" semantics better than two independent
-		// buckets.
-		if m.s.connRate != nil && !m.s.connRate.allow(ips[0]) {
-			m.s.log.Debug("UDP relay: per-host rate limit",
-				"target", ips[0], "port", port, "host", host)
-			continue
-		}
 		targetAddr := net.JoinHostPort(ips[0].String(), strconv.Itoa(int(port)))
+
+		// Per-target token bucket — symmetric to TCP CONNECT — consumed
+		// only on the FIRST datagram to a target. Otherwise a legitimate
+		// DNS-over-UDP burst (browser fanning out 6 parallel A+AAAA
+		// queries to one resolver in <100ms) repeatedly hits the same
+		// (ip, anyport) bucket and drains it within a second — refilling
+		// at 2/s, subsequent legitimate queries get dropped and break
+		// name resolution; worse, the bucket is shared with TCP so a
+		// UDP burst can starve TCP CONNECTs to the same IP for several
+		// seconds. We charge per new flow, matching how TCP CONNECT
+		// charges per connection establishment.
+		if m.s.connRate != nil && !m.hasRelay(targetAddr) {
+			if !m.s.connRate.allow(ips[0]) {
+				m.s.log.Debug("UDP relay: per-host rate limit",
+					"target", ips[0], "port", port, "host", host)
+				continue
+			}
+		}
 
 		relay, err := m.getOrCreate(ctx, host, port, targetAddr, client)
 		if err != nil {
@@ -381,6 +385,16 @@ func (m *udpRelayMgr) getOrCreate(ctx context.Context, dstHost string, dstPort u
 		}()
 		return r, nil
 	}
+}
+
+// hasRelay reports whether a relay for the given targetAddr already exists.
+// Used by the inbound UDP loop to skip per-host rate-limit consumption on
+// subsequent datagrams in an established flow.
+func (m *udpRelayMgr) hasRelay(targetAddr string) bool {
+	m.mu.Lock()
+	_, ok := m.relays[targetAddr]
+	m.mu.Unlock()
+	return ok
 }
 
 // removeRelay deletes r from the registry, closing the target conn.

@@ -68,7 +68,7 @@ type socks5Server struct {
 	inflight atomic.Int64
 }
 
-func newSOCKS5(ns *netstack.Net, r *resolver, listen, authSpec string, idle time.Duration, log *slog.Logger) *socks5Server {
+func newSOCKS5(ns *netstack.Net, r *resolver, listen, authSpec string, idle time.Duration, log *slog.Logger) (*socks5Server, error) {
 	s := &socks5Server{
 		ns:       ns,
 		resolver: r,
@@ -78,11 +78,21 @@ func newSOCKS5(ns *netstack.Net, r *resolver, listen, authSpec string, idle time
 		connRate: newConnRateLimiter(),
 	}
 	if authSpec != "" {
-		if u, p, ok := strings.Cut(authSpec, ":"); ok && u != "" {
-			s.authUser, s.authPass = u, p
+		// Reject malformed -socks-auth values rather than silently
+		// dropping them, which would otherwise leave the server in
+		// authNone mode AND suppress the "non-loopback without auth"
+		// warning in main — the worst possible combo: open proxy with
+		// an operator who believes auth is enabled.
+		u, p, ok := strings.Cut(authSpec, ":")
+		if !ok {
+			return nil, fmt.Errorf("socks-auth: expected user:pass, got %q", authSpec)
 		}
+		if u == "" {
+			return nil, fmt.Errorf("socks-auth: empty username (use 127.0.0.1 bind for unauthenticated access)")
+		}
+		s.authUser, s.authPass = u, p
 	}
-	return s
+	return s, nil
 }
 
 // ListenAndServe binds s.listen and serves SOCKS5 until ctx is cancelled.

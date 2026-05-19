@@ -312,6 +312,13 @@ type Client struct {
 	// guards the close.
 	unrecoverable     chan struct{}
 	unrecoverableOnce sync.Once
+
+	// watcherWG tracks the background sessionWatcher goroutine (when
+	// AutoReconnect is on) so Close blocks until the watcher has
+	// returned — otherwise a 500ms-cadence ticker can fire one more
+	// reconnect attempt after Close returns, and tests asserting
+	// "no goroutines after Close" flake.
+	watcherWG sync.WaitGroup
 }
 
 // reconnectHook bundles a registered callback with the slice element
@@ -482,8 +489,21 @@ func (c *Client) FireOnReconnect(pr PushReply) {
 		hooks[i] = h.fn
 	}
 	c.hooksMu.Unlock()
+	// Each hook is user-supplied — a panic must not propagate out of the
+	// reconnect path (which would crash the whole process: the watcher
+	// goroutine's top-level recover catches it, but the netstack hook
+	// and other registered callbacks would all be skipped). Log and move
+	// on; the caller is responsible for fixing their hook.
 	for _, h := range hooks {
-		h(pr)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					c.log.Error("OnReconnect hook panicked",
+						"recovered", fmt.Sprint(r))
+				}
+			}()
+			h(pr)
+		}()
 	}
 }
 
@@ -544,6 +564,7 @@ func Dial(ctx context.Context, cfg *Config) (*Client, error) {
 	// unconsumed and the tunnel sits in zombie state — exactly the
 	// post-suspend bug we hit live.
 	if cfg.AutoReconnect {
+		c.watcherWG.Add(1)
 		go c.sessionWatcher()
 	}
 	return c, nil
@@ -684,28 +705,33 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 
 		// Dial under c.ctx (so the resulting session outlives callCtx) but
 		// watch callCtx so a per-call deadline can interrupt a slow Dial.
-		// defer close(stopWatch) covers the path where session.Dial panics
-		// — without it the watcher goroutine would leak until c.ctx fires.
-		dialCtx, dialCancel := context.WithCancel(c.ctx)
-		stopWatch := make(chan struct{})
-		stopWatchClosed := false
-		closeStopWatch := func() {
-			if !stopWatchClosed {
-				close(stopWatch)
-				stopWatchClosed = true
-			}
-		}
-		defer closeStopWatch()
-		go func() {
-			select {
-			case <-callCtx.Done():
-				dialCancel()
-			case <-stopWatch:
-			}
+		// The dial body lives in a closure so its defers fire at the end
+		// of each iteration, not at the function's outer return — otherwise
+		// long reconnect loops (unlimited attempts on a flaky network) would
+		// accumulate one captured closure per failed attempt on the defer
+		// stack until the whole reconnect call returns.
+		s, err := func() (*session.Session, error) {
+			dialCtx, dialCancel := context.WithCancel(c.ctx)
+			defer dialCancel()
+			stopWatch := make(chan struct{})
+			// Defer the close in case session.Dial panics — the watcher
+			// goroutine would otherwise leak until c.ctx fires.
+			defer func() {
+				select {
+				case <-stopWatch:
+				default:
+					close(stopWatch)
+				}
+			}()
+			go func() {
+				select {
+				case <-callCtx.Done():
+					dialCancel()
+				case <-stopWatch:
+				}
+			}()
+			return session.Dial(dialCtx, sessionCfg(c.cfg))
 		}()
-		s, err := session.Dial(dialCtx, sessionCfg(c.cfg))
-		closeStopWatch()
-		dialCancel()
 
 		if err != nil && errors.Is(err, ErrAuthFailed) {
 			// Terminal: re-dial with the same credentials will keep failing
@@ -729,12 +755,15 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 				return callCtx.Err()
 			}
 			// Absorb the failed session's lifetime counters into cumStats
-			// before we lose visibility of it. Without this, every
-			// reconnect would silently zero the running totals.
+			// before we lose visibility of it. Hold statsMu across the
+			// c.s swap so a concurrent Stats() observer cannot see
+			// "Reconnects bumped + counters absorbed" while c.s still
+			// points at the old session — that intermediate state would
+			// double-count the old session's bytes (once via the absorb,
+			// once via the live c.session().Stats() add).
 			c.statsMu.Lock()
 			c.absorbStatsLocked(failed)
 			c.cumStats.Reconnects++
-			c.statsMu.Unlock()
 			c.mu.Lock()
 			c.s = s
 			// Re-apply any persistent ingress handler to the fresh session
@@ -747,6 +776,7 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 				s.SetIngressHandler(*hp)
 			}
 			c.mu.Unlock()
+			c.statsMu.Unlock()
 			// Reset the session-up wall clock so the NEXT call to
 			// decideStallSurrender measures the new session's lifetime
 			// from this point, not from the previous handshake.
@@ -802,6 +832,17 @@ const sessionWatchWakeGapThreshold = 10 * time.Second
 // paths, and reconnect's "another goroutine already swapped the
 // session" early return makes the second caller a no-op.
 func (c *Client) sessionWatcher() {
+	defer c.watcherWG.Done()
+	// Top-level panic guard so a buggy OnReconnect hook (invoked
+	// transitively via c.reconnect → FireOnReconnect) or any other
+	// unexpected panic in the reconnect path is contained to the
+	// watcher rather than killing the whole process.
+	defer func() {
+		if r := recover(); r != nil {
+			c.log.Error("session watcher: recovered panic",
+				"recovered", fmt.Sprint(r))
+		}
+	}()
 	ticker := time.NewTicker(sessionWatchPeriod)
 	defer ticker.Stop()
 	// Wall-clock-only timestamp: .Round(0) strips the monotonic
@@ -840,6 +881,16 @@ func (c *Client) sessionWatcher() {
 		}
 		closeErr := s.CloseErr()
 		if closeErr == nil {
+			// A session can be closed without a protocol-level
+			// reason (manual Close from tests, worker-panic
+			// recovery in workers.Manager). In that state c.session()
+			// keeps returning the dead pointer forever, so without
+			// this exit the watcher spins at 500ms cadence until the
+			// Client's own ctx fires. Bail out — there's nothing to
+			// reconnect to.
+			if s.IsClosed() {
+				return
+			}
 			continue
 		}
 		var re *RestartError
@@ -1047,7 +1098,10 @@ func (c *Client) RequestRestart(reason string) {
 }
 
 // Close tears down the session. Idempotent. Cancels any in-flight
-// AutoReconnect attempt so no orphan session is left behind.
+// AutoReconnect attempt so no orphan session is left behind, and blocks
+// until the background sessionWatcher (when AutoReconnect is on) has
+// returned so callers see deterministic teardown rather than a stale
+// goroutine that may fire one more reconnect tick after Close completes.
 func (c *Client) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
@@ -1062,8 +1116,12 @@ func (c *Client) Close() error {
 	c.reconnectMu.Lock()
 	s := c.session()
 	c.reconnectMu.Unlock()
+	var err error
 	if s != nil {
-		return s.Close()
+		err = s.Close()
 	}
-	return nil
+	// Drain the watcher AFTER closing the session, so its in-flight
+	// reconnect (if any) has the ctx cancellation it needs to exit.
+	c.watcherWG.Wait()
+	return err
 }

@@ -217,6 +217,7 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 	}
 	r := newResolver(ns, pr.DNS, override, logger)
 	r.startStatsLogger(rootCtx)
+	r.startCacheGC(rootCtx)
 
 	// Warn loudly when the SOCKS5 listener is bound to a non-loopback
 	// interface without SOCKS5 authentication: anyone on the LAN can
@@ -229,7 +230,10 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 			"hint", "set -socks-auth user:pass or bind to 127.0.0.1")
 	}
 
-	srv := newSOCKS5(ns, r, opts.listen, opts.socksAuth, opts.idle, logger)
+	srv, err := newSOCKS5(ns, r, opts.listen, opts.socksAuth, opts.idle, logger)
+	if err != nil {
+		return err
+	}
 	logger.Info("SOCKS5 listening", "addr", opts.listen)
 
 	// Reset the per-host CONNECT burst limiter after every reconnect.

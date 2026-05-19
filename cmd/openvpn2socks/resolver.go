@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/n0madic/go-openvpn/pkg/netstack"
+	"golang.org/x/sync/singleflight"
 )
 
 // dnsCacheTTL is how long a successful resolution is kept. Chosen to be
@@ -80,6 +81,14 @@ type resolver struct {
 	cacheMu sync.Mutex
 	cache   map[string]dnsCacheEntry
 
+	// inflight deduplicates concurrent LookupIP calls for the same host.
+	// Without it, a cold-cache page load (8-20 parallel sockets to one
+	// origin) issues N parallel tunneled DNS queries each spawning two
+	// gonet UDP conns (A + AAAA) — a documented contributor to upstream
+	// UDP rate-limiting on v4-only ProtonVPN tunnels. The first caller
+	// dispatches the lookup; the rest wait for the cached result.
+	inflight singleflight.Group
+
 	// Diagnostic counters surfaced by Stats / startStatsLogger so the
 	// operator can see whether the DNS cache is doing useful work or
 	// every lookup is paying the tunneled-query cost.
@@ -108,6 +117,21 @@ const systemWarnThrottle = 60 * time.Second
 // Matched to the netstack stats logger period so the two interleave
 // on the same cadence — easier to read in a live tail.
 const dnsStatsLogPeriod = 30 * time.Second
+
+// dnsCacheGCPeriod is how often the cache is swept for expired entries.
+// Without an active sweep, entries that are never re-queried after expiry
+// stay resident forever — a browser visiting thousands of distinct hosts
+// (CDN subdomains, ad/tracker domains, etc.) accumulates one entry per
+// hostname for the life of the daemon. The sweep also bounds the memory
+// available to an adversarial client on a non-loopback bind that issues
+// CONNECTs to `random-${i}.example.com`.
+const dnsCacheGCPeriod = 5 * time.Minute
+
+// dnsCacheMaxEntries caps the cache to prevent unbounded growth between
+// GC sweeps. When the cap is reached cacheSet evicts the entry that
+// expires soonest — a cheap O(n) walk that is acceptable because we only
+// pay it on insertion-while-full, not on every Set.
+const dnsCacheMaxEntries = 8192
 
 // Stats returns lifetime cumulative cache-hit and cache-miss counters.
 // Snapshot is consistent per field but the two are read independently;
@@ -202,16 +226,61 @@ func (r *resolver) cacheGet(host string) ([]netip.Addr, bool) {
 	return out, true
 }
 
-// cacheSet stores ips for host with TTL dnsCacheTTL.
+// cacheSet stores ips for host with TTL dnsCacheTTL. When the cache is at
+// dnsCacheMaxEntries it evicts the entry expiring soonest to make room —
+// a simple bounded-memory backstop between dnsCacheGCPeriod sweeps.
 func (r *resolver) cacheSet(host string, ips []netip.Addr) {
 	if len(ips) == 0 {
 		return
 	}
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
+	if _, exists := r.cache[host]; !exists && len(r.cache) >= dnsCacheMaxEntries {
+		var evictKey string
+		var evictAt time.Time
+		for k, e := range r.cache {
+			if evictKey == "" || e.expires.Before(evictAt) {
+				evictKey, evictAt = k, e.expires
+			}
+		}
+		if evictKey != "" {
+			delete(r.cache, evictKey)
+		}
+	}
 	stored := make([]netip.Addr, len(ips))
 	copy(stored, ips)
 	r.cache[host] = dnsCacheEntry{ips: stored, expires: time.Now().Add(dnsCacheTTL)}
+}
+
+// cacheSweep removes every entry whose TTL has expired. Called by the
+// periodic GC goroutine to bound resident memory across many distinct
+// hostnames that are never re-queried.
+func (r *resolver) cacheSweep() {
+	now := time.Now()
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	for k, e := range r.cache {
+		if now.After(e.expires) {
+			delete(r.cache, k)
+		}
+	}
+}
+
+// startCacheGC spawns a goroutine that sweeps expired entries on every
+// dnsCacheGCPeriod tick. Exits on ctx.Done().
+func (r *resolver) startCacheGC(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(dnsCacheGCPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				r.cacheSweep()
+			}
+		}
+	}()
 }
 
 // LookupIP returns the resolved A/AAAA records for host. If host is already
@@ -245,6 +314,30 @@ func (r *resolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, err
 	}
 	r.statsCacheMiss.Add(1)
 
+	// Deduplicate concurrent misses for the same host. singleflight
+	// returns the leader's result to every waiter — if the leader writes
+	// to the cache, followers' subsequent cacheGet (re-checked after Do
+	// returns) hits. We do not re-check the cache inside Do because the
+	// leader unconditionally runs the resolution path; followers receive
+	// the leader's value directly. Use a defensive copy: x/sync returns
+	// the same shared value to all waiters, and downstream code may
+	// mutate the slice (e.g. filterUsableIPs).
+	v, err, _ := r.inflight.Do(host, func() (any, error) {
+		return r.lookupIPUncached(ctx, host)
+	})
+	if err != nil {
+		return nil, err
+	}
+	src := v.([]netip.Addr)
+	out := make([]netip.Addr, len(src))
+	copy(out, src)
+	return out, nil
+}
+
+// lookupIPUncached runs the full resolution chain (tunneled resolvers →
+// public fallback → system) without consulting the cache. The caller
+// (LookupIP) handles cache lookup and singleflight deduplication.
+func (r *resolver) lookupIPUncached(ctx context.Context, host string) ([]netip.Addr, error) {
 	tunnelAttempted := false
 	sawAuthoritativeNoData := false
 
@@ -425,10 +518,22 @@ func (r *resolver) queryOverTunnel(ctx context.Context, server netip.AddrPort, h
 	if len(qtypes) == 0 {
 		return nil, fmt.Errorf("no usable address family for DNS lookup of %q", host)
 	}
+	// Pick the per-qtype deadline as the min of our hard cap and any
+	// shorter deadline the caller already imposed via ctx. Without this
+	// every query waits the full 3s even when the caller passed e.g.
+	// 100ms — and stays unresponsive to ctx cancellation in the receive
+	// loop below until each goroutine independently times out.
+	const perQtypeCap = 3 * time.Second
+	qtypeTimeout := perQtypeCap
+	if dl, ok := ctx.Deadline(); ok {
+		if rem := time.Until(dl); rem < qtypeTimeout {
+			qtypeTimeout = rem
+		}
+	}
 	ch := make(chan result, len(qtypes))
 	for _, qt := range qtypes {
 		go func(qt uint16) {
-			qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			qctx, cancel := context.WithTimeout(ctx, qtypeTimeout)
 			defer cancel()
 			conn, err := r.ns.DialContext(qctx, "udp", server.String())
 			if err != nil {
@@ -446,18 +551,27 @@ func (r *resolver) queryOverTunnel(ctx context.Context, server netip.AddrPort, h
 	var out []netip.Addr
 	authoritativeNegatives := 0
 	hadTransportErr := false
+	// Watch ctx.Done so a parent cancellation (caller bailed) returns
+	// promptly rather than waiting for every in-flight goroutine to
+	// notice the cancellation independently. Goroutines still finish
+	// their sends into the buffered ch (cap == len(qtypes), non-blocking)
+	// and exit cleanly — no leak.
 	for range qtypes {
-		res := <-ch
-		if res.err != nil {
-			r.log.Debug("DNS query failed", "server", server, "host", host, "qtype", res.qtype, "err", res.err)
-			if errors.Is(res.err, errDNSAuthoritativeNoData) {
-				authoritativeNegatives++
-			} else {
-				hadTransportErr = true
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case res := <-ch:
+			if res.err != nil {
+				r.log.Debug("DNS query failed", "server", server, "host", host, "qtype", res.qtype, "err", res.err)
+				if errors.Is(res.err, errDNSAuthoritativeNoData) {
+					authoritativeNegatives++
+				} else {
+					hadTransportErr = true
+				}
+				continue
 			}
-			continue
+			out = append(out, res.ips...)
 		}
-		out = append(out, res.ips...)
 	}
 	if len(out) > 0 {
 		return out, nil

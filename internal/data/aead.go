@@ -111,3 +111,15 @@ func (a *AEAD) open(nonce, ciphertext, aad []byte) ([]byte, error) {
 	}
 	return a.aead.Open(nil, nonce, ciphertext, aad)
 }
+
+// openInto decrypts ciphertext (which must include the 16-byte tag at end)
+// and appends the plaintext to dst. When cap(dst) is large enough to hold
+// the result (cap(dst)-len(dst) >= len(ciphertext)-Overhead), no allocation
+// occurs — the AEAD writes directly into the supplied buffer. Caller
+// supplies dst from a sync.Pool to amortise per-packet plaintext storage.
+func (a *AEAD) openInto(dst, nonce, ciphertext, aad []byte) ([]byte, error) {
+	if len(ciphertext) < a.aead.Overhead() {
+		return nil, ErrShortPacket
+	}
+	return a.aead.Open(dst, nonce, ciphertext, aad)
+}

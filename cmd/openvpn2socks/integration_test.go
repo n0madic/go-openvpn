@@ -104,7 +104,12 @@ func startProxy(t *testing.T, authSpec string) (string, func()) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	r := newResolver(ns, cli.PushedOptions().DNS, netip.AddrPort{}, logger)
-	srv := newSOCKS5(ns, r, "", authSpec, 0, logger)
+	srv, err := newSOCKS5(ns, r, "", authSpec, 0, logger)
+	if err != nil {
+		_ = ns.Close()
+		_ = cli.Close()
+		t.Fatalf("newSOCKS5: %v", err)
+	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
