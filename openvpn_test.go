@@ -132,14 +132,14 @@ func TestDecideStallSurrender(t *testing.T) {
 	plainErr := errors.New("plain non-RestartError")
 
 	tests := []struct {
-		name           string
-		lifetime       time.Duration
-		closeErr       error
-		counter        int32
-		maxStalls      int
-		threshold      time.Duration
-		wantCounter    int32
-		wantSurrender  bool
+		name          string
+		lifetime      time.Duration
+		closeErr      error
+		counter       int32
+		maxStalls     int
+		threshold     time.Duration
+		wantCounter   int32
+		wantSurrender bool
 	}{
 		{
 			name:        "feature disabled (maxStalls=0) never surrenders",

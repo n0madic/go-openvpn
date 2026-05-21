@@ -167,15 +167,15 @@ func TestIsProxiableLiteral(t *testing.T) {
 		want bool
 	}{
 		{"1.2.3.4", true},
-		{"127.0.0.1", false},      // loopback
-		{"0.0.0.0", false},        // unspecified
-		{"224.0.0.1", false},      // multicast
-		{"169.254.1.1", false},    // link-local v4
+		{"127.0.0.1", false},   // loopback
+		{"0.0.0.0", false},     // unspecified
+		{"224.0.0.1", false},   // multicast
+		{"169.254.1.1", false}, // link-local v4
 		{"2606:4700:4700::1111", true},
-		{"::1", false},            // loopback v6
-		{"::", false},             // unspecified v6
-		{"fe80::1", false},        // link-local v6
-		{"ff02::1", false},        // link-local multicast v6
+		{"::1", false},     // loopback v6
+		{"::", false},      // unspecified v6
+		{"fe80::1", false}, // link-local v6
+		{"ff02::1", false}, // link-local multicast v6
 	}
 	for _, tc := range cases {
 		t.Run(tc.ip, func(t *testing.T) {

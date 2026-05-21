@@ -16,6 +16,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -204,6 +205,50 @@ func TestRealExitNotify(t *testing.T) {
 	// control message from a client that advertised IV_PROTO_CC_EXIT_NOTIFY.
 	if !waitForServerLog(t, "CC-EEN exit message received", beforeClose, 5*time.Second) {
 		t.Fatal("server did not log CC-EEN exit notification within 5s of Close")
+	}
+}
+
+// TestRealCustomTransport verifies the injectable-transport API end to end:
+// the OpenVPN client runs over a caller-supplied transport (a plain UDP
+// net.Conn wrapped with NewDatagramTransport) instead of the built-in
+// dialer, and the full handshake + ICMP data path still works.
+func TestRealCustomTransport(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var dials int
+	cli, err := openvpn.Dial(ctx, &openvpn.Config{
+		Network:    "udp",
+		RemoteAddr: serverAddr,
+		TLSConfig:  loadTLSConfig(t),
+		TLSCryptV1: loadTLSCrypt(t),
+		DialTransport: func(dctx context.Context, network, addr string) (openvpn.Transport, error) {
+			dials++
+			var d net.Dialer
+			c, err := d.DialContext(dctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return openvpn.NewDatagramTransport(c), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Dial over custom transport: %v", err)
+	}
+	defer cli.Close()
+
+	if dials != 1 {
+		t.Errorf("DialTransport called %d times, want 1", dials)
+	}
+
+	pr := cli.PushedOptions()
+	t.Logf("session up over custom transport: local=%s gw=%s cipher=%s",
+		pr.LocalIP, pr.Gateway, pr.Cipher)
+	if !pr.LocalIP.Is4() || !pr.Gateway.Is4() {
+		t.Skipf("non-IPv4 push reply (%s → %s) — skipping ICMP check", pr.LocalIP, pr.Gateway)
+	}
+	if !roundTripPing(t, cli.Tunnel(), pr, 1, 5*time.Second) {
+		t.Fatal("no ICMP reply within 5s over custom transport")
 	}
 }
 

@@ -30,6 +30,7 @@ import (
 	"github.com/n0madic/go-openvpn/internal/control"
 	"github.com/n0madic/go-openvpn/internal/session"
 	"github.com/n0madic/go-openvpn/internal/trace"
+	"github.com/n0madic/go-openvpn/internal/transport"
 )
 
 // ErrAuthFailed is returned from Dial (and surfaced to the caller without
@@ -98,12 +99,56 @@ var ErrClosed = session.ErrClosed
 // reconnect attempts have failed.
 var ErrReconnectGaveUp = errors.New("openvpn: reconnect failed (max attempts exceeded)")
 
+// Transport is a packet-framed connection to the OpenVPN peer: one
+// ReadPacket yields exactly one OpenVPN protocol packet, one WritePacket
+// sends exactly one. It is the seam for running OpenVPN over a
+// caller-supplied transport — a proxy tunnel, an obfuscation layer, an
+// in-memory pipe — instead of the built-in UDP/TCP dialer.
+//
+// Build a Transport from an existing net.Conn with NewStreamTransport (for
+// stream conns, length-prefix framed) or NewDatagramTransport (for datagram
+// conns), then hand a TransportDialer to Config.DialTransport.
+type Transport = transport.PacketConn
+
+// TransportDialer produces a fresh Transport for each (re)connect. The
+// library calls it once from Dial and once per AutoReconnect cycle, passing
+// the Config's Network and RemoteAddr as hints (either may be empty when
+// DialTransport is set). Returning a freshly-established connection on every
+// call is REQUIRED: AutoReconnect closes the previous Transport and expects
+// a brand-new one, so a closed or reused connection makes reconnect fail.
+// ctx scopes the dial only.
+type TransportDialer func(ctx context.Context, network, addr string) (Transport, error)
+
+// NewStreamTransport adapts a stream-oriented net.Conn (a proxied TCP
+// connection, a TLS conn — anything with reliable, in-order byte delivery)
+// into a Transport. Each packet is framed with a 16-bit big-endian length
+// prefix, the same framing OpenVPN uses for `proto tcp`. The returned
+// Transport takes ownership of c and closes it on Close.
+func NewStreamTransport(c net.Conn) Transport { return transport.NewTCP(c) }
+
+// NewDatagramTransport adapts a datagram-oriented net.Conn (one Read = one
+// datagram: a connected UDP socket, a proxied UDP association) into a
+// Transport. Each ReadPacket returns one datagram unchanged. The returned
+// Transport takes ownership of c and closes it on Close.
+func NewDatagramTransport(c net.Conn) Transport { return transport.NewDatagram(c) }
+
 // Config holds Dial parameters.
 type Config struct {
-	// Network is the underlying transport: "udp", "udp4", "udp6", "tcp", "tcp4", "tcp6".
+	// Network is the underlying transport: "udp", "udp4", "udp6", "tcp",
+	// "tcp4", "tcp6". When DialTransport is set it is only a hint passed
+	// through to the factory and may be empty.
 	Network string
-	// RemoteAddr is host:port.
+	// RemoteAddr is host:port. When DialTransport is set it is only a hint
+	// passed through to the factory and may be empty.
 	RemoteAddr string
+
+	// DialTransport, when non-nil, overrides the built-in UDP/TCP dialer:
+	// the library calls it to obtain the underlying Transport instead of
+	// dialing a socket itself. This is the seam for running OpenVPN over a
+	// proxy, an obfuscation layer, or any caller-controlled net.Conn —
+	// Network and RemoteAddr become optional hints. See TransportDialer for
+	// the per-(re)connect contract.
+	DialTransport TransportDialer
 
 	// TLSConfig is used for the inner TLS 1.2/1.3 session.
 	// At minimum: ServerName + RootCAs. For mTLS, also Certificates.
@@ -527,7 +572,7 @@ func Dial(ctx context.Context, cfg *Config) (*Client, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 
-	s, err := session.Dial(ctx, sessionCfg(cfg))
+	s, err := dialSession(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -587,6 +632,31 @@ func sessionCfg(cfg *Config) session.Config {
 		HandshakeTracer:  cfg.HandshakeTracer,
 		Logger:           cfg.Logger,
 	}
+}
+
+// dialSession brings up one internal session, honouring a caller-supplied
+// Config.DialTransport when present. It is the single dial entry point
+// shared by Dial and the AutoReconnect path, so a custom transport is
+// re-created on every reconnect cycle. ctx scopes the handshake.
+func dialSession(ctx context.Context, cfg *Config) (*session.Session, error) {
+	scfg := sessionCfg(cfg)
+	if cfg.DialTransport == nil {
+		return session.Dial(ctx, scfg)
+	}
+	tr, err := cfg.DialTransport(ctx, cfg.Network, cfg.RemoteAddr)
+	if err != nil {
+		return nil, fmt.Errorf("openvpn: custom transport dial: %w", err)
+	}
+	if tr == nil {
+		return nil, errors.New("openvpn: DialTransport returned a nil Transport")
+	}
+	s, err := session.DialWithTransport(ctx, scfg, tr)
+	if err != nil {
+		// DialWithTransport contract: on error the caller owns the transport.
+		_ = tr.Close()
+		return nil, err
+	}
+	return s, nil
 }
 
 // session returns the currently-active session (atomic-snapshot).
@@ -714,7 +784,7 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 			dialCtx, dialCancel := context.WithCancel(c.ctx)
 			defer dialCancel()
 			stopWatch := make(chan struct{})
-			// Defer the close in case session.Dial panics — the watcher
+			// Defer the close in case the dial panics — the watcher
 			// goroutine would otherwise leak until c.ctx fires.
 			defer func() {
 				select {
@@ -730,7 +800,7 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 				case <-stopWatch:
 				}
 			}()
-			return session.Dial(dialCtx, sessionCfg(c.cfg))
+			return dialSession(dialCtx, c.cfg)
 		}()
 
 		if err != nil && errors.Is(err, ErrAuthFailed) {

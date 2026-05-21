@@ -9,6 +9,7 @@ TCP/IP stacks (gVisor netstack, Tailscale-style).
 | Capability | Status |
 |---|---|
 | UDP / TCP transport (16-bit BE length-prefix on TCP) | ✅ |
+| Injectable transport (`Config.DialTransport`) — run OpenVPN over a proxy / obfuscation layer / any `net.Conn` | ✅ |
 | Modern wire protocol (P_CONTROL_V1, P_ACK_V1, P_DATA_V2, hard/soft reset) | ✅ |
 | tls-crypt v1 (AES-256-CTR + HMAC-SHA256 control channel encryption) | ✅ |
 | tls-crypt-v2 (per-client wrapped key, P_CONTROL_HARD_RESET_CLIENT_V3) | ✅ |
@@ -131,6 +132,40 @@ resp, _ := httpClient.Get("http://10.8.0.1:8080/")
 The netstack package lives in its own Go module so the core library does not
 pull gVisor into its dependency graph. A runnable CLI demo is at
 `examples/netstack-http/`.
+
+### Custom transport (proxy chaining, obfuscation)
+
+By default the library dials the underlying UDP/TCP socket itself. Set
+`Config.DialTransport` to run OpenVPN over a transport you control instead —
+a proxy tunnel, an obfuscation layer, or any pre-established `net.Conn`:
+
+```go
+import (
+    "golang.org/x/net/proxy"
+    "github.com/n0madic/go-openvpn"
+)
+
+dialer, _ := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, proxy.Direct)
+
+cli, err := openvpn.Dial(ctx, &openvpn.Config{
+    Network:    "tcp",
+    RemoteAddr: "vpn.example:443",
+    TLSConfig:  tlsCfg,
+    TLSCryptV1: tlsCryptStaticKeyBytes,
+    DialTransport: func(ctx context.Context, network, addr string) (openvpn.Transport, error) {
+        c, err := dialer.Dial("tcp", addr) // OpenVPN-over-SOCKS5
+        if err != nil { return nil, err }
+        return openvpn.NewStreamTransport(c), nil
+    },
+})
+```
+
+`NewStreamTransport` frames packets for a stream `net.Conn` (the OpenVPN
+`proto tcp` 16-bit length prefix); `NewDatagramTransport` wraps a datagram
+`net.Conn` (one read = one packet). The factory is called once per
+(re)connect — it **must return a fresh connection each call** so
+`AutoReconnect` can replace a dead transport. `Network`/`RemoteAddr` are
+passed through as hints and may be left empty.
 
 ## Architecture
 

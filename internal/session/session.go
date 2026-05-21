@@ -246,8 +246,16 @@ type Session struct {
 	closed atomic.Bool
 }
 
-// Dial brings up the session.
+// Dial brings up the session, dialing the underlying UDP/TCP transport
+// itself. Callers that supply their own transport use DialWithTransport,
+// which does not require Network/RemoteAddr.
 func Dial(ctx context.Context, cfg Config) (*Session, error) {
+	if cfg.Network == "" {
+		return nil, errors.New("session: Network required")
+	}
+	if cfg.RemoteAddr == "" {
+		return nil, errors.New("session: RemoteAddr required")
+	}
 	tr, err := transport.Dial(ctx, cfg.Network, cfg.RemoteAddr)
 	if err != nil {
 		return nil, fmt.Errorf("session: dial transport: %w", err)
@@ -1296,13 +1304,11 @@ func (s *Session) tickLoop(layer *reliable.Layer) {
 
 // --- helpers ---
 
+// validateConfig checks the requirements common to every entry point.
+// Network/RemoteAddr are intentionally NOT checked here — they are only
+// needed by Dial's built-in transport dial and are validated there, so
+// DialWithTransport (and the injected-transport path) work without them.
 func validateConfig(cfg *Config) error {
-	if cfg.Network == "" {
-		return errors.New("session: Network required")
-	}
-	if cfg.RemoteAddr == "" {
-		return errors.New("session: RemoteAddr required")
-	}
 	if cfg.TLSConfig == nil {
 		return errors.New("session: TLSConfig required")
 	}

@@ -307,8 +307,8 @@ func TestDecideActivityStall(t *testing.T) {
 		{
 			// Session is sending TCP but has never received any TCP
 			// at all. Age past threshold ⇒ definitely stuck.
-			name:       "tcp never received and age past threshold",
-			lastOut:    -1, lastIn: -1,
+			name:    "tcp never received and age past threshold",
+			lastOut: -1, lastIn: -1,
 			lastTCPOut: 1 * time.Second, lastTCPIn: -1,
 			lastUDPOut: -1, lastUDPIn: -1,
 			age:        90 * time.Second,
@@ -317,8 +317,8 @@ func TestDecideActivityStall(t *testing.T) {
 		{
 			// Same as above but session is still young — sinceIn
 			// (= age) hasn't reached the threshold yet, so we wait.
-			name:       "tcp never received but still within threshold age",
-			lastOut:    -1, lastIn: -1,
+			name:    "tcp never received but still within threshold age",
+			lastOut: -1, lastIn: -1,
 			lastTCPOut: 1 * time.Second, lastTCPIn: -1,
 			lastUDPOut: -1, lastUDPIn: -1,
 			age:        5 * time.Second,
@@ -327,8 +327,8 @@ func TestDecideActivityStall(t *testing.T) {
 		{
 			// Outbound is stale: user stopped sending. Even if
 			// inbound is silent we don't fire — they're idle.
-			name:       "user idle on tcp, inbound stale",
-			lastOut:    -1, lastIn: -1,
+			name:    "user idle on tcp, inbound stale",
+			lastOut: -1, lastIn: -1,
 			lastTCPOut: 60 * time.Second, lastTCPIn: 60 * time.Second,
 			lastUDPOut: -1, lastUDPIn: -1,
 			age:        120 * time.Second,

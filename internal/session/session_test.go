@@ -41,6 +41,67 @@ func TestFirstPingChaCha20(t *testing.T) { runPingWithCipher(t, "CHACHA20-POLY13
 // TestFirstPingAES128GCM exercises the smaller-key AEAD variant.
 func TestFirstPingAES128GCM(t *testing.T) { runPingWithCipher(t, "AES-128-GCM") }
 
+// TestDialWithTransportNoNetworkHint verifies that DialWithTransport works
+// when Network and RemoteAddr are empty. That is the injected-transport
+// case: those fields are only hints to a caller-supplied TransportDialer and
+// the session never dials a socket itself, so validateConfig must not
+// require them.
+func TestDialWithTransportNoNetworkHint(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	var staticKey [tlscrypt.StaticKeyLen]byte
+	if _, err := rand.Read(staticKey[:]); err != nil {
+		t.Fatal(err)
+	}
+	serverWrap, err := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cTr, sTr := transport.MemoryPair()
+	cert, pool := genSelfSignedCert(t)
+
+	const peerID = uint32(7)
+	go func() {
+		_ = runServerWithDataEcho(ctx, sTr, serverWrap, cert, peerID, "AES-256-GCM", t)
+	}()
+
+	// Network and RemoteAddr deliberately left empty.
+	sess, err := session.DialWithTransport(ctx, session.Config{
+		TLSConfig:  &tls.Config{ServerName: "localhost", RootCAs: pool, MinVersion: tls.VersionTLS13},
+		TLSCryptV1: staticKey[:],
+		Ciphers:    []string{"AES-256-GCM"},
+	}, cTr)
+	if err != nil {
+		t.Fatalf("DialWithTransport with empty Network/RemoteAddr: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	payload := []byte("ping over injected transport")
+	if _, err := sess.Write(payload); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	buf := make([]byte, 1500)
+	done := make(chan error, 1)
+	go func() {
+		n, err := sess.Read(buf)
+		if err == nil && !bytes.Equal(buf[:n], payload) {
+			err = fmt.Errorf("echo mismatch: got %q", buf[:n])
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("read timed out")
+	}
+}
+
 // TestServerRESTART verifies that when the server sends a RESTART control
 // message after handshake, the client surfaces it as openvpn.RestartError
 // from Read/Write.

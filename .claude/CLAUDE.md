@@ -154,6 +154,21 @@ internal/session         Orchestrator. Goroutines per active session
   values are reflected.
 - `Client.Close()` — sends `EXIT\0` over the control channel
   (explicit-exit-notify) and waits for the reliable layer to drain it.
+- `Config.DialTransport TransportDialer` — optional injectable transport.
+  When non-nil the library calls it instead of dialing a UDP/TCP socket
+  itself, so OpenVPN can run over a proxy / obfuscation layer / any
+  caller-controlled `net.Conn`. `openvpn.Transport` is a type alias for the
+  internal `transport.PacketConn`; build one from a `net.Conn` with
+  `NewStreamTransport` (16-bit BE length-prefix framing, `proto tcp`) or
+  `NewDatagramTransport` (one read = one packet). The factory is invoked by
+  the single internal helper `dialSession` — shared by `Dial` and the
+  `reconnect` path — so it is called once per (re)connect and **must return
+  a fresh connection each call**; `AutoReconnect` closes the previous
+  transport and expects a brand-new one. `Network`/`RemoteAddr` become
+  optional hints (validation of them moved out of `session.validateConfig`
+  into `session.Dial`, so `DialWithTransport` accepts them empty). On a
+  factory error or a nil return `dialSession` wraps/reports it; on a
+  handshake failure it closes the transport (DialWithTransport contract).
 - `Config.AutoReconnect` + `ReconnectMaxAttempts` + `ReconnectMaxInterval`
   — when set, server `RESTART` is absorbed without surfacing to the user.
   When AutoReconnect is on, `Dial` also spawns a background
