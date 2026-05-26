@@ -197,6 +197,8 @@ type parseState struct {
 	tlsCrypt []byte
 	tlsCV2   []byte
 
+	scramble *openvpn.ScrambleConfig
+
 	// inlineBytesTotal tracks cumulative bytes consumed by inline blocks
 	// across the whole file (bounded by MaxInlineBytesTotal).
 	inlineBytesTotal int
@@ -458,6 +460,10 @@ func (s *parseState) handleDirective(name string, args []string, line int) error
 		// rest are handshake-only/keep-alive overrides that the server's
 		// PUSH_REPLY ultimately drives.
 
+	// ---- non-standard obfuscation (OpenVPN forks: Tunnelblick, OPNsense, ...) ----
+	case "scramble":
+		return s.setScramble(args)
+
 	// ---- auth ----
 	case "auth-user-pass":
 		s.authUserPass = true
@@ -706,6 +712,38 @@ func (s *parseState) loadTLSCryptFile(args []string, v2 bool) error {
 	return nil
 }
 
+// setScramble parses the non-standard `scramble <mode> [secret]`
+// directive shipped by community OpenVPN forks (Tunnelblick,
+// clayface/openvpn_xorpatch, OPNsense, ...).
+func (s *parseState) setScramble(args []string) error {
+	if len(args) == 0 {
+		return errors.New("scramble: mode required (xormask|xorptrpos|reverse|obfuscate)")
+	}
+	var sc openvpn.ScrambleConfig
+	switch args[0] {
+	case "xormask":
+		if len(args) < 2 || args[1] == "" {
+			return errors.New("scramble xormask: secret required")
+		}
+		sc.Mode = openvpn.ScrambleXorMask
+		sc.Key = []byte(args[1])
+	case "obfuscate":
+		if len(args) < 2 || args[1] == "" {
+			return errors.New("scramble obfuscate: secret required")
+		}
+		sc.Mode = openvpn.ScrambleObfuscate
+		sc.Key = []byte(args[1])
+	case "xorptrpos":
+		sc.Mode = openvpn.ScrambleXorPtrPos
+	case "reverse":
+		sc.Mode = openvpn.ScrambleReverse
+	default:
+		return fmt.Errorf("scramble: unknown mode %q (want xormask|xorptrpos|reverse|obfuscate)", args[0])
+	}
+	s.scramble = &sc
+	return nil
+}
+
 func (s *parseState) resolvePath(p string) string {
 	if filepath.IsAbs(p) {
 		return p
@@ -848,6 +886,7 @@ func (s *parseState) finalize() (*Parsed, error) {
 		Reneg:      s.reneg,
 		Username:   s.opt.Username,
 		Password:   s.opt.Password,
+		Scramble:   s.scramble,
 	}
 
 	return &Parsed{

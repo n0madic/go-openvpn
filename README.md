@@ -34,6 +34,7 @@ TCP/IP stacks (gVisor netstack, Tailscale-style).
 | `.ovpn` profile parser (`pkg/ovpn`) — converts standard OpenVPN config files into `*openvpn.Config` | ✅ |
 | Real-world tested: connects to ProtonVPN servers (AES-256-GCM, tls-crypt v1, auth-user-pass, no client cert) | ✅ |
 | Local SOCKS5 proxy CLI (`cmd/openvpn2socks/`) — CONNECT + UDP ASSOCIATE, tunnel DNS, no root | ✅ |
+| Non-standard `scramble` obfuscation (xormask / xorptrpos / reverse / obfuscate) — clayface/Tunnelblick xorpatch compatible | ✅ |
 | Compression (comp-lzo / lz4) | ❌ intentional — modern config (`--compress` rejected) |
 | Static-key mode (no TLS) | ❌ intentional — only TLS+NCP path supported |
 | Legacy CBC+HMAC data channel | ❌ intentional — AEAD only |
@@ -166,6 +167,31 @@ cli, err := openvpn.Dial(ctx, &openvpn.Config{
 (re)connect — it **must return a fresh connection each call** so
 `AutoReconnect` can replace a dead transport. `Network`/`RemoteAddr` are
 passed through as hints and may be left empty.
+
+### Non-standard `scramble` obfuscation (xorpatch)
+
+Community OpenVPN forks (Tunnelblick, clayface/openvpn_xorpatch, OPNsense)
+ship a `scramble <mode> [secret]` directive that XORs / permutes every
+wire packet — including the very first hard-reset — for DPI evasion.
+All four modes are supported and bit-for-bit compatible with the
+canonical patch:
+
+```go
+cli, err := openvpn.Dial(ctx, &openvpn.Config{
+    Network: "udp", RemoteAddr: "vpn.example:1194",
+    TLSConfig: tlsCfg, TLSCryptV1: tlsCryptStaticKeyBytes,
+    Scramble: &openvpn.ScrambleConfig{
+        Mode: openvpn.ScrambleObfuscate,
+        Key:  []byte("mysecret"),
+    },
+})
+```
+
+`pkg/ovpn` reads the directive directly from a `.ovpn` profile — no
+extra wiring is needed. Modes `xormask` and `obfuscate` require a
+shared secret; `xorptrpos` and `reverse` take no key. The transform
+sits below the OpenVPN protocol, composes with `DialTransport` (it
+wraps whatever the factory returns), and survives `AutoReconnect`.
 
 ## Architecture
 

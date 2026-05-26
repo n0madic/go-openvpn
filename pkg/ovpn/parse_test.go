@@ -3,6 +3,7 @@
 package ovpn
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -18,6 +19,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	openvpn "github.com/n0madic/go-openvpn"
 )
 
 func TestParseMinimal(t *testing.T) {
@@ -465,3 +468,123 @@ aeb893d9a96d1f15519bb3c4dcb40ee3
 
 // Ensure compile-time access (currently unused but useful for future tests).
 var _ = errors.New
+
+// scrambleConfigSrc builds a minimal-but-valid .ovpn config that adds
+// the supplied `scramble` directive line. The other directives are kept
+// to the bare minimum the parser accepts.
+func scrambleConfigSrc(scrambleLine string) string {
+	return `client
+dev tun
+proto udp
+remote vpn.example 1194
+verify-x509-name test-server name
+` + scrambleLine + `
+<tls-crypt>` + tlsCryptInline() + `</tls-crypt>
+`
+}
+
+func TestParseScrambleObfuscate(t *testing.T) {
+	t.Parallel()
+	p, err := Parse(strings.NewReader(scrambleConfigSrc("scramble obfuscate mysecret")), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.Config.Scramble == nil {
+		t.Fatal("Scramble nil, want populated")
+	}
+	if p.Config.Scramble.Mode != openvpn.ScrambleObfuscate {
+		t.Errorf("Mode=%v, want ScrambleObfuscate", p.Config.Scramble.Mode)
+	}
+	if !bytes.Equal(p.Config.Scramble.Key, []byte("mysecret")) {
+		t.Errorf("Key=%q, want %q", p.Config.Scramble.Key, "mysecret")
+	}
+}
+
+func TestParseScrambleXormask(t *testing.T) {
+	t.Parallel()
+	p, err := Parse(strings.NewReader(scrambleConfigSrc("scramble xormask hunter2")), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.Config.Scramble == nil {
+		t.Fatal("Scramble nil, want populated")
+	}
+	if p.Config.Scramble.Mode != openvpn.ScrambleXorMask {
+		t.Errorf("Mode=%v, want ScrambleXorMask", p.Config.Scramble.Mode)
+	}
+	if !bytes.Equal(p.Config.Scramble.Key, []byte("hunter2")) {
+		t.Errorf("Key=%q, want %q", p.Config.Scramble.Key, "hunter2")
+	}
+}
+
+func TestParseScrambleXorPtrPos(t *testing.T) {
+	t.Parallel()
+	p, err := Parse(strings.NewReader(scrambleConfigSrc("scramble xorptrpos")), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.Config.Scramble == nil {
+		t.Fatal("Scramble nil, want populated")
+	}
+	if p.Config.Scramble.Mode != openvpn.ScrambleXorPtrPos {
+		t.Errorf("Mode=%v, want ScrambleXorPtrPos", p.Config.Scramble.Mode)
+	}
+	if len(p.Config.Scramble.Key) != 0 {
+		t.Errorf("Key=%q, want empty for xorptrpos", p.Config.Scramble.Key)
+	}
+}
+
+func TestParseScrambleReverse(t *testing.T) {
+	t.Parallel()
+	p, err := Parse(strings.NewReader(scrambleConfigSrc("scramble reverse")), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.Config.Scramble == nil {
+		t.Fatal("Scramble nil, want populated")
+	}
+	if p.Config.Scramble.Mode != openvpn.ScrambleReverse {
+		t.Errorf("Mode=%v, want ScrambleReverse", p.Config.Scramble.Mode)
+	}
+	if len(p.Config.Scramble.Key) != 0 {
+		t.Errorf("Key=%q, want empty for reverse", p.Config.Scramble.Key)
+	}
+}
+
+func TestParseScrambleErrors(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		directive   string
+		wantContain string
+	}{
+		{"missing mode", "scramble", "mode required"},
+		{"obfuscate without secret", "scramble obfuscate", "secret required"},
+		{"xormask without secret", "scramble xormask", "secret required"},
+		{"unknown mode", "scramble bogus mysecret", "unknown mode"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Parse(strings.NewReader(scrambleConfigSrc(tc.directive)), nil)
+			if err == nil {
+				t.Fatalf("Parse: nil error, want error containing %q", tc.wantContain)
+			}
+			if !strings.Contains(err.Error(), tc.wantContain) {
+				t.Fatalf("err=%q, want substring %q", err, tc.wantContain)
+			}
+		})
+	}
+}
+
+func TestParseScrambleAbsent(t *testing.T) {
+	t.Parallel()
+	// scrambleConfigSrc with an empty extra line — no scramble directive.
+	p, err := Parse(strings.NewReader(scrambleConfigSrc("")), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.Config.Scramble != nil {
+		t.Errorf("Scramble=%+v, want nil", p.Config.Scramble)
+	}
+}

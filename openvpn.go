@@ -119,6 +119,37 @@ type Transport = transport.PacketConn
 // ctx scopes the dial only.
 type TransportDialer func(ctx context.Context, network, addr string) (Transport, error)
 
+// ScrambleMode selects a non-standard per-packet XOR / permutation layer
+// applied to every wire packet. Compatible with the de-facto
+// clayface/openvpn_xorpatch algorithm used by Tunnelblick, OPNsense and
+// similar OpenVPN forks. See Config.Scramble.
+type ScrambleMode = transport.ScrambleMode
+
+// Scramble mode constants. ScrambleXorMask and ScrambleObfuscate require
+// a non-empty Key; ScrambleXorPtrPos and ScrambleReverse ignore Key.
+const (
+	ScrambleXorMask   = transport.ScrambleXorMask
+	ScrambleXorPtrPos = transport.ScrambleXorPtrPos
+	ScrambleReverse   = transport.ScrambleReverse
+	ScrambleObfuscate = transport.ScrambleObfuscate
+)
+
+// ScrambleConfig describes the per-packet obfuscation layer to apply to
+// every wire packet of an OpenVPN session, matching the .ovpn
+// `scramble <mode> [secret]` directive shipped by community OpenVPN
+// forks. The transform sits below the OpenVPN protocol, so it covers
+// both the control channel (TLS-encapsulated handshake) and the data
+// channel — starting with the very first
+// P_CONTROL_HARD_RESET_CLIENT_V2.
+type ScrambleConfig struct {
+	// Mode selects the algorithm. Must be one of ScrambleXorMask,
+	// ScrambleXorPtrPos, ScrambleReverse, ScrambleObfuscate.
+	Mode ScrambleMode
+	// Key is the shared secret for Mode == ScrambleXorMask or
+	// ScrambleObfuscate. Ignored for other modes.
+	Key []byte
+}
+
 // NewStreamTransport adapts a stream-oriented net.Conn (a proxied TCP
 // connection, a TLS conn — anything with reliable, in-order byte delivery)
 // into a Transport. Each packet is framed with a 16-bit big-endian length
@@ -149,6 +180,16 @@ type Config struct {
 	// Network and RemoteAddr become optional hints. See TransportDialer for
 	// the per-(re)connect contract.
 	DialTransport TransportDialer
+
+	// Scramble, when non-nil, applies a non-standard per-packet XOR /
+	// permutation layer to every wire packet (control- and data-channel
+	// alike). Compatible with the de-facto clayface/openvpn_xorpatch
+	// algorithm used by Tunnelblick, OPNsense and similar forks. The
+	// pkg/ovpn parser fills this field from the `scramble <mode>
+	// [secret]` directive. Composes with DialTransport: when both are
+	// set, the scramble layer wraps whatever Transport DialTransport
+	// returns.
+	Scramble *ScrambleConfig
 
 	// TLSConfig is used for the inner TLS 1.2/1.3 session.
 	// At minimum: ServerName + RootCAs. For mTLS, also Certificates.
@@ -567,6 +608,9 @@ func Dial(ctx context.Context, cfg *Config) (*Client, error) {
 	if cfg == nil {
 		return nil, errInvalidConfig
 	}
+	if err := validateScramble(cfg.Scramble); err != nil {
+		return nil, err
+	}
 	log := cfg.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -634,21 +678,63 @@ func sessionCfg(cfg *Config) session.Config {
 	}
 }
 
+// validateScramble checks Config.Scramble for the well-formedness
+// constraints that NewScramble (and the parser) silently rely on. It is
+// called from Dial so users see a clear error before any socket is
+// opened.
+func validateScramble(sc *ScrambleConfig) error {
+	if sc == nil {
+		return nil
+	}
+	switch sc.Mode {
+	case ScrambleXorMask, ScrambleObfuscate:
+		if len(sc.Key) == 0 {
+			return fmt.Errorf("openvpn: Scramble.Key required for mode %v", sc.Mode)
+		}
+	case ScrambleXorPtrPos, ScrambleReverse:
+		// Key is ignored; allow it to be set so callers building
+		// from .ovpn don't have to clear it.
+	default:
+		return fmt.Errorf("openvpn: invalid Scramble.Mode %v", sc.Mode)
+	}
+	return nil
+}
+
 // dialSession brings up one internal session, honouring a caller-supplied
 // Config.DialTransport when present. It is the single dial entry point
 // shared by Dial and the AutoReconnect path, so a custom transport is
-// re-created on every reconnect cycle. ctx scopes the handshake.
+// re-created on every reconnect cycle. When Config.Scramble is non-nil
+// the transport — whether built-in UDP/TCP or returned from
+// DialTransport — is wrapped with the configured per-packet obfuscation
+// layer. ctx scopes the handshake.
 func dialSession(ctx context.Context, cfg *Config) (*session.Session, error) {
 	scfg := sessionCfg(cfg)
-	if cfg.DialTransport == nil {
-		return session.Dial(ctx, scfg)
+	var (
+		tr  transport.PacketConn
+		err error
+	)
+	if cfg.DialTransport != nil {
+		tr, err = cfg.DialTransport(ctx, cfg.Network, cfg.RemoteAddr)
+		if err != nil {
+			return nil, fmt.Errorf("openvpn: custom transport dial: %w", err)
+		}
+		if tr == nil {
+			return nil, errors.New("openvpn: DialTransport returned a nil Transport")
+		}
+	} else {
+		if cfg.Network == "" {
+			return nil, errors.New("openvpn: Network required")
+		}
+		if cfg.RemoteAddr == "" {
+			return nil, errors.New("openvpn: RemoteAddr required")
+		}
+		tr, err = transport.Dial(ctx, cfg.Network, cfg.RemoteAddr)
+		if err != nil {
+			return nil, fmt.Errorf("openvpn: dial transport: %w", err)
+		}
 	}
-	tr, err := cfg.DialTransport(ctx, cfg.Network, cfg.RemoteAddr)
-	if err != nil {
-		return nil, fmt.Errorf("openvpn: custom transport dial: %w", err)
-	}
-	if tr == nil {
-		return nil, errors.New("openvpn: DialTransport returned a nil Transport")
+	if cfg.Scramble != nil {
+		tr = transport.NewScramble(tr, cfg.Scramble.Mode, cfg.Scramble.Key)
 	}
 	s, err := session.DialWithTransport(ctx, scfg, tr)
 	if err != nil {
