@@ -1,6 +1,7 @@
 cmd/openvpn2socks/openvpn2socks
 examples/netstack-http/netstack-http
 *PLAN*
+*.auth
 *.ovpn
 *.log
 bench-artifacts
