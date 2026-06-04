@@ -96,37 +96,20 @@ internal/workers         Tiny lifecycle manager for the session's
                          internal/session so all of its goroutines share
                          one ctx + WaitGroup with uniform observability.
 internal/session         Orchestrator. Goroutines per active session
-                         (all managed by workers.Manager — named for
-                         logs, recovered on panic, cancelled together):
-                         readLoop (demuxes incoming by opcode+key-id;
-                         on transport-level read error before s.ctx is
-                         cancelled, it setCloseErr's a *RestartError and
-                         spawns closeAsync so AutoReconnect picks the
-                         failure up — without this the socket-died-but-
-                         no-watch-fired post-suspend path leaves the
-                         tunnel frozen with closeErr=nil),
-                         writeLoop + tickLoop (per reliable.Layer, so 2 per
-                         key-id), rekeyWatch (rekey trigger watchdog),
-                         controlChannelReader (post-handshake RESTART/EXIT/
-                         INFO dispatcher), keepaliveLoop (sends PING magic
-                         every PushReply.PingInterval), pingRestartWatch
-                         (closes session with *RestartError after
-                         PushReply.PingRestart of inbound silence),
-                         dataActivityWatch (second-tier liveness watchdog
-                         that fires when the user is actively sending but
-                         no real non-PING inbound data arrives — closes
-                         the "tunnel alive but data path stuck" failure
-                         mode that pingRestartWatch alone misses),
-                         hardResetWatch (closes with *RestartError when
-                         the server keeps sending P_CONTROL_HARD_RESET_
-                         SERVER_V2 — the server explicitly saying "I
-                         lost your session, re-handshake"; typical
-                         after-laptop-sleep aftermath),
-                         wakeDetectorWatch (notices a wall-clock jump
-                         > 10s as evidence the host suspended, forces
-                         AutoReconnect immediately instead of waiting
-                         on pingRestart to time out on stale keys),
-                         statsLogger (periodic packet-flow counter dump).
+                         (all via workers.Manager — named, panic-
+                         recovered, cancelled together):
+                         readLoop (demuxes by opcode+key-id; on a
+                         transport read error before s.ctx is cancelled
+                         it setCloseErr's a *RestartError + spawns
+                         closeAsync so AutoReconnect catches the socket-
+                         died-but-no-watch-fired post-suspend path, else
+                         closeErr=nil freezes the tunnel),
+                         writeLoop + tickLoop (per reliable.Layer, 2 per
+                         key-id), rekeyWatch, controlChannelReader
+                         (post-handshake RESTART/EXIT/INFO dispatcher),
+                         keepaliveLoop, pingRestartWatch, dataActivityWatch,
+                         hardResetWatch, wakeDetectorWatch, statsLogger
+                         (each watchdog's contract is in points 7-11).
                          Holds per-key-id slot + layer tables for rekey
                          transition windows.
 ```
@@ -155,59 +138,49 @@ internal/session         Orchestrator. Goroutines per active session
 - `Client.Close()` — sends `EXIT\0` over the control channel
   (explicit-exit-notify) and waits for the reliable layer to drain it.
 - `Config.DialTransport TransportDialer` — optional injectable transport.
-  When non-nil the library calls it instead of dialing a UDP/TCP socket
-  itself, so OpenVPN can run over a proxy / obfuscation layer / any
-  caller-controlled `net.Conn`. `openvpn.Transport` is a type alias for the
-  internal `transport.PacketConn`; build one from a `net.Conn` with
-  `NewStreamTransport` (16-bit BE length-prefix framing, `proto tcp`) or
-  `NewDatagramTransport` (one read = one packet). The factory is invoked by
-  the single internal helper `dialSession` — shared by `Dial` and the
-  `reconnect` path — so it is called once per (re)connect and **must return
-  a fresh connection each call**; `AutoReconnect` closes the previous
-  transport and expects a brand-new one. `Network`/`RemoteAddr` become
-  optional hints (validation of them moved out of `session.validateConfig`
-  into `session.Dial`, so `DialWithTransport` accepts them empty). On a
-  factory error or a nil return `dialSession` wraps/reports it; on a
-  handshake failure it closes the transport (DialWithTransport contract).
+  When non-nil the library calls it instead of dialing a UDP/TCP socket, so
+  OpenVPN runs over a proxy / obfuscation layer / any caller-controlled
+  `net.Conn`. `openvpn.Transport` aliases the internal `transport.PacketConn`;
+  build one from a `net.Conn` with `NewStreamTransport` (16-bit BE length-
+  prefix framing, `proto tcp`) or `NewDatagramTransport` (one read = one
+  packet). The factory is invoked by the internal helper `dialSession`
+  (shared by `Dial` + `reconnect`), so it runs once per (re)connect and
+  **must return a fresh connection each call** — `AutoReconnect` closes the
+  previous transport and expects a brand-new one. `Network`/`RemoteAddr`
+  become optional hints (validation moved from `session.validateConfig` to
+  `session.Dial`, so `DialWithTransport` accepts them empty). On factory
+  error or nil return `dialSession` wraps/reports it; on handshake failure
+  it closes the transport (DialWithTransport contract).
 - `Config.AutoReconnect` + `ReconnectMaxAttempts` + `ReconnectMaxInterval`
   — when set, server `RESTART` is absorbed without surfacing to the user.
-  When AutoReconnect is on, `Dial` also spawns a background
-  `sessionWatcher` goroutine that polls `s.CloseErr()` every
-  `sessionWatchPeriod=500ms` and initiates reconnect on a `*RestartError`
-  WITHOUT requiring `Tunnel.Read`/`Tunnel.Write` to observe the error.
-  This matters: in netstack mode the data path runs through
-  `SetIngressHandler` and nobody sits in `Tunnel.Read`. If the host
-  suspends, `wakeDetectorWatch` closes the session with a RestartError —
-  but with no Read/Write caller to consume the error and no apps writing
-  outbound (gVisor TCP has long since timed out, apps haven't retried
-  yet), the zombie state persists until manual intervention. The
-  watcher is the second pair of hands that picks up RestartError on
-  behalf of the netstack-shaped consumer. It exits on terminal errors
-  (`ErrAuthFailed`, `ErrReconnectGaveUp`, `ErrClosed`, `ctx.Canceled`)
-  or when the session closes for a non-restart reason. `reconnectMu`
-  serialises with the `Tunnel.Read/Write` reconnect path so they don't
-  step on each other; whichever wins, the other sees `c.session() !=
-  failed` and returns nil.
+  `Dial` also spawns a background `sessionWatcher` that polls `s.CloseErr()`
+  every `sessionWatchPeriod=500ms` and reconnects on a `*RestartError`
+  WITHOUT needing `Tunnel.Read`/`Write` to observe it. This matters in
+  netstack mode: the data path runs through `SetIngressHandler`, nobody
+  sits in `Tunnel.Read`, so a `wakeDetectorWatch` RestartError after suspend
+  would otherwise sit unconsumed (gVisor TCP timed out, apps not yet
+  retrying) and zombie until manual intervention. The watcher exits on
+  terminal errors (`ErrAuthFailed`, `ErrReconnectGaveUp`, `ErrClosed`,
+  `ctx.Canceled`) or a non-restart close. `reconnectMu` serialises it with
+  the `Tunnel.Read/Write` reconnect path; whichever wins, the other sees
+  `c.session() != failed` and returns nil.
 - `Client.RequestRestart(reason string)` — application-level escape hatch
   that forces the current session to close with a `*RestartError` so
   `AutoReconnect` re-dials. Useful for external monitoring / manual
   session refresh / tests. The Tunnel handle survives — blocked Reads
   resume on the new session.
-- `Client.OnReconnect(fn func(PushReply)) (detach func())` — register a
-  callback fired every time AutoReconnect installs a fresh session.
-  **Critical** for anything that caches a tunnel-IP-dependent value:
-  gVisor NIC address, bound sockets, host routes. The server assigns a
-  *new* `LocalIP` per session (and may also change Gateway / Routes /
-  MTU), so failing to refresh those state means post-reconnect packets
-  carry the OLD source IP and the server silently drops them — that's
-  the long-running "tunnel works for a bit, reconnects, then nothing
-  works forever" zombie-loop bug we hit. **Always call the returned
-  detach func from your Close path** if the hook's target lifetime is
-  shorter than the Client — otherwise the closure keeps that target
-  alive past its useful life and may dereference fields that have
-  already been torn down. `pkg/netstack/netstack.go::Net.New` registers
-  itself via this hook so the gVisor NIC stays in sync automatically;
-  `Net.Close` invokes the detach.
+- `Client.OnReconnect(fn func(PushReply)) (detach func())` — callback fired
+  every time AutoReconnect installs a fresh session. **Critical** for
+  anything caching a tunnel-IP-dependent value (gVisor NIC address, bound
+  sockets, host routes): the server assigns a *new* `LocalIP` per session
+  (and may change Gateway/Routes/MTU), so not refreshing means post-reconnect
+  packets carry the OLD source IP and the server silently drops them — the
+  "works for a bit, reconnects, then nothing works forever" zombie-loop bug.
+  **Always call the returned detach from your Close path** if the hook's
+  target outlives shorter than the Client, else the closure keeps a torn-down
+  target alive and may deref dead fields. `pkg/netstack/netstack.go::Net.New`
+  registers via this hook so the gVisor NIC stays in sync; `Net.Close`
+  invokes the detach.
 
 ### Key protocol nuances (caught against real OpenVPN — preserve when editing)
 
@@ -231,41 +204,34 @@ internal/session         Orchestrator. Goroutines per active session
 6. **OpenVPN PEM header for tls-crypt static key uses lowercase `key`**:
    `-----BEGIN OpenVPN Static key V1-----`. Both cases are accepted on
    read but emit with lowercase.
-7. **Keepalive is mandatory and `applyKeepaliveDefaults` fills it when the
-   server is silent.** Real servers push `ping N, ping-restart M` and
-   expect us to PING every N seconds; if M seconds pass without inbound
-   data the server drops us. Several providers (ProtonVPN among them)
-   don't push these directives, so we apply defaults
-   (`defaultPingInterval=15s` / `defaultPingRestart=60s`) — pushed values
-   always win when present. `session.keepaliveLoop` emits the 16-byte
-   `proto.PingMagic` (`2a 18 7b f3 64 1e b4 cb 07 ed 2d 0a 98 1f c7 48`,
-   per `ping.c::ping_string`) as a regular P_DATA_V2 packet via the
-   active slot. Crucially, **PING is suppressed while any outbound data
-   has gone out in the last `PingInterval`** — matches upstream OpenVPN's
-   `forward.c::process_outgoing_link` which resets `ping_send_interval`
-   on every outbound. Loop samples at `interval/4` (≥250ms) so the next
-   PING fires promptly once the silence threshold is crossed. PINGs
-   themselves count as outbound (loop-local `lastPingSent`); user data
-   resets it via `s.lastUserOutbound`. **`lastUserOutbound` is set ONLY
-   by `Session.WriteCtx`, NOT by `keepaliveLoop`** — that way
-   `dataActivityWatch` (see point 9) keeps treating PINGs as protocol
-   overhead, not as user activity. The first nibble (`2`) of PingMagic
-   is not a valid IP version, so `pkg/netstack`'s IPv4/IPv6 demux
-   drops them naturally; `handleDataIn` also filters them so direct
-   `Tunnel.Read` consumers don't see them. `session.pingRestartWatch`
-   is the standard OpenVPN watchdog: `now - lastInbound >= ping-restart`
-   ⇒ `setCloseErr(&RestartError{...})` ⇒ `Close()` ⇒ AutoReconnect.
-   Don't gate the loops on push-reply being non-zero — that's the
-   failure mode for providers that don't push. Keepalive `WritePacket`
-   errors are non-fatal: log at Debug and `continue` to the next tick.
-   Bailing out on the first ENOBUFS would silently mute keepalives for
-   the rest of the session (which is the second half of the production
-   failure we hunted — see point 8). **`ping_in_total=0` in stats is
-   normal, not a bug**: an OpenVPN server's `ping_send_timeout` only
-   fires when the server has no outbound, so during active user traffic
-   the server never PINGs us — `pingRestartWatch` survives anyway
-   because user data updates `lastInbound` (link-options.rst: "ping ...
-   or other packet").
+7. **Keepalive is mandatory; `applyKeepaliveDefaults` fills it when the
+   server is silent.** Real servers push `ping N, ping-restart M` and expect
+   a PING every N seconds; if M seconds pass without inbound data they drop
+   us. Some providers (ProtonVPN) don't push these, so we apply defaults
+   (`defaultPingInterval=15s` / `defaultPingRestart=60s`); pushed values win
+   when present. `session.keepaliveLoop` emits the 16-byte `proto.PingMagic`
+   (`2a 18 7b f3 64 1e b4 cb 07 ed 2d 0a 98 1f c7 48`, per
+   `ping.c::ping_string`) as a regular P_DATA_V2 via the active slot. **PING
+   is suppressed while any outbound went out in the last `PingInterval`** —
+   matches upstream `forward.c::process_outgoing_link` resetting
+   `ping_send_interval` on every outbound. Loop samples at `interval/4`
+   (≥250ms) so a PING fires promptly once silence is crossed. PINGs count as
+   outbound (loop-local `lastPingSent`); user data resets `s.lastUserOutbound`.
+   **`lastUserOutbound` is set ONLY by `Session.WriteCtx`, NOT
+   `keepaliveLoop`** — so `dataActivityWatch` (point 9) treats PINGs as
+   overhead, not user activity. PingMagic's first nibble (`2`) is not a valid
+   IP version, so `pkg/netstack`'s IPv4/IPv6 demux drops them naturally;
+   `handleDataIn` also filters them from direct `Tunnel.Read`.
+   `session.pingRestartWatch` is the standard watchdog: `now - lastInbound
+   >= ping-restart` ⇒ `setCloseErr(&RestartError{...})` ⇒ `Close()` ⇒
+   AutoReconnect. Don't gate the loops on push-reply being non-zero — that
+   breaks providers that don't push. Keepalive `WritePacket` errors are
+   non-fatal: log Debug and `continue`; bailing on the first ENOBUFS would
+   mute keepalives for the session (the second half of the point-8
+   production failure). **`ping_in_total=0` is normal**: a server's
+   `ping_send_timeout` fires only when it has no outbound, so during active
+   traffic it never PINGs us — `pingRestartWatch` survives because user data
+   updates `lastInbound` (link-options.rst: "ping ... or other packet").
 
 7b. **`ENOBUFS` on kernel UDP send must apply backpressure, not just
    error.** Even with `SO_SNDBUF` bumped to 4 MiB, a sustained burst
@@ -305,73 +271,52 @@ internal/session         Orchestrator. Goroutines per active session
    loss under burst load.
 
 9. **`pingRestartWatch` alone is not enough — server PINGs can fake
-   liveness.** Servers configured with `keepalive N M` send their own
-   PINGs to the client every N seconds. Our `handleDataIn` updates
-   `lastInbound` on **any** decrypted inbound packet, *including* the
-   PINGs it then filters out. Several failure modes (gVisor link
-   endpoint stall, server-side data-path glitch, intermediate device
-   silently dropping user traffic) leave PINGs flowing while real
-   bytes are silently dropped — `pingRestartWatch` never fires,
-   `AutoReconnect` never kicks in, and the user has to restart the
-   process manually. `session.dataActivityWatch` is the second-tier
-   watchdog: it tracks `lastDataInbound` (non-PING only, updated in
-   `handleDataIn`) and `lastUserOutbound` (updated in `Session.WriteCtx`,
-   intentionally NOT touched by `keepaliveLoop` which goes direct to
-   `transport.WritePacket`). When the user is actively sending
-   (`sinceOut < threshold`) but no real data has arrived in
-   `DataActivityStuckThreshold` (steady default 60s), it fires
-   `RestartError` the same way pingRestartWatch does, surfacing through
-   `Read`/`Write` for AutoReconnect.
-   **Adaptive two-phase threshold:** for the first
-   `DataActivityFastWindow` (default 2 minutes) after session-up, the
-   watchdog uses the tighter `DataActivityWarmupFast` (default 10s) /
-   `DataActivityStuckThresholdFast` (default 20s) pair; after the
-   window elapses it relaxes to the steady values. Rationale: a
-   freshly-handshaken session is empirically MUCH more likely to be
-   wedged than a steady-state one — post-reconnect failure modes
-   include server-side state loss for the prior peer-id, upstream
-   rate-limits / blackholes keyed on something stable across reconnect
-   (public IP, peer-info fingerprint) that the new handshake does not
-   actually clear, NAT mapping drift, and gVisor TCP zombies
-   retransmitting on the previous tunnel IP. Spending the full 60s steady threshold confirming each
-   of those (we observed it in a 2026-05-15 prod log: tunnel was wedged
-   ~32s when the user gave up and SIGKILL'd) is the difference between
-   "tunnel jitters for a few seconds" and "tunnel froze for over a
-   minute". The fast values are clamped at runtime to <= steady so
-   tests that set explicit short steady values (e.g. 200ms warmup,
-   500ms threshold) keep their behaviour without being slowed down by
-   the package defaults. The trigger log records `phase=fast/steady`
-   plus the elapsed `age` so an operator can tell which side fired.
-   **L4-aware liveness — `aggregate` alone is not enough.** Aggregate
-   `lastDataInbound` is fed by ANY decrypted non-PING inbound IP
-   packet, regardless of L4 family. The user hit 2026-05-15
-   19:51-19:55: ~4s after a reconnect the server started selectively
-   dropping all TCP responses while UDP DNS replies kept dribbling
-   in once a minute or so. From the aggregate channel's perspective
-   `sinceIn` reset on every DNS reply, the watchdog never crossed
-   the threshold, and the tunnel sat wedged for ~4 minutes until
-   the user reached for Ctrl-C. To detect this `Session` also
-   tracks `lastDataInboundTCP` / `lastDataInboundUDP` /
-   `lastUserOutboundTCP` / `lastUserOutboundUDP`, populated from the
-   `sniffL4` helper in `handleDataIn` and `Session.WriteCtx`. The
-   pure `decideActivityStall` core checks all three pairs and fires
-   on the first match — per-L4 wins over aggregate so the trigger
-   log records the most specific cause (`signal=tcp` /
-   `signal=udp` / `signal=aggregate`). When an L4 inbound has never
-   been observed (e.g. fresh session that's only sent TCP) we use
-   the session `age` as the inbound floor, so a never-replied-to
-   TCP flow eventually trips the watchdog instead of hiding behind
-   the never-touched zero timestamp. The aggregate channel
-   intentionally does NOT use that floor — historically it required
-   both sides to be observed at least once, preserved to keep
-   existing tests stable. `sniffL4` mirrors the parser in
-   `pkg/netstack/endpoint.dispatchInbound`; kept private to session
-   so the watchdog doesn't drag a netstack dependency into the core
-   library.
-   Thresholds are configurable via Config; tests can run with
-   sub-second windows. Don't unify with pingRestartWatch — the two
-   are intentionally independent so we get one of them no matter
-   which signal is fake.
+   liveness.** Servers with `keepalive N M` PING us every N seconds, and
+   `handleDataIn` bumps `lastInbound` on **any** decrypted inbound,
+   *including* the PINGs it then filters out. Several failure modes (gVisor
+   link stall, server data-path glitch, an intermediate device dropping user
+   traffic) leave PINGs flowing while real bytes are dropped —
+   `pingRestartWatch` never fires and the user must restart manually.
+   `session.dataActivityWatch` is the second-tier watchdog: it tracks
+   `lastDataInbound` (non-PING, set in `handleDataIn`) and `lastUserOutbound`
+   (set in `Session.WriteCtx`, NOT `keepaliveLoop` which goes direct to
+   `transport.WritePacket`). When the user is sending (`sinceOut <
+   threshold`) but no real data arrived in `DataActivityStuckThreshold`
+   (steady 60s), it fires `RestartError` like pingRestartWatch, surfacing
+   through `Read`/`Write` for AutoReconnect.
+   **Adaptive two-phase threshold:** for the first `DataActivityFastWindow`
+   (2min) after session-up it uses the tighter `DataActivityWarmupFast`
+   (10s) / `DataActivityStuckThresholdFast` (20s) pair, then relaxes to
+   steady. Rationale: a freshly-handshaken session is empirically far more
+   likely to be wedged (server state loss for the prior peer-id, upstream
+   rate-limit/blackhole keyed on something stable across reconnect — public
+   IP, peer-info fingerprint — that the new handshake doesn't clear, NAT
+   drift, gVisor TCP zombies on the old tunnel IP). Spending the full 60s
+   confirming each is the difference between a few-second jitter and a
+   minute-long freeze (2026-05-15 prod log: wedged ~32s before the user
+   SIGKILL'd). Fast values are clamped at runtime to <= steady so tests with
+   short explicit steady values (e.g. 200ms/500ms) aren't slowed by defaults.
+   Trigger log records `phase=fast/steady` + elapsed `age`.
+   **L4-aware — `aggregate` alone is not enough.** Aggregate `lastDataInbound`
+   is fed by ANY non-PING inbound regardless of L4 family. 2026-05-15
+   19:51-19:55: ~4s post-reconnect the server selectively dropped all TCP
+   responses while UDP DNS replies dribbled in ~once a minute, so `sinceIn`
+   reset on every DNS reply, the watchdog never tripped, and the tunnel sat
+   wedged ~4min. So `Session` also tracks `lastDataInbound{TCP,UDP}` /
+   `lastUserOutbound{TCP,UDP}`, populated from `sniffL4` in `handleDataIn`
+   and `Session.WriteCtx`. The pure `decideActivityStall` checks all three
+   pairs and fires on first match — per-L4 wins over aggregate so the log
+   records the most specific cause (`signal=tcp/udp/aggregate`). When an L4
+   inbound was never observed (fresh session that only sent TCP) it uses
+   session `age` as the inbound floor, so a never-replied TCP flow trips the
+   watchdog instead of hiding behind a zero timestamp; the aggregate channel
+   deliberately does NOT use that floor (it required both sides observed
+   once, kept for test stability). `sniffL4` mirrors
+   `pkg/netstack/endpoint.dispatchInbound`, kept private to session so the
+   watchdog doesn't drag a netstack dep into the core library. Thresholds
+   are Config-tunable (sub-second in tests). Don't unify with
+   pingRestartWatch — independent by design so one fires no matter which
+   signal is fake.
 
 10. **`handleDataIn` must NOT block on `ingressCh`.** The
     decrypt-and-forward path runs inside `session.readLoop`'s single
@@ -465,43 +410,34 @@ back, just silent black-hole. The hook updates IPv4 + IPv6 addresses
 route table (`SetRouteTable` replaces, not merges), and refreshes the
 endpoint MTU.
 
-**Zombie-endpoint cleanup on reconnect (IP-change-conditional):**
-existing TCP/UDP gVisor connections that were bound to the OLD
-local IP would become zombies when the tunnel IP changes — they
-keep retransmitting with the now-invalid src IP, the server drops
-those packets, and gVisor's TCP retransmit takes 60-120s to give
-up. Apps using those conns see a long stall. To match the OS
-kernel's `RTM_CHANGE` behaviour on utun (which fails existing
-kernel sockets with `ECONNRESET` the moment the interface address
-changes), `Net` tracks every `net.Conn` it hands out via
-`DialContext` in an `activeConns sync.Map` (wrapped in a
-`trackedConn` that deregisters on `Close`). The OnReconnect hook
-calls `applyPushReply` to install the new addresses, then
-**unconditionally** force-closes every tracked conn via
-`closeActiveOnReconnect` — apps see an immediate error on the next
-Read/Write, retry, and the retry's new gVisor endpoint binds to
-whatever the current local IP is and registers with the new server
-session. Pre-/post-reconnect IPs are logged for diagnostics but no
-longer drive a policy decision.
+**Zombie-endpoint cleanup on reconnect (unconditional):** existing TCP/UDP
+gVisor conns bound to the OLD local IP become zombies when the tunnel IP
+changes — they retransmit with a now-invalid src IP, the server drops them,
+and gVisor TCP takes 60-120s to give up, so apps stall. To match the OS
+kernel's `RTM_CHANGE` on utun (which `ECONNRESET`s existing sockets the
+moment the interface address changes), `Net` tracks every `net.Conn` from
+`DialContext` in an `activeConns sync.Map` (via a `trackedConn` that
+deregisters on `Close`). The OnReconnect hook runs `applyPushReply` to
+install the new addresses, then **unconditionally** force-closes every
+tracked conn via `closeActiveOnReconnect` — apps see an immediate error,
+retry, and the new gVisor endpoint binds to the current local IP and
+registers with the new server session. Pre-/post-reconnect IPs are logged
+but no longer drive policy.
 
-**Why unconditional, not just "IP changed":** an earlier version
-preserved active conns when the tunnel IP stayed the same, on the
-theory that existing 4-tuples remained valid (server's NAT routes
-by IP, not by OpenVPN peer-id). Field evidence killed that theory:
-ProtonVPN routinely hands back the same local IP across reconnects
-while the server-side OpenVPN session is brand new (different
-peer_id), and the previous session's connection state is gone. Even
-with the same 4-tuple the server doesn't route packets for our old
-conns — gVisor TCP retransmits 60-120s before giving up, apps stall,
-and `dataActivityWatch` ends up firing a *second* reconnect a few
-seconds later. The visible symptom in the log was a healthy-looking
-"reconnect successful" followed by `tcp_current_established>0` with
-zero TCP delta_in for a full minute, then another reconnect.
-Force-closing everything restores app-level liveness in under a
-second. The `trackedConn` wrapper explicitly forwards `CloseWrite()`
-and `CloseRead()` so the type assertion in
-`socks5_tcp.go::proxy` (`interface{ CloseWrite() error }`) still
-matches for TCP-backed conns; for UDP the methods are no-op safe.
+**Why unconditional, not just "IP changed":** an earlier version preserved
+conns when the tunnel IP stayed the same, assuming existing 4-tuples
+remained valid (server NAT routes by IP, not peer-id). Field evidence killed
+that: ProtonVPN routinely hands back the same local IP across reconnects
+while the server-side session is brand new (different peer_id) with the old
+connection state gone — so even with the same 4-tuple the server doesn't
+route our old conns, gVisor TCP retransmits 60-120s, apps stall, and
+`dataActivityWatch` fires a *second* reconnect seconds later. Log symptom: a
+healthy "reconnect successful" then `tcp_current_established>0` with zero TCP
+delta_in for a minute, then another reconnect. Force-closing everything
+restores liveness in under a second. The `trackedConn` wrapper forwards
+`CloseWrite()`/`CloseRead()` so the `socks5_tcp.go::proxy` type assertion
+(`interface{ CloseWrite() error }`) still matches TCP-backed conns; for UDP
+they're no-op safe.
 
 **openvpn2socks-level companion fix:** `connRateLimiter.Reset()` is
 invoked from a second `cli.OnReconnect` hook installed in `main.go`.
@@ -526,77 +462,48 @@ malformed, DroppedPackets) every `statsLogPeriod=30s` at Debug
 level — anything unusual auto-escalates to Warn so `-v` is not
 required to see real problems.
 
-**Pure observability — no actions.** An earlier iteration added a
-"data-path health watchdog" goroutine on top of these counters
-that called `cli.RequestRestart` on application-level "TCP-deaf",
-"UDP-deaf" or "TCP-RST-storm" signatures, escalating to
-`os.Exit(99)` after two consecutive triggers. **It was removed**
-because every single failure case we collected on a real
-ProtonVPN tunnel turned out to be the watchdog itself creating
-the problem:
+**Pure observability — no actions.** An earlier "data-path health watchdog"
+goroutine called `cli.RequestRestart` on app-level "TCP-deaf"/"UDP-deaf"/
+"TCP-RST-storm" signatures, escalating to `os.Exit(99)` after two triggers.
+**It was removed** — every failure case on a real ProtonVPN tunnel was the
+watchdog creating the problem: the triggering metric (DNS UDP timeout,
+transient RST burst from busy browsing) was an app-level hiccup, not a dead
+tunnel — the protocol layer flowed, `dataActivityWatch`/`pingRestartWatch`
+weren't firing. Its AutoReconnect changed the tunnel IP; gVisor TCP
+endpoints on the OLD IP became zombies retransmitting an invalid src IP, the
+server dropped them, `ep_in_tcp` read zero, the watchdog called that
+"tcp-deaf" and hit `os.Exit(99)`. The official OpenVPN CLI runs stably for
+hours against the same endpoint with no such gymnastics. The counters and
+`statsLoggerLoop` stayed (useful for diagnosis). **Lesson: don't act on
+app-level metrics when a protocol-level self-healing layer
+(`pingRestartWatch`, `dataActivityWatch`, `hardResetWatch`, server RESTART)
+already exists** — they're noisier than the protocol's own keepalive/restart
+signals, and acting on them turns false signals into real outages.
 
-  - The triggering metric (DNS UDP timeout, transient RST burst
-    from a busy browsing session, etc.) reflected an
-    application-level hiccup, not a dead tunnel — the OpenVPN
-    protocol layer was still flowing, `dataActivityWatch` and
-    `pingRestartWatch` weren't firing.
-  - The watchdog-requested AutoReconnect changed the tunnel IP.
-  - gVisor TCP endpoints bound to the OLD tunnel IP became
-    zombies: they kept retransmitting with the now-invalid src
-    IP, the server dropped those packets, `ep_in_tcp` looked
-    like zero, the watchdog interpreted that as "tcp-deaf" and
-    escalated to `os.Exit(99)`.
-  - Reference data point: the official OpenVPN CLI client
-    against the same endpoint runs stably for hours with no
-    such gymnastics. The reconnect machinery built into the
-    OpenVPN protocol (`pingRestartWatch`, `dataActivityWatch`,
-    `hardResetWatch`, server-pushed RESTART) is the right
-    self-healing layer — it operates on protocol-level signals
-    that don't false-fire on application transients.
-
-The counters and `statsLoggerLoop` stayed because they're
-genuinely useful for diagnosing what's going on. The lesson:
-**don't act on application-level metrics when a protocol-level
-self-healing layer already exists** — those metrics are inherently
-noisier than the underlying protocol's own keepalive/restart
-mechanisms, and acting on them turns false signals into real
-outages.
-
-**Consecutive-stall surrender (protocol-level, NOT
-application-level).** A different failure mode — upstream
-rate-limit / blackhole keyed on something stable across our
-reconnects (most plausibly our external public IP or peer-info
-fingerprint, NOT our UDP source port: `transport.Dial`
-re-issues `connect(2)` every cycle, so the kernel hands us a
-fresh ephemeral port already) — has been observed where every
-AutoReconnect lands a fresh OpenVPN handshake but the new
-session is born broken: TCP outbound flows, keepalive PINGs
-arrive, but no real inbound data ever does, so
-`session.dataActivityWatch` fast-phase trips at age ~20s, we
-reconnect, trip again, and the process spins forever, the tight
-loop keeping the upstream cooldown timer continuously refreshed.
-The fix lives in `openvpn.Client.reconnect` (NOT in netstack — see
-above for why the netstack-side application watchdog kept doing
-the wrong thing). The pure
-`decideStallSurrender(lifetime, closeErr, counter, max, threshold)`
-returns the updated counter and a surrender flag: a stall close
-shorter than `Config.StableSessionThreshold` (default 60s)
-increments the counter; any other reason or any long-lived
-session resets it to 0; reaching `Config.MaxConsecutiveStalls`
-latches `c.gaveUp` and closes the `Client.Unrecoverable()` chan.
-`cmd/openvpn2socks/main.go` defaults `MaxConsecutiveStalls=3`
-and runs a watcher that cancels `rootCtx` on the chan close, so
-the daemon exits with code 1 and a supervisor (launchd /
-systemd / a shell `until openvpn2socks; do sleep 5; done`
-wrapper) relaunches us. **The restart delay is what helps**, not
-the relaunch per se: it gives the upstream rate-limit time to
-expire by its own clock instead of being continuously starved by
-the 20s fast-phase loop. The signal is strictly protocol-level so
-it survives the lesson above: only `session.dataActivityWatch`-
-emitted `RestartError{Reason:"data-activity stuck"}` counts, and
-only when the session it sank lived less than the threshold;
-normal browsing-period stalls (longer-lived sessions, other
-RestartError reasons) never increment the counter.
+**Consecutive-stall surrender (protocol-level, NOT app-level).** A different
+failure mode — an upstream rate-limit/blackhole keyed on something stable
+across reconnects (most plausibly our public IP or peer-info fingerprint,
+NOT the UDP source port: `transport.Dial` re-`connect(2)`s each cycle, so
+the kernel already hands us a fresh ephemeral port) — where every
+AutoReconnect lands a fresh handshake but the session is born broken: TCP
+outbound flows, PINGs arrive, but no real inbound ever does, so
+`dataActivityWatch` fast-phase trips at age ~20s, we reconnect, trip again,
+and spin forever, the tight loop continuously refreshing the upstream
+cooldown timer. The fix is in `openvpn.Client.reconnect` (NOT netstack — see
+above). Pure `decideStallSurrender(lifetime, closeErr, counter, max,
+threshold)` returns the updated counter + a surrender flag: a stall close
+shorter than `Config.StableSessionThreshold` (60s) increments the counter;
+any other reason or any long-lived session resets it to 0; reaching
+`Config.MaxConsecutiveStalls` latches `c.gaveUp` and closes
+`Client.Unrecoverable()`. `cmd/openvpn2socks/main.go` defaults
+`MaxConsecutiveStalls=3` and cancels `rootCtx` on that close, exiting code 1
+so a supervisor (launchd/systemd/`until openvpn2socks; do sleep 5; done`)
+relaunches us. **The restart delay is what helps**, not the relaunch — it
+lets the upstream rate-limit expire on its own clock instead of being
+starved by the 20s fast-phase loop. Strictly protocol-level (survives the
+lesson above): only `dataActivityWatch`'s `RestartError{Reason:"data-
+activity stuck"}` counts, and only when the session lived less than the
+threshold; normal longer-lived stalls and other reasons never increment.
 
 **IPv6 plumbing:** the parser splits dual-stack data into separate
 fields — `PushReply.LocalIP6` (a `netip.Prefix` from `ifconfig-ipv6
