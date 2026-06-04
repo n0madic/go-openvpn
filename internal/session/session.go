@@ -27,6 +27,7 @@ import (
 	"github.com/n0madic/go-openvpn/internal/data"
 	"github.com/n0madic/go-openvpn/internal/proto"
 	"github.com/n0madic/go-openvpn/internal/reliable"
+	"github.com/n0madic/go-openvpn/internal/tlsauth"
 	"github.com/n0madic/go-openvpn/internal/tlscrypt"
 	"github.com/n0madic/go-openvpn/internal/trace"
 	"github.com/n0madic/go-openvpn/internal/transport"
@@ -60,10 +61,31 @@ type Config struct {
 	Username string
 	Password string
 
-	// Either TLSCryptV1 (256 bytes) or TLSCryptV2 (PEM bundle with embedded
-	// WKc). Exactly one must be set.
+	// Exactly one of TLSCryptV1 / TLSCryptV2 / TLSAuth must be set.
+	// TLSCryptV1 is a 256-byte tls-crypt static key; TLSCryptV2 is a
+	// PEM bundle with embedded WKc; TLSAuth is a 256-byte tls-auth static
+	// key (HMAC-only control-channel authentication).
 	TLSCryptV1 []byte
 	TLSCryptV2 []byte
+	TLSAuth    []byte
+
+	// Auth is the control-channel HMAC digest for tls-auth: "" (=SHA1,
+	// OpenVPN's default), "SHA256" or "SHA512". Ignored for tls-crypt v1/v2,
+	// which always use HMAC-SHA256.
+	Auth string
+
+	// KeyDirection selects the tls-auth key orientation. In every real-world
+	// client profile this is `key-direction 1` (Inverse), mirroring the
+	// tls-crypt client; we therefore use the Inverse orientation regardless,
+	// and this field is informational/reserved. 0 and 1 both yield the client
+	// Inverse orientation today.
+	// TODO: honour a client-side `key-direction 0` (Normal) if a profile ever
+	// needs it.
+	KeyDirection int
+
+	// PeerInfoExtra carries additional peer-info fields (e.g. UV_* tokens)
+	// merged over the default IV_* set on the initial handshake.
+	PeerInfoExtra map[string]string
 
 	Ciphers          []string
 	HandshakeTimeout time.Duration
@@ -124,13 +146,24 @@ type Config struct {
 	Logger *slog.Logger
 }
 
+// controlWrapper authenticates (tls-auth) or encrypts+authenticates
+// (tls-crypt v1/v2) every control-channel packet. It is the minimal surface
+// the session needs from a wrapper: the concrete *tlscrypt.Wrapper and
+// *tlsauth.Authenticator both satisfy it. tls-crypt-v2's SetFirstWrapTrailer
+// is invoked on the concrete type inside buildWrapper, so it is not part of
+// this interface.
+type controlWrapper interface {
+	Wrap(opcodeKID byte, sessionID uint64, plaintext []byte) []byte
+	Unwrap(pkt []byte) (opcodeKID byte, sessionID uint64, packetID uint32, plaintext []byte, err error)
+}
+
 // Session is the live VPN session.
 type Session struct {
 	cfg Config
 	log *slog.Logger
 
 	transport transport.PacketConn
-	wrapper   *tlscrypt.Wrapper
+	wrapper   controlWrapper
 	localSID  uint64
 
 	slots  *slotTable
@@ -345,6 +378,7 @@ func DialWithTransport(ctx context.Context, cfg Config, tr transport.PacketConn)
 		Ciphers:         cfg.Ciphers,
 		HardResetOpcode: hardResetOp,
 		PeerInfoVersion: cfg.PeerInfoVersion,
+		PeerInfoExtra:   cfg.PeerInfoExtra,
 		Tracer:          cfg.HandshakeTracer,
 	})
 	if err != nil {
@@ -1312,13 +1346,38 @@ func validateConfig(cfg *Config) error {
 	if cfg.TLSConfig == nil {
 		return errors.New("session: TLSConfig required")
 	}
-	if len(cfg.TLSCryptV1) == 0 && len(cfg.TLSCryptV2) == 0 {
-		return errors.New("session: tls-crypt key required (v1 or v2)")
+	set := 0
+	if len(cfg.TLSCryptV1) > 0 {
+		set++
+	}
+	if len(cfg.TLSCryptV2) > 0 {
+		set++
+	}
+	if len(cfg.TLSAuth) > 0 {
+		set++
+	}
+	if set != 1 {
+		return errors.New("session: exactly one control-channel key required (tls-crypt v1, tls-crypt-v2 or tls-auth)")
 	}
 	return nil
 }
 
-func buildWrapper(cfg Config) (*tlscrypt.Wrapper, proto.Opcode, error) {
+func buildWrapper(cfg Config) (controlWrapper, proto.Opcode, error) {
+	if len(cfg.TLSAuth) > 0 {
+		rawKey, err := tlscrypt.ParseStaticKey(cfg.TLSAuth)
+		if err != nil {
+			return nil, 0, fmt.Errorf("session: parse tls-auth key: %w", err)
+		}
+		// tls-auth clients use the Inverse orientation in every real-world
+		// profile (`key-direction 1`), mirroring the tls-crypt client. We do
+		// not yet distinguish a client-side `key-direction 0` (Normal); see
+		// Config.KeyDirection.
+		auth, err := tlsauth.New(rawKey, tlscrypt.DirectionInverse, cfg.Auth)
+		if err != nil {
+			return nil, 0, fmt.Errorf("session: init tls-auth: %w", err)
+		}
+		return auth, proto.PControlHardResetClientV2, nil
+	}
 	if len(cfg.TLSCryptV2) > 0 {
 		bundle, err := tlscrypt.ParseClientBundleV2(cfg.TLSCryptV2)
 		if err != nil {

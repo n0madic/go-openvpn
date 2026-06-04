@@ -4,9 +4,12 @@
 // openvpn.Config for the go-openvpn client library.
 //
 // Coverage focuses on the modern 2.6+ profile that this library actually
-// supports: TLS+NCP, AEAD ciphers, tls-crypt v1/v2. Legacy directives
-// (compression, tls-auth, BF-CBC, dev tap, static-key-only) are rejected.
-// Comfort directives (persist-key, nobind, etc.) are silently accepted.
+// supports: TLS+NCP, AEAD ciphers, tls-crypt v1/v2 and tls-auth (HMAC-only
+// control channel, with key-direction). Legacy directives (compression,
+// BF-CBC, dev tap, static-key-only) are rejected; `cipher none` is tolerated
+// (dropped — AEAD is negotiated via NCP) rather than implementing a null data
+// channel. Comfort directives (persist-key, nobind, etc.) are silently
+// accepted, and `setenv UV_* <value>` tokens are forwarded as peer-info.
 package ovpn
 
 import (
@@ -196,6 +199,15 @@ type parseState struct {
 	keyPEM   []byte
 	tlsCrypt []byte
 	tlsCV2   []byte
+	tlsAuth  []byte
+
+	// tlsAuthKeyDir is the `key-direction` value (0 or 1); -1 means unset.
+	tlsAuthKeyDir int
+	// authDigest is the uppercased `auth` digest name ("SHA1", "SHA256", ...);
+	// applied only to tls-auth (tls-crypt always uses SHA256).
+	authDigest string
+	// peerInfoExtra collects `setenv UV_* <value>` tokens for peer-info.
+	peerInfoExtra map[string]string
 
 	scramble *openvpn.ScrambleConfig
 
@@ -205,7 +217,7 @@ type parseState struct {
 }
 
 func newState(opt *ParseOptions) *parseState {
-	return &parseState{opt: opt}
+	return &parseState{opt: opt, tlsAuthKeyDir: -1}
 }
 
 // run iterates over the input and dispatches each directive.
@@ -377,7 +389,7 @@ func (s *parseState) handleInline(name string, content []byte, line int) error {
 	case "tls-crypt-v2":
 		s.tlsCV2 = content
 	case "tls-auth":
-		return errors.New("tls-auth is not supported (use tls-crypt or tls-crypt-v2)")
+		s.tlsAuth = content
 	case "secret":
 		return errors.New("static-key mode is not supported (TLS+NCP only)")
 	case "connection":
@@ -420,9 +432,13 @@ func (s *parseState) handleDirective(name string, args []string, line int) error
 			}
 		}
 	case "auth":
-		// We don't validate or apply auth — modern AEAD has its own MAC,
-		// and tls-crypt has its own HMAC. Accepted silently.
-		_ = args
+		// The data channel uses AEAD (its own MAC) and tls-crypt fixes
+		// HMAC-SHA256, so `auth` only matters for the tls-auth control
+		// channel: record it as the tls-auth digest. An empty/none value
+		// leaves the tls-auth default (SHA1).
+		if len(args) == 1 {
+			s.authDigest = strings.ToUpper(args[0])
+		}
 
 	// ---- TLS / cert ----
 	case "ca":
@@ -436,7 +452,7 @@ func (s *parseState) handleDirective(name string, args []string, line int) error
 	case "tls-crypt-v2":
 		return s.loadTLSCryptFile(args, true)
 	case "tls-auth":
-		return errors.New("tls-auth is not supported (use tls-crypt or tls-crypt-v2)")
+		return s.loadTLSAuthFile(args)
 	case "tls-version-min":
 		return s.setTLSMin(args)
 	case "tls-version-max":
@@ -463,6 +479,14 @@ func (s *parseState) handleDirective(name string, args []string, line int) error
 	// ---- non-standard obfuscation (OpenVPN forks: Tunnelblick, OPNsense, ...) ----
 	case "scramble":
 		return s.setScramble(args)
+
+	// ---- tls-auth key-direction ----
+	case "key-direction":
+		return s.setKeyDirection(args)
+
+	// ---- peer-info passthrough (UV_* tokens) ----
+	case "setenv":
+		s.addSetenv(args)
 
 	// ---- auth ----
 	case "auth-user-pass":
@@ -508,8 +532,8 @@ func (s *parseState) handleDirective(name string, args []string, line int) error
 	// ---- noise (silently ignored) ----
 	case "client", "tls-client", "pull", "nopull",
 		"persist-key", "persist-tun", "resolv-retry",
-		"setenv", "script-security", "mute", "mute-replay-warnings",
-		"verb", "auth-nocache", "key-direction",
+		"script-security", "mute", "mute-replay-warnings",
+		"verb", "auth-nocache",
 		"tun-mtu", "tun-mtu-extra", "link-mtu", "fragment", "mssfix",
 		"route", "route-gateway", "route-metric", "route-delay",
 		"route-noexec", "redirect-gateway", "redirect-private",
@@ -712,6 +736,51 @@ func (s *parseState) loadTLSCryptFile(args []string, v2 bool) error {
 	return nil
 }
 
+// loadTLSAuthFile handles `tls-auth <file> [direction]`. The optional second
+// argument is the key-direction (0 or 1), equivalent to a separate
+// `key-direction` line.
+func (s *parseState) loadTLSAuthFile(args []string) error {
+	if len(args) < 1 {
+		return errors.New("tls-auth: expected a file path (and optional key-direction)")
+	}
+	b, err := os.ReadFile(s.resolvePath(args[0]))
+	if err != nil {
+		return fmt.Errorf("tls-auth: %w", err)
+	}
+	s.tlsAuth = b
+	if len(args) >= 2 {
+		return s.setKeyDirection(args[1:2])
+	}
+	return nil
+}
+
+// setKeyDirection parses a `key-direction 0|1` value (also used as the inline
+// argument of `tls-auth <file> <dir>`).
+func (s *parseState) setKeyDirection(args []string) error {
+	if len(args) != 1 {
+		return errors.New("key-direction: expected one argument (0 or 1)")
+	}
+	n, err := strconv.Atoi(args[0])
+	if err != nil || (n != 0 && n != 1) {
+		return fmt.Errorf("key-direction: want 0 or 1, got %q", args[0])
+	}
+	s.tlsAuthKeyDir = n
+	return nil
+}
+
+// addSetenv records `setenv UV_* <value>` tokens for the peer-info field.
+// All other setenv variables are ignored (matching OpenVPN's behaviour for a
+// non-interactive client).
+func (s *parseState) addSetenv(args []string) {
+	if len(args) < 2 || !strings.HasPrefix(args[0], "UV_") {
+		return
+	}
+	if s.peerInfoExtra == nil {
+		s.peerInfoExtra = make(map[string]string)
+	}
+	s.peerInfoExtra[args[0]] = args[1]
+}
+
 // setScramble parses the non-standard `scramble <mode> [secret]`
 // directive shipped by community OpenVPN forks (Tunnelblick,
 // clayface/openvpn_xorpatch, OPNsense, ...).
@@ -759,11 +828,17 @@ func (s *parseState) finalize() (*Parsed, error) {
 	if s.proto == "" {
 		s.proto = "udp"
 	}
-	if s.tlsCrypt == nil && s.tlsCV2 == nil {
-		return nil, errors.New("missing tls-crypt or tls-crypt-v2 (this library requires modern control-channel encryption)")
+	ctrlKeys := 0
+	for _, set := range []bool{s.tlsCrypt != nil, s.tlsCV2 != nil, s.tlsAuth != nil} {
+		if set {
+			ctrlKeys++
+		}
 	}
-	if s.tlsCrypt != nil && s.tlsCV2 != nil {
-		return nil, errors.New("both tls-crypt and tls-crypt-v2 set; only one may be active")
+	switch {
+	case ctrlKeys == 0:
+		return nil, errors.New("missing control-channel protection: provide tls-crypt, tls-crypt-v2 or tls-auth (this library requires a protected control channel)")
+	case ctrlKeys > 1:
+		return nil, errors.New("multiple control-channel keys set; use exactly one of tls-crypt, tls-crypt-v2 or tls-auth")
 	}
 
 	picked := s.pickRemote()
@@ -859,8 +934,18 @@ func (s *parseState) finalize() (*Parsed, error) {
 	}
 
 	// Cipher list: prefer data-ciphers; fall back to cipher singleton.
-	ciphers := s.dataCiphers
-	if len(ciphers) == 0 && s.cipher != "" {
+	// `cipher none` (and a `none` entry in data-ciphers) is tolerated but
+	// dropped — we don't implement a null data channel, so we fall through to
+	// the library's AEAD defaults negotiated via NCP. This lets obfuscated
+	// profiles (which carry `cipher none`) parse and connect. It is NOT a
+	// data-channel `none` implementation.
+	ciphers := make([]string, 0, len(s.dataCiphers))
+	for _, c := range s.dataCiphers {
+		if !strings.EqualFold(c, "none") {
+			ciphers = append(ciphers, c)
+		}
+	}
+	if len(ciphers) == 0 && s.cipher != "" && !strings.EqualFold(s.cipher, "none") {
 		ciphers = []string{s.cipher}
 	}
 	if err := validateCiphers(ciphers); err != nil {
@@ -876,17 +961,33 @@ func (s *parseState) finalize() (*Parsed, error) {
 		network = n
 	}
 
+	// key-direction defaults to 1 (the standard client Inverse orientation)
+	// when a tls-auth profile omits it. For non-tls-auth profiles the field is
+	// irrelevant, so leave it at 0 rather than emitting a misleading 1.
+	keyDir := s.tlsAuthKeyDir
+	if keyDir < 0 {
+		if s.tlsAuth != nil {
+			keyDir = 1
+		} else {
+			keyDir = 0
+		}
+	}
+
 	cfg := &openvpn.Config{
-		Network:    network,
-		RemoteAddr: picked.Addr(),
-		TLSConfig:  tlsCfg,
-		TLSCryptV1: s.tlsCrypt,
-		TLSCryptV2: s.tlsCV2,
-		Ciphers:    ciphers,
-		Reneg:      s.reneg,
-		Username:   s.opt.Username,
-		Password:   s.opt.Password,
-		Scramble:   s.scramble,
+		Network:       network,
+		RemoteAddr:    picked.Addr(),
+		TLSConfig:     tlsCfg,
+		TLSCryptV1:    s.tlsCrypt,
+		TLSCryptV2:    s.tlsCV2,
+		TLSAuth:       s.tlsAuth,
+		Auth:          s.authDigest,
+		KeyDirection:  keyDir,
+		PeerInfoExtra: s.peerInfoExtra,
+		Ciphers:       ciphers,
+		Reneg:         s.reneg,
+		Username:      s.opt.Username,
+		Password:      s.opt.Password,
+		Scramble:      s.scramble,
 	}
 
 	return &Parsed{

@@ -28,8 +28,9 @@ import (
 )
 
 const (
-	serverAddr = "127.0.0.1:1194"
-	serverSNI  = "test-server"
+	serverAddr        = "127.0.0.1:1194"
+	tlsAuthServerAddr = "127.0.0.1:1196"
+	serverSNI         = "test-server"
 )
 
 // pkiDir is the path to the PKI directory relative to this file. Resolved
@@ -68,6 +69,55 @@ func loadTLSCrypt(tb testing.TB) []byte {
 		tb.Fatalf("read tls-crypt key: %v", err)
 	}
 	return b
+}
+
+func loadTLSAuth(tb testing.TB) []byte {
+	tb.Helper()
+	b, err := os.ReadFile(filepath.Join(pkiDir, "tlsauth.key"))
+	if err != nil {
+		tb.Fatalf("read tls-auth key: %v", err)
+	}
+	return b
+}
+
+// TestRealHandshakeTLSAuth verifies the full handshake + ICMP data path
+// against a real OpenVPN server whose control channel is protected by tls-auth
+// (HMAC-only; SHA1 default; server key-direction 0, client 1/Inverse) on
+// UDP/1196. Proves the tls-auth wire format (swap_hmac byte order, digest-size
+// HMAC key) interoperates with a real server, not just our in-process sim.
+func TestRealHandshakeTLSAuth(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cli, err := openvpn.Dial(ctx, &openvpn.Config{
+		Network:      "udp",
+		RemoteAddr:   tlsAuthServerAddr,
+		TLSConfig:    loadTLSConfig(t),
+		TLSAuth:      loadTLSAuth(t),
+		KeyDirection: 1,
+	})
+	if err != nil {
+		t.Fatalf("Dial (tls-auth): %v", err)
+	}
+	defer cli.Close()
+
+	pr := cli.PushedOptions()
+	t.Logf("tls-auth session up: local=%s gw=%s cipher=%s peer_id=%d",
+		pr.LocalIP, pr.Gateway, pr.Cipher, pr.PeerID)
+	if !pr.LocalIP.IsValid() {
+		t.Error("no LocalIP in PUSH_REPLY")
+	}
+	if pr.Cipher == "" {
+		t.Error("no cipher negotiated over tls-auth control channel")
+	}
+
+	if !pr.LocalIP.Is4() || !pr.Gateway.Is4() {
+		t.Skipf("non-IPv4 push reply (%s → %s) — skipping ICMP", pr.LocalIP, pr.Gateway)
+	}
+	if !roundTripPing(t, cli.Tunnel(), pr, 1, 5*time.Second) {
+		t.Fatal("no ICMP reply within 5s over tls-auth tunnel")
+	}
+	t.Logf("ICMP echo reply received over tls-auth tunnel from %s", pr.Gateway)
 }
 
 // TestRealHandshakeUDP verifies that the full OpenVPN 2.6 handshake completes

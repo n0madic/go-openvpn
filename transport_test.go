@@ -19,6 +19,7 @@ func TestDialTransportFactoryError(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("proxy unreachable")
 	_, err := Dial(context.Background(), &Config{
+		TLSCryptV1: make([]byte, 256), // satisfy control-channel validation
 		DialTransport: func(ctx context.Context, network, addr string) (Transport, error) {
 			return nil, sentinel
 		},
@@ -33,6 +34,7 @@ func TestDialTransportFactoryError(t *testing.T) {
 func TestDialTransportNilTransport(t *testing.T) {
 	t.Parallel()
 	_, err := Dial(context.Background(), &Config{
+		TLSCryptV1: make([]byte, 256), // satisfy control-channel validation
 		DialTransport: func(ctx context.Context, network, addr string) (Transport, error) {
 			return nil, nil
 		},

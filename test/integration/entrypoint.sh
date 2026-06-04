@@ -30,5 +30,7 @@ echo "[entrypoint] socat TCP echo on :8080, pid=$TCP_PID"
 UDP_PID=$!
 echo "[entrypoint] socat UDP echo on 10.8.0.1:8080 (retrying until tun0 is up), pid=$UDP_PID"
 
-# Hand over to openvpn (gets PID 1 semantics via exec).
-exec openvpn --config /etc/openvpn/server.conf
+# Hand over to openvpn (gets PID 1 semantics via exec). The config path is
+# overridable via $OVPN_CONFIG so the same image can serve the tls-crypt
+# (default) and tls-auth server variants.
+exec openvpn --config "${OVPN_CONFIG:-/etc/openvpn/server.conf}"

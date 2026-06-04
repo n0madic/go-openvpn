@@ -10,7 +10,7 @@ set -euo pipefail
 PKI="$(cd "$(dirname "$0")" && pwd)/pki"
 mkdir -p "$PKI"
 
-if [ -f "$PKI/ca.crt" ] && [ -f "$PKI/tlscrypt.key" ]; then
+if [ -f "$PKI/ca.crt" ] && [ -f "$PKI/tlscrypt.key" ] && [ -f "$PKI/tlsauth.key" ]; then
     echo "PKI already present at $PKI — nothing to do."
     exit 0
 fi
@@ -54,6 +54,9 @@ openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
 
 # --- tls-crypt v1 static key ---
 openvpn --genkey secret tlscrypt.key
+
+# --- tls-auth static key (same 256-byte static-key format) ---
+openvpn --genkey secret tlsauth.key
 
 # Cleanup intermediate files.
 rm -f *.csr *.srl *-ext.cnf

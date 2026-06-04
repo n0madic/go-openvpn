@@ -23,9 +23,10 @@ up: pki
 	docker compose up -d --build
 
 wait:
-	@printf "Waiting for OpenVPN server to be ready"
+	@printf "Waiting for OpenVPN servers (tls-crypt + tls-auth) to be ready"
 	@for i in $$(seq 1 30); do \
-	    if docker compose logs openvpn 2>&1 | grep -q "Initialization Sequence Completed"; then \
+	    if docker compose logs openvpn 2>&1 | grep -q "Initialization Sequence Completed" && \
+	       docker compose logs openvpn-tlsauth 2>&1 | grep -q "Initialization Sequence Completed"; then \
 	        echo " — ready."; \
 	        exit 0; \
 	    fi; \
@@ -33,7 +34,7 @@ wait:
 	    sleep 1; \
 	done; \
 	echo " — TIMED OUT. Last logs:"; \
-	docker compose logs openvpn | tail -30; \
+	docker compose logs openvpn openvpn-tlsauth | tail -40; \
 	exit 1
 
 down:

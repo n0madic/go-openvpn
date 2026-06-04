@@ -7,7 +7,7 @@ FROM alpine:latest
 
 RUN apk add --no-cache openvpn iproute2 socat
 
-EXPOSE 1194/udp 1195/udp
+EXPOSE 1194/udp 1195/udp 1196/udp
 
 # Entrypoint backgrounds a TCP echo on :8080 (reachable as 10.8.0.1:8080 once
 # tun0 is up) for the netstack integration test, then runs openvpn in the

@@ -199,11 +199,34 @@ type Config struct {
 	Username string
 	Password string
 
+	// Exactly one of TLSCryptV1 / TLSCryptV2 / TLSAuth must be set.
+	//
 	// TLSCryptV1 is a 256-byte (PEM-wrapped or raw) tls-crypt static key.
-	// Exactly one of TLSCryptV1 / TLSCryptV2 must be set.
 	TLSCryptV1 []byte
 	// TLSCryptV2 is a tls-crypt-v2 client bundle (Kc || WKc, PEM-wrapped).
 	TLSCryptV2 []byte
+	// TLSAuth is a 256-byte (PEM-wrapped or raw) tls-auth static key. tls-auth
+	// only HMAC-authenticates the control channel (the inner TLS session
+	// already encrypts it), so it is lighter than tls-crypt. The HMAC digest
+	// is selected by Auth.
+	TLSAuth []byte
+
+	// Auth is the tls-auth control-channel HMAC digest: "" (=SHA1, OpenVPN's
+	// default when `auth` is unset), "SHA256" or "SHA512". Ignored for
+	// tls-crypt v1/v2 (which always use HMAC-SHA256).
+	Auth string
+
+	// KeyDirection mirrors OpenVPN's `key-direction` for tls-auth. The .ovpn
+	// parser fills it from the directive (absent ⇒ 1). The standard client
+	// profile uses `key-direction 1` (Inverse), which is the orientation the
+	// library uses; 0 and 1 are currently treated identically. Only meaningful
+	// alongside TLSAuth.
+	KeyDirection int
+
+	// PeerInfoExtra carries additional peer-info fields merged over the default
+	// IV_* set (e.g. a provider's `setenv UV_LOCAL_ID_0 <token>`). Applied on
+	// the initial handshake and on rekey.
+	PeerInfoExtra map[string]string
 
 	// Ciphers is the IV_CIPHERS list (priority order). Defaults to
 	// AES-256-GCM:CHACHA20-POLY1305:AES-128-GCM.
@@ -611,6 +634,9 @@ func Dial(ctx context.Context, cfg *Config) (*Client, error) {
 	if err := validateScramble(cfg.Scramble); err != nil {
 		return nil, err
 	}
+	if err := validateControlChannel(cfg); err != nil {
+		return nil, err
+	}
 	log := cfg.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -669,6 +695,10 @@ func sessionCfg(cfg *Config) session.Config {
 		Password:         cfg.Password,
 		TLSCryptV1:       cfg.TLSCryptV1,
 		TLSCryptV2:       cfg.TLSCryptV2,
+		TLSAuth:          cfg.TLSAuth,
+		Auth:             cfg.Auth,
+		KeyDirection:     cfg.KeyDirection,
+		PeerInfoExtra:    cfg.PeerInfoExtra,
 		Ciphers:          cfg.Ciphers,
 		HandshakeTimeout: cfg.HandshakeTimeout,
 		Reneg:            cfg.Reneg,
@@ -676,6 +706,30 @@ func sessionCfg(cfg *Config) session.Config {
 		HandshakeTracer:  cfg.HandshakeTracer,
 		Logger:           cfg.Logger,
 	}
+}
+
+// validateControlChannel enforces that exactly one control-channel key is
+// configured (tls-crypt v1, tls-crypt-v2 or tls-auth). It is called from Dial
+// so the failure surfaces before any socket is opened, with a clearer message
+// than the internal session-level check.
+func validateControlChannel(cfg *Config) error {
+	set := 0
+	if len(cfg.TLSCryptV1) > 0 {
+		set++
+	}
+	if len(cfg.TLSCryptV2) > 0 {
+		set++
+	}
+	if len(cfg.TLSAuth) > 0 {
+		set++
+	}
+	switch {
+	case set == 0:
+		return errors.New("openvpn: a control-channel key is required (set one of TLSCryptV1, TLSCryptV2 or TLSAuth)")
+	case set > 1:
+		return errors.New("openvpn: only one control-channel key may be set (TLSCryptV1, TLSCryptV2 or TLSAuth)")
+	}
+	return nil
 }
 
 // validateScramble checks Config.Scramble for the well-formedness

@@ -24,9 +24,18 @@ import (
 	"github.com/n0madic/go-openvpn/internal/proto"
 	"github.com/n0madic/go-openvpn/internal/reliable"
 	"github.com/n0madic/go-openvpn/internal/session"
+	"github.com/n0madic/go-openvpn/internal/tlsauth"
 	"github.com/n0madic/go-openvpn/internal/tlscrypt"
 	"github.com/n0madic/go-openvpn/internal/transport"
 )
+
+// controlWrap is the minimal control-channel wrapper surface the server
+// simulator needs. Both *tlscrypt.Wrapper and *tlsauth.Authenticator satisfy
+// it, so the same simulator drives tls-crypt and tls-auth handshakes.
+type controlWrap interface {
+	Wrap(opcodeKID byte, sessionID uint64, plaintext []byte) []byte
+	Unwrap(pkt []byte) (opcodeKID byte, sessionID uint64, packetID uint32, plaintext []byte, err error)
+}
 
 // TestFirstPingAES256GCM verifies that a client opens a session
 // against a self-built server simulator, sends an IP packet through Tunnel,
@@ -379,6 +388,90 @@ func runPingWithCipher(t *testing.T, cipher string) {
 	}
 }
 
+// TestTLSAuthHandshake drives a full handshake + data echo over a tls-auth
+// (HMAC-only) control channel, proving client(Inverse) ↔ server(Normal)
+// interop through the session orchestrator — the analogue of runPingWithCipher
+// for tls-crypt.
+func TestTLSAuthHandshake(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	var staticKey [tlscrypt.StaticKeyLen]byte
+	if _, err := rand.Read(staticKey[:]); err != nil {
+		t.Fatal(err)
+	}
+	// The server uses the Normal orientation; the client (Inverse) is what
+	// session.Config produces from a tls-auth key (key-direction 1).
+	serverAuth, err := tlsauth.New(staticKey, tlscrypt.DirectionNormal, "SHA1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cTr, sTr := transport.MemoryPair()
+	cert, pool := genSelfSignedCert(t)
+
+	const peerID = uint32(99)
+	serverErrCh := make(chan error, 1)
+	go func() {
+		serverErrCh <- runServerWithDataEcho(ctx, sTr, serverAuth, cert, peerID, "AES-256-GCM", t)
+	}()
+
+	cfg := session.Config{
+		Network:    "memory",
+		RemoteAddr: "memB",
+		TLSConfig: &tls.Config{
+			ServerName: "localhost",
+			RootCAs:    pool,
+			MinVersion: tls.VersionTLS13,
+		},
+		TLSAuth:      staticKey[:],
+		KeyDirection: 1,
+		Ciphers:      []string{"AES-256-GCM"},
+	}
+	sess, err := session.DialWithTransport(ctx, cfg, cTr)
+	if err != nil {
+		t.Fatalf("client Dial (tls-auth): %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	payload := []byte("tls-auth echo")
+	if _, err := sess.Write(payload); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	buf := make([]byte, 1500)
+	done := make(chan error, 1)
+	go func() {
+		n, err := sess.Read(buf)
+		if err == nil && !bytes.Equal(buf[:n], payload) {
+			err = fmt.Errorf("echo mismatch: got %q", buf[:n])
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("read timed out")
+	}
+
+	if pr := sess.PushReply(); pr.PeerID != peerID {
+		t.Errorf("PeerID = %d, want %d", pr.PeerID, peerID)
+	}
+
+	_ = sess.Close()
+	select {
+	case err := <-serverErrCh:
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, transport.ErrClosed) {
+			t.Logf("server returned: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Log("server goroutine still running on test exit")
+	}
+}
+
 // runServerWithDataEcho runs a one-shot server that completes the handshake
 // then echoes back every P_DATA_V2 packet (after AEAD round-trip). A single
 // reader goroutine owns the transport and demuxes control/data; outbound
@@ -387,7 +480,7 @@ func runPingWithCipher(t *testing.T, cipher string) {
 func runServerWithDataEcho(
 	ctx context.Context,
 	tr transport.PacketConn,
-	wrap *tlscrypt.Wrapper,
+	wrap controlWrap,
 	cert tls.Certificate,
 	peerID uint32,
 	cipher string,
@@ -676,7 +769,7 @@ func continueServerSim(
 	ctx context.Context,
 	layer *reliable.Layer,
 	tr transport.PacketConn,
-	wrap *tlscrypt.Wrapper,
+	wrap controlWrap,
 	cert tls.Certificate,
 	peerID uint32,
 	cipher string,

@@ -92,6 +92,7 @@ through the SOCKS5 proxy).
 | Test | What it proves |
 |---|---|
 | `TestRealHandshakeUDP` | Hard reset → TLS 1.3 → KEY_METHOD 2 → PUSH_REPLY → EKM derivation all work against the real OpenVPN server |
+| `TestRealHandshakeTLSAuth` | Same handshake + ICMP data path against the **tls-auth** server (UDP/1196, HMAC-only control channel, SHA1 default, client `key-direction 1`) — proves the swap_hmac wire order and digest-size HMAC key interoperate with real OpenVPN |
 | `TestRealCipherNegotiation` | NCP: client pins AES-256-GCM / CHACHA20-POLY1305 / AES-128-GCM in turn, server agrees |
 | `TestRealPingGateway` | Full data path: AEAD seal/open round-trip via the actual TUN device + container kernel ICMP responder |
 | `TestRealExitNotify` | `Client.Close()` makes the server log `CC-EEN exit message received by peer` (explicit-exit-notify is reaching the wire) |
@@ -119,12 +120,21 @@ docker server, then drives it from an in-process SOCKS5 client.
 
 ## Server configuration
 
-`server.conf` runs a minimal mTLS + tls-crypt-v1 setup on UDP/1194:
+Two servers share one Docker image (config path selected by `$OVPN_CONFIG`):
+
+`server.conf` — mTLS + tls-crypt-v1 on UDP/1194 (the primary server used by the
+core, netstack and socks5 suites):
 
 - AEAD only: `data-ciphers AES-256-GCM:CHACHA20-POLY1305:AES-128-GCM`
 - TLS 1.3 (via `tls-min-version 1.2` default + Go client requesting 1.3)
 - Topology: `subnet`, subnet `10.8.0.0/24`, gateway 10.8.0.1
 - `reneg-sec 0` — automatic rekey disabled so tests control timing
+
+`server-tlsauth.conf` — mTLS + **tls-auth** on UDP/1196 (`openvpn-tlsauth`
+service): identical otherwise, but the control channel is HMAC-only with
+`tls-auth … 0` (server key-direction 0) and **no** `auth` directive, so it uses
+OpenVPN's SHA1 default — matching providers that omit `auth`. Exercised by
+`TestRealHandshakeTLSAuth`.
 
 ## PKI structure
 
@@ -137,7 +147,8 @@ server.crt          # SAN: test-server, localhost, 127.0.0.1
 server.key
 client.crt          # CN: test-client
 client.key
-tlscrypt.key        # 256-byte OpenVPN static key
+tlscrypt.key        # 256-byte OpenVPN static key (tls-crypt v1)
+tlsauth.key         # 256-byte OpenVPN static key (tls-auth)
 ```
 
 Everything is throwaway — `make clean` wipes it; `make pki` regenerates.

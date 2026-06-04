@@ -76,6 +76,11 @@ The OpenVPN client is built bottom-up as separately testable layers:
 internal/transport       UDP raw / TCP-with-16BE-length-prefix (PacketConn)
 internal/tlscrypt        AES-256-CTR + HMAC-SHA256 wrapper (v1) +
                          tls-crypt-v2 client bundle (Kc + WKc)
+internal/tlsauth         tls-auth control-channel HMAC (SHA1/256/512,
+                         digest-size keys, swap_hmac byte order). Reuses
+                         tlscrypt's key parsing + KEY_DIRECTION mapping.
+                         HMAC-only (no encryption); satisfies the same
+                         controlWrapper interface as tlscrypt.
 internal/reliable        Per-key-id reliability shim: msg_pid, retransmit
                          (1s→16s exp backoff, 8 retries), TCP-style fast
                          retransmit (3 higher-msgPID ACKs short-circuit
@@ -601,6 +606,9 @@ clients fall back to v4 inside the same connection.
 - Compression (`comp-lzo`, `compress lz4`) — return errors in the parser
 - Static-key only mode (no TLS) — TLS+NCP path only
 - Legacy CBC+HMAC data channel — AEAD only
-- `tls-auth` — modern `tls-crypt` and `tls-crypt-v2` only
 - `dev tap` — tun-mode only
 - KEY_METHOD 1 — KEY_METHOD 2 only
+- `cipher none` **data channel** — the parser *tolerates* the `cipher none`
+  directive (drops it; AEAD is negotiated via NCP), but a true null data
+  channel is NOT implemented. tls-auth (control channel) IS supported (see
+  `internal/tlsauth`).

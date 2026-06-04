@@ -38,6 +38,8 @@ type cliOpts struct {
 	keyFile        string
 	tlsCryptFile   string
 	tlsCryptV2File string
+	tlsAuthFile    string
+	auth           string
 	ciphers        string
 	port           string
 	sni            string
@@ -70,6 +72,8 @@ func parseFlags() *cliOpts {
 	flag.StringVar(&o.keyFile, "key", "", "PEM file with client private key (optional)")
 	flag.StringVar(&o.tlsCryptFile, "tls-crypt", "", "tls-crypt v1 static key file")
 	flag.StringVar(&o.tlsCryptV2File, "tls-crypt-v2", "", "tls-crypt-v2 client bundle file")
+	flag.StringVar(&o.tlsAuthFile, "tls-auth", "", "tls-auth static key file (HMAC-only control channel)")
+	flag.StringVar(&o.auth, "auth", "", "tls-auth control-channel HMAC digest (SHA1|SHA256|SHA512; default SHA1)")
 	flag.StringVar(&o.ciphers, "ciphers", "", "colon-separated AEAD cipher list (default: AES-256-GCM:CHACHA20-POLY1305:AES-128-GCM)")
 	flag.StringVar(&o.port, "port", "", "when -config lists multiple remotes, force this port (e.g. 1194)")
 	flag.StringVar(&o.sni, "sni", "", "override TLS ServerName / verify-x509-name")

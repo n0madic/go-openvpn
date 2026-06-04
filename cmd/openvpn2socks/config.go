@@ -58,6 +58,24 @@ func loadFromOvpnFile(opts *cliOpts, logger *slog.Logger) (*openvpn.Config, erro
 	if opts.ciphers != "" {
 		parsed.Config.Ciphers = strings.Split(opts.ciphers, ":")
 	}
+	// -auth overrides the tls-auth control-channel digest from the profile.
+	if opts.auth != "" {
+		parsed.Config.Auth = opts.auth
+	}
+	// -tls-auth overrides/supplies the tls-auth key; clear any tls-crypt key
+	// from the profile so exactly one control-channel key remains.
+	if opts.tlsAuthFile != "" {
+		b, err := os.ReadFile(opts.tlsAuthFile)
+		if err != nil {
+			return nil, fmt.Errorf("read -tls-auth: %w", err)
+		}
+		parsed.Config.TLSAuth = b
+		parsed.Config.TLSCryptV1 = nil
+		parsed.Config.TLSCryptV2 = nil
+		if parsed.Config.KeyDirection == 0 {
+			parsed.Config.KeyDirection = 1
+		}
+	}
 	return parsed.Config, nil
 }
 
@@ -66,8 +84,14 @@ func loadFromFlags(opts *cliOpts, _ *slog.Logger) (*openvpn.Config, error) {
 	if opts.server == "" {
 		return nil, errors.New("either -config or -server is required")
 	}
-	if opts.tlsCryptFile == "" && opts.tlsCryptV2File == "" {
-		return nil, errors.New("tls-crypt or tls-crypt-v2 is required (modern control-channel encryption)")
+	ctrlKeys := 0
+	for _, f := range []string{opts.tlsCryptFile, opts.tlsCryptV2File, opts.tlsAuthFile} {
+		if f != "" {
+			ctrlKeys++
+		}
+	}
+	if ctrlKeys != 1 {
+		return nil, errors.New("exactly one of -tls-crypt, -tls-crypt-v2 or -tls-auth is required (modern control-channel protection)")
 	}
 
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
@@ -117,6 +141,15 @@ func loadFromFlags(opts *cliOpts, _ *slog.Logger) (*openvpn.Config, error) {
 			return nil, fmt.Errorf("read -tls-crypt-v2: %w", err)
 		}
 		cfg.TLSCryptV2 = b
+	}
+	if opts.tlsAuthFile != "" {
+		b, err := os.ReadFile(opts.tlsAuthFile)
+		if err != nil {
+			return nil, fmt.Errorf("read -tls-auth: %w", err)
+		}
+		cfg.TLSAuth = b
+		cfg.Auth = opts.auth
+		cfg.KeyDirection = 1 // standard client (Inverse) orientation
 	}
 	if opts.ciphers != "" {
 		cfg.Ciphers = strings.Split(opts.ciphers, ":")

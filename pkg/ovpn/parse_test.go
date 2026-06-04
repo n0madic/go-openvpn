@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -168,13 +169,6 @@ dev tun
 proto udp
 remote vpn.example 1194
 compress lz4-v2
-<tls-crypt>` + tlsCryptInline() + `</tls-crypt>
-`,
-		"tls-auth": `client
-dev tun
-proto udp
-remote vpn.example 1194
-tls-auth ta.key 1
 <tls-crypt>` + tlsCryptInline() + `</tls-crypt>
 `,
 		"dev tap": `client
@@ -586,5 +580,175 @@ func TestParseScrambleAbsent(t *testing.T) {
 	}
 	if p.Config.Scramble != nil {
 		t.Errorf("Scramble=%+v, want nil", p.Config.Scramble)
+	}
+}
+
+// tlsAuthConfigSrc builds a minimal-but-valid tls-auth profile, splicing in
+// the supplied extra directive lines (e.g. `key-direction 1`, `auth SHA256`).
+func tlsAuthConfigSrc(extraLines string) string {
+	return `client
+dev tun
+proto udp
+remote vpn.example 1194
+verify-x509-name test-server name
+` + extraLines + `
+<tls-auth>` + tlsCryptInline() + `</tls-auth>
+`
+}
+
+func TestParseTLSAuthInline(t *testing.T) {
+	t.Parallel()
+	p, err := Parse(strings.NewReader(tlsAuthConfigSrc("key-direction 1")), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(p.Config.TLSAuth) == 0 {
+		t.Fatal("TLSAuth not populated from inline <tls-auth>")
+	}
+	if len(p.Config.TLSCryptV1) != 0 || len(p.Config.TLSCryptV2) != 0 {
+		t.Error("tls-crypt fields unexpectedly set for a tls-auth profile")
+	}
+	if p.Config.KeyDirection != 1 {
+		t.Errorf("KeyDirection=%d, want 1", p.Config.KeyDirection)
+	}
+}
+
+func TestParseKeyDirectionValues(t *testing.T) {
+	t.Parallel()
+	for _, kd := range []int{0, 1} {
+		p, err := Parse(strings.NewReader(tlsAuthConfigSrc("key-direction "+strconv.Itoa(kd))), nil)
+		if err != nil {
+			t.Fatalf("key-direction %d: Parse: %v", kd, err)
+		}
+		if p.Config.KeyDirection != kd {
+			t.Errorf("KeyDirection=%d, want %d", p.Config.KeyDirection, kd)
+		}
+	}
+	// Absent key-direction in a tls-auth profile defaults to 1.
+	p, err := Parse(strings.NewReader(tlsAuthConfigSrc("auth SHA256")), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.Config.KeyDirection != 1 {
+		t.Errorf("default KeyDirection=%d, want 1", p.Config.KeyDirection)
+	}
+	if p.Config.Auth != "SHA256" {
+		t.Errorf("Auth=%q, want SHA256", p.Config.Auth)
+	}
+	// Invalid key-direction is rejected.
+	if _, err := Parse(strings.NewReader(tlsAuthConfigSrc("key-direction 2")), nil); err == nil {
+		t.Error("expected error on key-direction 2")
+	}
+}
+
+func TestParseTLSAuthFileForm(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writeFile(t, dir, "ta.key", tlsCryptInline())
+	writeFile(t, dir, "client.ovpn", `client
+dev tun
+proto udp
+remote vpn.example 1194
+verify-x509-name test-server name
+tls-auth ta.key 1
+`)
+	p, err := ParseFile(filepath.Join(dir, "client.ovpn"), nil)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if len(p.Config.TLSAuth) == 0 {
+		t.Fatal("TLSAuth not loaded from ta.key")
+	}
+	if p.Config.KeyDirection != 1 {
+		t.Errorf("KeyDirection=%d, want 1 (from `tls-auth ta.key 1`)", p.Config.KeyDirection)
+	}
+}
+
+func TestParseCipherNoneTolerated(t *testing.T) {
+	t.Parallel()
+	p, err := Parse(strings.NewReader(tlsAuthConfigSrc("cipher none")), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(p.Config.Ciphers) != 0 {
+		t.Errorf("Ciphers=%v, want empty (NCP defaults)", p.Config.Ciphers)
+	}
+	// `none` mixed into data-ciphers is dropped, keeping the rest.
+	p2, err := Parse(strings.NewReader(tlsAuthConfigSrc("data-ciphers AES-256-GCM:none")), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(p2.Config.Ciphers) != 1 || p2.Config.Ciphers[0] != "AES-256-GCM" {
+		t.Errorf("Ciphers=%v, want [AES-256-GCM]", p2.Config.Ciphers)
+	}
+}
+
+func TestParseSetenvUV(t *testing.T) {
+	t.Parallel()
+	p, err := Parse(strings.NewReader(tlsAuthConfigSrc(
+		"setenv UV_LOCAL_ID_0 token-xyz\nsetenv FORWARD_COMPATIBLE 1")), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := p.Config.PeerInfoExtra["UV_LOCAL_ID_0"]; got != "token-xyz" {
+		t.Errorf("UV_LOCAL_ID_0=%q, want token-xyz", got)
+	}
+	if _, ok := p.Config.PeerInfoExtra["FORWARD_COMPATIBLE"]; ok {
+		t.Error("non-UV setenv leaked into PeerInfoExtra")
+	}
+}
+
+func TestParseTLSAuthCryptMutualExclusion(t *testing.T) {
+	t.Parallel()
+	src := `client
+dev tun
+proto udp
+remote vpn.example 1194
+verify-x509-name test-server name
+<tls-auth>` + tlsCryptInline() + `</tls-auth>
+<tls-crypt>` + tlsCryptInline() + `</tls-crypt>
+`
+	if _, err := Parse(strings.NewReader(src), nil); err == nil {
+		t.Fatal("expected mutual-exclusion error for tls-auth + tls-crypt")
+	}
+}
+
+// TestParseObfuscatedTLSAuthProfile is a smoke test over a profile that
+// combines every obfuscated-provider trait at once: scramble obfuscate +
+// tls-auth + key-direction + cipher none + setenv UV_*. It proves they all
+// coexist and map onto Config correctly.
+func TestParseObfuscatedTLSAuthProfile(t *testing.T) {
+	t.Parallel()
+	src := `client
+dev tun
+proto udp
+remote vpn.example 110
+verify-x509-name test-server name
+remote-cert-tls server
+auth-user-pass
+cipher none
+scramble obfuscate 831066042faf541ac9f25c7b5914d8ff
+setenv UV_LOCAL_ID_0 device-token-abc
+<tls-auth>` + tlsCryptInline() + `</tls-auth>
+key-direction 1
+`
+	p, err := Parse(strings.NewReader(src), nil)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(p.Config.TLSAuth) == 0 {
+		t.Error("TLSAuth empty")
+	}
+	if p.Config.KeyDirection != 1 {
+		t.Errorf("KeyDirection=%d, want 1", p.Config.KeyDirection)
+	}
+	if p.Config.Scramble == nil || p.Config.Scramble.Mode != openvpn.ScrambleObfuscate {
+		t.Error("scramble obfuscate not parsed")
+	}
+	if len(p.Config.Ciphers) != 0 {
+		t.Errorf("Ciphers=%v, want empty (cipher none dropped)", p.Config.Ciphers)
+	}
+	if got := p.Config.PeerInfoExtra["UV_LOCAL_ID_0"]; got != "device-token-abc" {
+		t.Errorf("UV_LOCAL_ID_0=%q, want device-token-abc", got)
 	}
 }

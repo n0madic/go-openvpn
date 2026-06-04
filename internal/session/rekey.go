@@ -313,6 +313,11 @@ func buildRekeyClientKM(s *Session) (proto.KeyMethod2, error) {
 	if s.cfg.PeerInfoVersion != "" {
 		pi.Set("IV_VER", s.cfg.PeerInfoVersion)
 	}
+	// Carry the same peer-info extras (e.g. UV_* tokens) the initial
+	// handshake advertised — some providers key per-session state on them.
+	for k, v := range s.cfg.PeerInfoExtra {
+		pi.Set(k, v)
+	}
 	km.PeerInfo = pi.Encode()
 	return km, nil
 }

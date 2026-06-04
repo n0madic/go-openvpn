@@ -13,6 +13,7 @@ TCP/IP stacks (gVisor netstack, Tailscale-style).
 | Modern wire protocol (P_CONTROL_V1, P_ACK_V1, P_DATA_V2, hard/soft reset) | ✅ |
 | tls-crypt v1 (AES-256-CTR + HMAC-SHA256 control channel encryption) | ✅ |
 | tls-crypt-v2 (per-client wrapped key, P_CONTROL_HARD_RESET_CLIENT_V3) | ✅ |
+| tls-auth (HMAC-SHA1/256/512 control channel, `key-direction`) | ✅ |
 | Reliability layer (in-order delivery, retransmit, ACKs, MTU chunking) | ✅ |
 | Inner TLS 1.2/1.3 with mTLS (crypto/tls) | ✅ |
 | KEY_METHOD 2 binary exchange | ✅ |
@@ -103,12 +104,14 @@ cli, err := openvpn.Dial(ctx, p.Config)
 ```
 
 Supports inline blocks (`<ca>`, `<cert>`, `<key>`, `<tls-crypt>`,
-`<tls-crypt-v2>`) and external file references resolved relative to the
-profile's directory. Multiple `remote` lines are exposed via `p.Remotes`
-(`remote-random` is honored; pass `ParseOptions.PickRemote` for custom
-selection). Legacy directives that conflict with the library's policy —
-`comp-lzo`, `compress lz4`, `tls-auth`, `dev tap`, non-AEAD `cipher` — return
-an error rather than silently going wrong; comfort directives
+`<tls-crypt-v2>`, `<tls-auth>`) and external file references resolved relative
+to the profile's directory. `key-direction`, the `auth` digest (for tls-auth),
+and `setenv UV_* <value>` peer-info tokens are honored. Multiple `remote` lines
+are exposed via `p.Remotes` (`remote-random` is honored; pass
+`ParseOptions.PickRemote` for custom selection). Legacy directives that conflict
+with the library's policy — `comp-lzo`, `compress lz4`, `dev tap`, non-AEAD
+`cipher` — return an error rather than silently going wrong; `cipher none` is
+tolerated (dropped — AEAD is negotiated via NCP) and comfort directives
 (`persist-key`, `nobind`, …) are accepted as no-ops.
 
 ### Userspace TCP/IP via gVisor netstack

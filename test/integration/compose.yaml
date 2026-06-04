@@ -1,8 +1,12 @@
-# docker compose v2 file for the OpenVPN 2.6 integration-test server.
+# docker compose v2 file for the OpenVPN 2.6 integration-test servers.
 #
-# Runs ONE openvpn server with mTLS + tls-crypt v1 on UDP/1194. The container
-# needs /dev/net/tun and NET_ADMIN to bring up its tun0 interface. On Docker
-# Desktop for macOS, the embedded Linux VM provides tun.
+# Two openvpn servers share the same image:
+#   - openvpn         — mTLS + tls-crypt v1 on UDP/1194 (the primary server
+#                       used by the core, netstack and socks5 suites)
+#   - openvpn-tlsauth — mTLS + tls-auth (HMAC-only) on UDP/1196 (exercises the
+#                       tls-auth control channel)
+# Each container needs /dev/net/tun and NET_ADMIN to bring up its tun0
+# interface. On Docker Desktop for macOS, the embedded Linux VM provides tun.
 services:
   openvpn:
     build:
@@ -18,6 +22,29 @@ services:
     volumes:
       - ./pki:/etc/openvpn/pki:ro
       - ./server.conf:/etc/openvpn/server.conf:ro
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "test -e /dev/net/tun"]
+      interval: 2s
+      timeout: 1s
+      retries: 5
+
+  openvpn-tlsauth:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: go-openvpn-test-server-tlsauth
+    environment:
+      - OVPN_CONFIG=/etc/openvpn/server-tlsauth.conf
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "1196:1196/udp"
+    volumes:
+      - ./pki:/etc/openvpn/pki:ro
+      - ./server-tlsauth.conf:/etc/openvpn/server-tlsauth.conf:ro
     restart: "no"
     healthcheck:
       test: ["CMD-SHELL", "test -e /dev/net/tun"]
