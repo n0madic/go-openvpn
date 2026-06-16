@@ -10,7 +10,7 @@ library never pulls heavy dependencies (gVisor) into its graph:
 | Path | Module path | Purpose | Heavy deps |
 |---|---|---|---|
 | `/` | `github.com/n0madic/go-openvpn` | Core OpenVPN 2.6+ client library + `pkg/ovpn` (.ovpn parser). Pure stdlib + `golang.org/x/crypto`. | none |
-| `pkg/netstack/` | `github.com/n0madic/go-openvpn/pkg/netstack` | gVisor userspace TCP/IP stack on top of the tunnel `net.Conn`. | `gvisor.dev/gvisor` |
+| `pkg/netstack/` | `github.com/n0madic/go-openvpn/pkg/netstack` | Thin adapter bridging `*openvpn.Client` to the `github.com/n0madic/go-tun2net` userspace gVisor TCP/IP stack. Re-exports `Net`/`New`/`ErrTunnelIPChanged`; the heavy stack lives in go-tun2net. | `github.com/n0madic/go-tun2net` (→ gVisor) |
 | `examples/netstack-http/` | `github.com/n0madic/go-openvpn/examples/netstack-http` | Standalone HTTP-over-netstack demo. | (transitively gVisor) |
 | `cmd/openvpn2socks/` | `github.com/n0madic/go-openvpn/cmd/openvpn2socks` | SOCKS5 proxy CLI. | (transitively gVisor) |
 
@@ -25,7 +25,7 @@ directory** — the root `go.mod` is not a workspace; there is no top-level
 
 ```bash
 go test -race -count=1 ./...                        # from repo root: core lib + pkg/ovpn + 7 internal/ pkgs
-cd pkg/netstack && go test -race -count=1 ./...
+cd pkg/netstack && go test -race -count=1 ./...     # adapter only (PushReply→TunConfig mapping)
 cd cmd/openvpn2socks && go test -race -count=1 ./...
 ```
 
@@ -33,18 +33,19 @@ cd cmd/openvpn2socks && go test -race -count=1 ./...
 
 ```bash
 cd test/integration
-make all          # pki + up + wait + (3-module test run) + down
+make all          # pki + up + wait + (2-module test run) + down
 make up && make wait      # just bring the server up
-make test                  # run all 3 modules' integration tests (-tags=integration)
+make test                  # run both modules' integration tests (-tags=integration)
 make logs                  # tail server logs
 make down                  # stop and remove the container
 make clean                 # also wipe ./pki
 ```
 
-`make test` runs three invocations sequentially:
+`make test` runs two invocations sequentially:
 1. `test/integration/` (core library, 5 tests)
-2. `pkg/netstack/` (userspace TCP/IP, 2 integration tests)
-3. `cmd/openvpn2socks/` (SOCKS5 daemon, 5 e2e tests)
+2. `cmd/openvpn2socks/` (SOCKS5 daemon, 5 e2e tests) — also the end-to-end
+   coverage of the pkg/netstack adapter over go-tun2net (the userspace TCP/IP
+   stack itself is tested upstream in go-tun2net).
 
 To switch back to OpenVPN 2.7.x: change `FROM alpine:latest` →
 `FROM alpine:edge` in `test/integration/Dockerfile`.
@@ -183,9 +184,9 @@ internal/session         Orchestrator. Goroutines per active session
   "works for a bit, reconnects, then nothing works forever" zombie-loop bug.
   **Always call the returned detach from your Close path** if the hook's
   target outlives shorter than the Client, else the closure keeps a torn-down
-  target alive and may deref dead fields. `pkg/netstack/netstack.go::Net.New`
-  registers via this hook so the gVisor NIC stays in sync; `Net.Close`
-  invokes the detach.
+  target alive and may deref dead fields. `pkg/netstack`'s adapter forwards
+  this hook to go-tun2net (via `clientTunnel.OnReconfigure`) so the gVisor NIC
+  stays in sync; the stack's `Close` invokes the detach.
 
 ### Key protocol nuances (caught against real OpenVPN — preserve when editing)
 
@@ -316,9 +317,9 @@ internal/session         Orchestrator. Goroutines per active session
    session `age` as the inbound floor, so a never-replied TCP flow trips the
    watchdog instead of hiding behind a zero timestamp; the aggregate channel
    deliberately does NOT use that floor (it required both sides observed
-   once, kept for test stability). `sniffL4` mirrors
-   `pkg/netstack/endpoint.dispatchInbound`, kept private to session so the
-   watchdog doesn't drag a netstack dep into the core library. Thresholds
+   once, kept for test stability). `sniffL4` mirrors go-tun2net's inbound
+   L4 demux, kept private to session so the watchdog doesn't drag a
+   netstack/gVisor dep into the core library. Thresholds
    are Config-tunable (sub-second in tests). Don't unify with
    pingRestartWatch — independent by design so one fires no matter which
    signal is fake.
@@ -374,116 +375,70 @@ internal/session         Orchestrator. Goroutines per active session
     `delta_hard_reset_in` so an operator sees the server-side give-up
     long before either watch crosses its threshold.
 
-### gVisor netstack adapter (`pkg/netstack/`)
+### netstack adapter (`pkg/netstack/`)
 
-`Net.DialContext` supports both `tcp[/4/6]` and `udp[/4/6]`. Hosts must be
-literal IPs — DNS resolution is the caller's responsibility (see
-`cmd/openvpn2socks/resolver.go` for tunneled-UDP DNS). The `endpoint`
-inside is a `stack.LinkEndpoint` that pumps IP packets between the gVisor
-stack and the tunnel `net.Conn` without any link-layer header
-(ARPHardwareNone, MaxHeaderLength=0).
+`pkg/netstack` is now a **thin shim** (`netstack.go`, ~70 lines) over
+`github.com/n0madic/go-tun2net`. It implements go-tun2net's `PacketTunnel`
+interface on top of `*openvpn.Client` and re-exports the resulting stack:
 
-**Conservative NIC MTU (`safeInnerMTU=1400`):** the gVisor NIC's
-MTU is always clamped to 1400, regardless of what the server's
-PUSH_REPLY says. With OpenVPN encap (24 B) + outer UDP (8 B) +
-outer IPv4 (20 B) = 52 B of overhead, an inner IP packet of 1400
-becomes a 1452-byte wire datagram — well under 1500 (ethernet),
-1492 (PPPoE), 1480 (VPN-in-VPN). This is the architectural
-equivalent of the official OpenVPN client's runtime MSS clamping
-(`mssfix=1492` rewriting TCP MSS option on every TCP SYN, see
-`src/openvpn/mss.c::mss_fixup_dowork`) — but **simpler in our
-architecture**: gVisor *is* the OS stack for apps inside the
-tunnel, so configuring its NIC MTU directly causes gVisor TCP to
-auto-negotiate the right MSS (NIC_MTU - 40 = 1360) on every SYN
-it emits; apps respect it, no runtime packet rewriting needed.
-Without this, a naive 1500-byte inner MTU produces ~1552-byte
-outer datagrams that fragment or silently drop on any path with
-a strict 1500-byte MTU — which manifests as "tunnel works for a
-while then degrades under sustained TCP load", a pattern we hit
-in early testing. Applied at both `New` time and on every
-reconnect via `clampInnerMTU` so a server pushing a different MTU
-after AutoReconnect still gets clamped.
+- `netstack.Net` is a type alias for `tun2net.Net`; `netstack.New(cli)` calls
+  `tun2net.New(clientTunnel{cli}, cli.Logger())`; `netstack.ErrTunnelIPChanged`
+  re-exports `tun2net.ErrTunnelIPChanged` (so the `errors.Is` check in
+  `socks5_tcp.go` still matches).
+- `clientTunnel` wires the four interface methods to the client:
+  `TunnelConn()→cli.Tunnel()`,
+  `Config()→pushReplyToTunConfig(cli.PushedOptions())`,
+  `SetInbound(fn)→cli.SetIngressHandler(fn)`,
+  `OnReconfigure(fn)→cli.OnReconnect(pr→fn(pushReplyToTunConfig(pr)))`. Its
+  `Close()` closes the client so `(*Net).CloseAll` tears the client down too.
+- `pushReplyToTunConfig` maps `openvpn.PushReply` → `tun2net.TunConfig` 1:1
+  (only `MTU int`→`uint32`; go-tun2net does the clamping). This pure function
+  is unit-tested in `netstack_test.go`; the stack itself is integration-tested
+  upstream in go-tun2net and end-to-end via `cmd/openvpn2socks`.
 
-**Reconnect synchronisation:** the NIC address / routes / MTU are NOT
-fixed at construction. `Net.New` registers an `openvpn.Client.OnReconnect`
-hook that re-runs `Net.applyPushReply` against every freshly-installed
-session's PUSH_REPLY. Without this, the NIC keeps the *first* session's
-tunnel IP even after reconnect, so post-reconnect packets carry the old
-source IP and the server drops them — there's no protocol-level error
-back, just silent black-hole. The hook updates IPv4 + IPv6 addresses
-(new before old, no transient unconfigured-NIC window), reinstalls the
-route table (`SetRouteTable` replaces, not merges), and refreshes the
-endpoint MTU.
+`Net.DialContext` supports both `tcp[/4/6]` and `udp[/4/6]`; hosts must be
+literal IPs (DNS resolution is the caller's responsibility — see
+`cmd/openvpn2socks/resolver.go`).
 
-**Zombie-endpoint cleanup on reconnect (unconditional):** existing TCP/UDP
-gVisor conns bound to the OLD local IP become zombies when the tunnel IP
-changes — they retransmit with a now-invalid src IP, the server drops them,
-and gVisor TCP takes 60-120s to give up, so apps stall. To match the OS
-kernel's `RTM_CHANGE` on utun (which `ECONNRESET`s existing sockets the
-moment the interface address changes), `Net` tracks every `net.Conn` from
-`DialContext` in an `activeConns sync.Map` (via a `trackedConn` that
-deregisters on `Close`). The OnReconnect hook runs `applyPushReply` to
-install the new addresses, then **unconditionally** force-closes every
-tracked conn via `closeActiveOnReconnect` — apps see an immediate error,
-retry, and the new gVisor endpoint binds to the current local IP and
-registers with the new server session. Pre-/post-reconnect IPs are logged
-but no longer drive policy.
+**The stack behaviour itself lives in go-tun2net** — don't reimplement it in
+this shim: conservative NIC MTU clamping (`safeInnerMTU=1400`, the
+architectural equivalent of OpenVPN's runtime `mssfix=1492` — gVisor *is* the
+apps' OS stack so its NIC MTU auto-negotiates the right MSS on every SYN, no
+packet rewriting), reconnect resync of NIC address/routes/MTU from each new
+`Config()`/`OnReconfigure()`, unconditional force-close of conns bound to the
+old tunnel IP (ProtonVPN often hands back the same local IP while the
+server-side session is brand new, so even an unchanged 4-tuple must be reset or
+gVisor TCP zombies for 60-120s), IPv6 default-route synthesis (`::/0 →
+RemoteIP6`), and the per-L4 data-path stats logger. Bug reports about those
+behaviours belong upstream in go-tun2net. go-tun2net has no tag yet — it is
+pinned by pseudo-version in `pkg/netstack/go.mod`.
 
-**Why unconditional, not just "IP changed":** an earlier version preserved
-conns when the tunnel IP stayed the same, assuming existing 4-tuples
-remained valid (server NAT routes by IP, not peer-id). Field evidence killed
-that: ProtonVPN routinely hands back the same local IP across reconnects
-while the server-side session is brand new (different peer_id) with the old
-connection state gone — so even with the same 4-tuple the server doesn't
-route our old conns, gVisor TCP retransmits 60-120s, apps stall, and
-`dataActivityWatch` fires a *second* reconnect seconds later. Log symptom: a
-healthy "reconnect successful" then `tcp_current_established>0` with zero TCP
-delta_in for a minute, then another reconnect. Force-closing everything
-restores liveness in under a second. The `trackedConn` wrapper forwards
-`CloseWrite()`/`CloseRead()` so the `socks5_tcp.go::proxy` type assertion
-(`interface{ CloseWrite() error }`) still matches TCP-backed conns; for UDP
-they're no-op safe.
+The remaining two companion fixes stay in THIS repo because they live on the
+`openvpn.Client` / SOCKS5 side, not inside the stack:
 
 **openvpn2socks-level companion fix:** `connRateLimiter.Reset()` is
-invoked from a second `cli.OnReconnect` hook installed in `main.go`.
+invoked from a second `cli.OnReconnect` hook installed in `main.go`
+(the first being the one the netstack adapter forwards to go-tun2net).
 Without it, the per-host CONNECT burst limiter would refuse the
-flood of legitimate retries that follow the netstack-level
+flood of legitimate retries that follow go-tun2net's reconnect
 force-close (browser tab fan-out reopening dozens of conns to the
 same target IP in <1s) with `repConnRefused` for the first window,
 even though the new tunnel is otherwise healthy.
 
-**Data-path observability:** the LinkEndpoint exposes atomic
-counters for every IP packet it sees in each direction, bucketed
-by L4 protocol via a 1-byte sniff of the IP header
-(`statsOutPackets`, `statsInPackets`, `statsInTCP`, `statsInUDP`,
-`statsInICMP`). These are independent from the session-level
-`statsOutboundOK` counter (which counts ALL transport writes
-including PINGs and other non-gVisor traffic) — divergence
-between the two localises whether a stuck data path is inside or
-outside the netstack. `statsLoggerLoop` dumps the counters plus
-key fields from `stack.Stats()` (TCP retransmits/resets/send-
-errors, UDP packets-sent/received/unknown-port, IP packets/
-malformed, DroppedPackets) every `statsLogPeriod=30s` at Debug
-level — anything unusual auto-escalates to Warn so `-v` is not
-required to see real problems.
-
-**Pure observability — no actions.** An earlier "data-path health watchdog"
-goroutine called `cli.RequestRestart` on app-level "TCP-deaf"/"UDP-deaf"/
-"TCP-RST-storm" signatures, escalating to `os.Exit(99)` after two triggers.
-**It was removed** — every failure case on a real ProtonVPN tunnel was the
-watchdog creating the problem: the triggering metric (DNS UDP timeout,
-transient RST burst from busy browsing) was an app-level hiccup, not a dead
-tunnel — the protocol layer flowed, `dataActivityWatch`/`pingRestartWatch`
-weren't firing. Its AutoReconnect changed the tunnel IP; gVisor TCP
-endpoints on the OLD IP became zombies retransmitting an invalid src IP, the
-server dropped them, `ep_in_tcp` read zero, the watchdog called that
-"tcp-deaf" and hit `os.Exit(99)`. The official OpenVPN CLI runs stably for
-hours against the same endpoint with no such gymnastics. The counters and
-`statsLoggerLoop` stayed (useful for diagnosis). **Lesson: don't act on
-app-level metrics when a protocol-level self-healing layer
-(`pingRestartWatch`, `dataActivityWatch`, `hardResetWatch`, server RESTART)
-already exists** — they're noisier than the protocol's own keepalive/restart
-signals, and acting on them turns false signals into real outages.
+**Lesson worth keeping (don't act on app-level metrics).** go-tun2net's
+per-L4 data-path counters and `stack.Stats()` dump are for *diagnosis only*.
+An earlier openvpn2socks "data-path health watchdog" goroutine acted on them —
+calling `cli.RequestRestart` on app-level "TCP-deaf"/"UDP-deaf"/"TCP-RST-storm"
+signatures, escalating to `os.Exit(99)`. **It was removed**: every failure on a
+real ProtonVPN tunnel was the watchdog creating the problem — the triggering
+metric (a DNS UDP timeout, a transient RST burst from busy browsing) was an
+app-level hiccup, not a dead tunnel, while the protocol layer was still flowing
+and `dataActivityWatch`/`pingRestartWatch` weren't firing. Its restart changed
+the tunnel IP, zombified gVisor TCP, `ep_in_tcp` read zero, the watchdog called
+that "tcp-deaf" and exited. **Don't act on app-level metrics when a
+protocol-level self-healing layer (`pingRestartWatch`, `dataActivityWatch`,
+`hardResetWatch`, server RESTART) already exists** — acting on them turns false
+signals into real outages.
 
 **Consecutive-stall surrender (protocol-level, NOT app-level).** A different
 failure mode — an upstream rate-limit/blackhole keyed on something stable
@@ -510,20 +465,14 @@ lesson above): only `dataActivityWatch`'s `RestartError{Reason:"data-
 activity stuck"}` counts, and only when the session lived less than the
 threshold; normal longer-lived stalls and other reasons never increment.
 
-**IPv6 plumbing:** the parser splits dual-stack data into separate
-fields — `PushReply.LocalIP6` (a `netip.Prefix` from `ifconfig-ipv6
-<addr>/<plen> <peer>`) and `PushReply.RemoteIP6` (the peer side of
-that same directive). `LocalIP` always stays IPv4 (from `ifconfig`),
-so do NOT test `LocalIP.Is6()` to decide whether to configure the v6
-NIC — read `LocalIP6` instead. OpenVPN has no `route-gateway-ipv6`
-directive: standard practice is to use `RemoteIP6` as the v6 default
-next-hop, so `buildRoutes` synthesises `::/0 → RemoteIP6` whenever
-`RemoteIP6` is valid (symmetric to the v4 `route-gateway` path). An
-explicit server-pushed `route-ipv6 ::/0` is harmless — gVisor's
-first-hit route matching tolerates the duplicate. Without this
-synthesis, providers that push only `ifconfig-ipv6` (no `route-ipv6
-::/0`) get a v6 NIC address but no way out, which surfaces as
-`"connect tcp [...]: no route to host"` on every v6 dial.
+**IPv6 PushReply fields (core parser, still relevant here):** the parser
+splits dual-stack data into separate fields — `PushReply.LocalIP6` (a
+`netip.Prefix` from `ifconfig-ipv6 <addr>/<plen> <peer>`) and
+`PushReply.RemoteIP6` (the peer side of that same directive). `LocalIP`
+always stays IPv4 (from `ifconfig`), so do NOT test `LocalIP.Is6()` to decide
+whether the tunnel carries IPv6 — read `LocalIP6` instead. `pushReplyToTunConfig`
+passes both straight through; go-tun2net synthesises the `::/0 → RemoteIP6`
+default route (OpenVPN has no `route-gateway-ipv6` directive).
 
 ### SOCKS5 daemon (`cmd/openvpn2socks/`)
 

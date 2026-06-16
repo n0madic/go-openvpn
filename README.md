@@ -133,8 +133,10 @@ httpClient := &http.Client{Transport: &http.Transport{DialContext: ns.DialContex
 resp, _ := httpClient.Get("http://10.8.0.1:8080/")
 ```
 
-The netstack package lives in its own Go module so the core library does not
-pull gVisor into its dependency graph. A runnable CLI demo is at
+`pkg/netstack` is a thin adapter over
+[`github.com/n0madic/go-tun2net`](https://github.com/n0madic/go-tun2net) (the
+userspace gVisor stack); it lives in its own Go module so the core library does
+not pull gVisor into its dependency graph. A runnable CLI demo is at
 `examples/netstack-http/`.
 
 ### Custom transport (proxy chaining, obfuscation)
@@ -261,9 +263,10 @@ the client against it. Tests cover: handshake, ICMP echo through
 the data channel, NCP cipher pinning for all three AEAD variants, a full
 soft-reset rekey cycle with end-to-end ping verification,
 explicit-exit-notify (`Close()` triggers the server's
-`CC-EEN exit message received` marker), plus two gVisor-netstack tests
-that TCP-dial a socat echo on `10.8.0.1:8080` through the tunnel (30-byte
-round-trip and 256 KB transfer).
+`CC-EEN exit message received` marker). The userspace TCP/IP path
+(socat echo on `10.8.0.1:8080` through the tunnel) is exercised end-to-end by
+the `cmd/openvpn2socks` SOCKS5 integration tests; the gVisor stack itself is
+tested upstream in `go-tun2net`.
 
 Implementing this against the real binary surfaced and fixed five protocol
 quirks that the simulator alone could not catch:
