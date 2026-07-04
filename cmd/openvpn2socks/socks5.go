@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -174,8 +175,12 @@ func (s *socks5Server) handle(ctx context.Context, conn net.Conn) {
 		s.log.Debug("greet failed", "remote", conn.RemoteAddr(), "err", err)
 		return
 	}
-	// Clear handshake deadline; per-command handlers manage their own.
-	_ = conn.SetDeadline(time.Time{})
+	// Keep a deadline covering request parsing too. A client that completes
+	// the greet and then stalls before sending its request would otherwise
+	// block io.ReadFull in readRequest forever, pinning this goroutine + fd
+	// (a slow-loris that can exhaust the daemon's budget). Handlers clear the
+	// deadline below once the request is parsed.
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 
 	req, err := readRequest(br)
 	if err != nil {
@@ -183,6 +188,9 @@ func (s *socks5Server) handle(ctx context.Context, conn net.Conn) {
 		_ = writeReply(conn, repGeneralFailure, netip.AddrPortFrom(netip.IPv4Unspecified(), 0))
 		return
 	}
+	// Request parsed — clear the handshake deadline; per-command handlers
+	// manage their own for the relay phase.
+	_ = conn.SetDeadline(time.Time{})
 
 	switch req.cmd {
 	case cmdConnect:
@@ -255,7 +263,14 @@ func (s *socks5Server) subnegUserPass(br *bufio.Reader, w io.Writer) error {
 		return fmt.Errorf("subneg pass: %w", err)
 	}
 
-	ok := string(user) == s.authUser && string(pass) == s.authPass
+	// Constant-time compare so response latency doesn't leak how many leading
+	// bytes of the credentials matched (a timing oracle for password guessing,
+	// meaningful when the listener is bound to a non-loopback address). Bitwise
+	// & avoids the short-circuit of && that would otherwise skip the pass
+	// comparison when the username is wrong.
+	userOK := subtle.ConstantTimeCompare(user, []byte(s.authUser))
+	passOK := subtle.ConstantTimeCompare(pass, []byte(s.authPass))
+	ok := userOK&passOK == 1
 	status := byte(0x01)
 	if ok {
 		status = 0x00

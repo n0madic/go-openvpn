@@ -249,3 +249,33 @@ func TestUDPContextCancel(t *testing.T) {
 		t.Fatal("expected error after cancel")
 	}
 }
+
+// TestMemoryPairConcurrentWriteClose stresses the previously-racy path where
+// one side's WritePacket sent into the peer's channel at the same instant the
+// peer's Close closed that channel — a "send on closed channel" panic. With
+// done-channel shutdown (q is never closed) this must run cleanly, no panic.
+func TestMemoryPairConcurrentWriteClose(t *testing.T) {
+	for range 300 {
+		a, b := MemoryPair()
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				_ = a.WritePacket(context.Background(), []byte("x"))
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				_ = b.WritePacket(context.Background(), []byte("y"))
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			_ = b.Close()
+		}()
+		wg.Wait()
+		_ = a.Close()
+	}
+}

@@ -597,6 +597,17 @@ func (s *Session) WriteCtx(ctx context.Context, p []byte) (int, error) {
 	// safe.
 	data.ReleaseSealedBuf(wire)
 	if werr != nil {
+		// If the session's own context is cancelled, the write failed because
+		// we're tearing down — surface the protocol-level close reason (a
+		// *RestartError when a watchdog set one) so the Tunnel reconnect path
+		// can classify it, instead of leaking a bare context.Canceled that
+		// errors.As(&RestartError) won't match. Mirrors ReadCtx, which checks
+		// closedErr() first on both of its close branches. A caller-deadline
+		// cancellation leaves s.ctx.Err() nil, so the DeadlineExceeded still
+		// flows through untouched.
+		if s.ctx.Err() != nil {
+			return 0, s.closedErr()
+		}
 		s.statsOutboundErr.Add(1)
 		s.lastOutboundErrNs.Store(time.Now().UnixNano())
 		// Per-error logging is Debug because the aggregate is the
@@ -835,14 +846,32 @@ func (s *Session) sendExitNotifyBestEffort(timeout time.Duration) {
 		return
 	}
 	deadline := time.Now().Add(timeout)
-	_ = c.SetWriteDeadline(deadline)
-	if _, err := c.Write([]byte("EXIT\x00")); err != nil {
-		s.log.Debug("explicit-exit-notify write failed", "err", err)
+	// Write EXIT from a detached goroutine. c.Write goes through the reliable
+	// layer, whose Write parks on queueCond while the outbound queue is full
+	// waiting for ACKs a dead peer will never send. We must NOT let that block
+	// Close() forever: shutdown() runs right after this returns and closes the
+	// layer, which broadcasts queueCond and unblocks the parked write — so the
+	// goroutine never leaks. (SetWriteDeadline is intentionally not used here:
+	// the reliable Adapter only honours past deadlines, so a future one is a
+	// no-op and would give false confidence.)
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		if _, err := c.Write([]byte("EXIT\x00")); err != nil {
+			s.log.Debug("explicit-exit-notify write failed", "err", err)
+		}
+	}()
+	select {
+	case <-writeDone:
+	case <-time.After(time.Until(deadline)):
+		// Write still parked on a full queue — hand off to shutdown().
+		s.log.Debug("explicit-exit-notify write timed out")
 		return
 	}
-	// Wait for the active reliable layer to drain its outbound queue (i.e.
-	// the server ACKed our EXIT). Otherwise the in-flight packet may be
-	// cancelled by shutdown() and never reach the wire.
+	// Write enqueued — wait (within the remaining deadline) for the active
+	// reliable layer to drain its outbound queue, i.e. the server ACKed our
+	// EXIT. Otherwise the in-flight packet may be cancelled by shutdown() and
+	// never reach the wire.
 	layer := s.layers.Get(s.slots.ActiveKID())
 	if layer == nil {
 		return
@@ -1197,15 +1226,24 @@ func (s *Session) handleControlIn(pkt []byte, opcode proto.Opcode, kid uint8) {
 			if kid == nextKeyID(active) {
 				s.log.Info("server-initiated rekey detected, kicking off our side",
 					"server_kid", kid, "active_kid", active)
-				go func() {
-					rkCtx, cancel := context.WithTimeout(s.ctx, 60*time.Second)
+				// Run under s.workers so shutdown() (which Shutdowns workers
+				// BEFORE its retire-all-layers loop) waits for this to finish:
+				// otherwise a Close racing between PerformSoftReset's closed
+				// check and its layers.Install could leave the new layer never
+				// retired. If Go returns false, shutdown already began — skip.
+				started := s.workers.Go("serverRekey", func(ctx context.Context) {
+					rkCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 					defer cancel()
 					if err := s.rekeyMgr.PerformSoftReset(rkCtx); err != nil &&
 						!errors.Is(err, ErrRekeyInProgress) {
 						s.log.Error("server-initiated rekey failed",
 							"err", err, "server_kid", kid)
 					}
-				}()
+				})
+				if !started {
+					s.log.Debug("server-initiated rekey skipped: session shutting down",
+						"server_kid", kid)
+				}
 				return
 			}
 			s.log.Debug("server SOFT_RESET on unexpected key-id",
@@ -1295,15 +1333,25 @@ func (s *Session) writeLoop(layer *reliable.Layer) {
 			if err := s.transport.WritePacket(s.ctx, wrapped); err != nil {
 				s.statsOutboundErr.Add(1)
 				s.lastOutboundErrNs.Store(time.Now().UnixNano())
-				if !errors.Is(err, context.Canceled) && !errors.Is(err, transport.ErrClosed) {
-					s.log.Warn("transport WritePacket failed (control)",
-						"err", err,
-						"opcode", out.Opcode,
-						"kid", out.KeyID,
-						"outbound_err_total", s.statsOutboundErr.Load(),
-					)
+				if errors.Is(err, context.Canceled) || errors.Is(err, transport.ErrClosed) {
+					// Session tearing down — exit the loop.
+					return
 				}
-				return
+				// Transient transport error (e.g. ENOBUFS after the
+				// transport's own backoff gave up). Do NOT kill the control
+				// channel: the reliable layer keeps this packet in its
+				// retransmit queue, so tickLoop re-emits it on the next
+				// timer. Returning here would silently mute the layer's
+				// control channel until the ~80s retransmit-exhaustion path
+				// finally noticed — the same failure the keepalive loop's
+				// continue-on-error guards against.
+				s.log.Warn("transport WritePacket failed (control), continuing",
+					"err", err,
+					"opcode", out.Opcode,
+					"kid", out.KeyID,
+					"outbound_err_total", s.statsOutboundErr.Load(),
+				)
+				continue
 			}
 		}
 	}

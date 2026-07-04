@@ -241,6 +241,16 @@ func TestTokenize(t *testing.T) {
 		{`remote "vpn host" 1194`, []string{"remote", "vpn host", "1194"}},
 		{"   leading  spaces  ", []string{"leading", "spaces"}},
 		{"", nil},
+		// Single-quoted string (OpenVPN options.c::parse_line).
+		{`push 'route 10.0.0.0'`, []string{"push", "route 10.0.0.0"}},
+		// Backslash escapes a space outside quotes.
+		{`path C:\\Program\ Files\\vpn`, []string{"path", `C:\Program Files\vpn`}},
+		// Backslash inside double quotes escapes the quote.
+		{`arg "a\"b"`, []string{"arg", `a"b`}},
+		// Backslash is literal inside single quotes.
+		{`arg 'a\b'`, []string{"arg", `a\b`}},
+		// Empty quoted string is a real, distinct argument.
+		{`push ""`, []string{"push", ""}},
 	}
 	for _, tc := range tests {
 		got, err := tokenize(tc.in)
@@ -253,7 +263,59 @@ func TestTokenize(t *testing.T) {
 		}
 	}
 	if _, err := tokenize(`bad "unterminated`); err == nil {
-		t.Error("expected error on unterminated quote")
+		t.Error("expected error on unterminated double quote")
+	}
+	if _, err := tokenize(`bad 'unterminated`); err == nil {
+		t.Error("expected error on unterminated single quote")
+	}
+	if _, err := tokenize(`trailing\`); err == nil {
+		t.Error("expected error on trailing backslash escape")
+	}
+}
+
+// TestParseBOM verifies a leading UTF-8 BOM (common from Windows editors) is
+// stripped so the first directive still parses.
+func TestParseBOM(t *testing.T) {
+	t.Parallel()
+	src := "\ufeff" + `client
+dev tun
+proto udp
+remote vpn.example.test 1194
+<ca>
+` + caInline() + `</ca>
+<tls-crypt>` + tlsCryptInline() + `</tls-crypt>
+`
+	p, err := Parse(strings.NewReader(src), nil)
+	if err != nil {
+		t.Fatalf("Parse with BOM: %v", err)
+	}
+	if p.Config.RemoteAddr != "vpn.example.test:1194" {
+		t.Errorf("RemoteAddr=%q, want vpn.example.test:1194 (BOM not stripped?)", p.Config.RemoteAddr)
+	}
+}
+
+// TestTLSCryptEmptyFile verifies an empty control-channel key file is rejected
+// at parse time with a message naming the file, rather than passing the parser
+// (non-nil, zero-length slice) and failing later inside Dial.
+func TestTLSCryptEmptyFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writeFile(t, dir, "ca.pem", caInline())
+	writeFile(t, dir, "empty.key", "")
+	confPath := filepath.Join(dir, "client.ovpn")
+	writeFile(t, dir, "client.ovpn", `client
+dev tun
+proto udp
+remote vpn.example 1194
+ca ca.pem
+tls-crypt empty.key
+`)
+	_, err := ParseFile(confPath, nil)
+	if err == nil {
+		t.Fatal("expected error for empty tls-crypt key file")
+	}
+	if !strings.Contains(err.Error(), "empty") {
+		t.Errorf("error %q does not mention the empty key file", err)
 	}
 }
 

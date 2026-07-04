@@ -4,15 +4,71 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/netip"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// --- DNS response builders for parseDNSAnswers tests ---
+
+func encDNSName(name string) []byte {
+	var b []byte
+	if name != "" {
+		for _, part := range strings.Split(name, ".") {
+			b = append(b, byte(len(part)))
+			b = append(b, part...)
+		}
+	}
+	return append(b, 0)
+}
+
+func buildDNSResp(id, flags uint16, qname string, qtype uint16, answers [][]byte) []byte {
+	hdr := make([]byte, 12)
+	binary.BigEndian.PutUint16(hdr[0:2], id)
+	binary.BigEndian.PutUint16(hdr[2:4], flags)
+	binary.BigEndian.PutUint16(hdr[4:6], 1) // QDCOUNT
+	binary.BigEndian.PutUint16(hdr[6:8], uint16(len(answers)))
+	b := append([]byte(nil), hdr...)
+	b = append(b, encDNSName(qname)...)
+	qt := make([]byte, 4)
+	binary.BigEndian.PutUint16(qt[0:2], qtype)
+	binary.BigEndian.PutUint16(qt[2:4], 1) // CLASS IN
+	b = append(b, qt...)
+	for _, a := range answers {
+		b = append(b, a...)
+	}
+	return b
+}
+
+func aRecord(owner string, ip [4]byte) []byte {
+	b := encDNSName(owner)
+	rr := make([]byte, 10)
+	binary.BigEndian.PutUint16(rr[0:2], dnsTypeA)
+	binary.BigEndian.PutUint16(rr[2:4], 1)   // CLASS IN
+	binary.BigEndian.PutUint32(rr[4:8], 300) // TTL
+	binary.BigEndian.PutUint16(rr[8:10], 4)  // RDLEN
+	b = append(b, rr...)
+	return append(b, ip[:]...)
+}
+
+func cnameRecord(owner, target string) []byte {
+	b := encDNSName(owner)
+	tgt := encDNSName(target)
+	rr := make([]byte, 10)
+	binary.BigEndian.PutUint16(rr[0:2], dnsTypeCNAME)
+	binary.BigEndian.PutUint16(rr[2:4], 1)
+	binary.BigEndian.PutUint32(rr[4:8], 300)
+	binary.BigEndian.PutUint16(rr[8:10], uint16(len(tgt)))
+	b = append(b, rr...)
+	return append(b, tgt...)
+}
 
 func mustAddr(t *testing.T, s string) netip.Addr {
 	t.Helper()
@@ -283,7 +339,7 @@ func TestParseDNSAnswersNXDomain(t *testing.T) {
 		0x80, 0x03,
 		0, 0, 0, 0, 0, 0, 0, 0,
 	}
-	_, err := parseDNSAnswers(resp, 0x1234, dnsTypeA)
+	_, err := parseDNSAnswers(resp, 0x1234, dnsTypeA, "host")
 	if err == nil {
 		t.Fatal("expected error for NXDOMAIN response")
 	}
@@ -307,7 +363,7 @@ func TestParseDNSAnswersNoData(t *testing.T) {
 		0, 1, // QTYPE=A
 		0, 1, // QCLASS=IN
 	}
-	_, err := parseDNSAnswers(resp, 0x1234, dnsTypeA)
+	_, err := parseDNSAnswers(resp, 0x1234, dnsTypeA, "host")
 	if err == nil {
 		t.Fatal("expected error for NOERROR/0-answers response")
 	}
@@ -327,7 +383,7 @@ func TestParseDNSAnswersServfail(t *testing.T) {
 		0x80, 0x02, // QR=1, RCODE=2 SERVFAIL
 		0, 0, 0, 0, 0, 0, 0, 0,
 	}
-	_, err := parseDNSAnswers(resp, 0x1234, dnsTypeA)
+	_, err := parseDNSAnswers(resp, 0x1234, dnsTypeA, "host")
 	if err == nil {
 		t.Fatal("expected error for SERVFAIL response")
 	}
@@ -379,12 +435,9 @@ func TestResolverStats(t *testing.T) {
 	want := []netip.Addr{mustAddr(t, "1.2.3.4")}
 	r.cacheSet("example.com", want)
 
-	if _, _ = r.cacheGet("example.com"); true {
-	}
-	if _, _ = r.cacheGet("example.com"); true {
-	}
-	if _, _ = r.cacheGet("nope"); true {
-	}
+	_, _ = r.cacheGet("example.com")
+	_, _ = r.cacheGet("example.com")
+	_, _ = r.cacheGet("nope")
 
 	hits, misses := r.Stats()
 	// cacheGet does not bump the counters itself — LookupIP does.
@@ -434,4 +487,53 @@ func errorsIsAuthoritativeNoData(err error) bool {
 		cur = u.Unwrap()
 	}
 	return false
+}
+
+// TestParseDNSAnswersRejectsMismatchedOwner confirms an answer RR whose owner
+// name is neither the queried name nor a followed CNAME target is dropped —
+// defending against records injected under an unrelated name.
+func TestParseDNSAnswersRejectsMismatchedOwner(t *testing.T) {
+	t.Parallel()
+	resp := buildDNSResp(0x1234, 0x8180, "example.com", dnsTypeA, [][]byte{
+		aRecord("evil.attacker", [4]byte{203, 0, 113, 9}), // injected
+		aRecord("example.com", [4]byte{93, 184, 216, 34}), // the real answer
+	})
+	got, err := parseDNSAnswers(resp, 0x1234, dnsTypeA, "example.com")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(got) != 1 || got[0].String() != "93.184.216.34" {
+		t.Fatalf("got %v, want only [93.184.216.34] (injected record not dropped)", got)
+	}
+}
+
+// TestParseDNSAnswersFollowsCNAME confirms A records owned by a CNAME target
+// reached from the queried name are accepted.
+func TestParseDNSAnswersFollowsCNAME(t *testing.T) {
+	t.Parallel()
+	resp := buildDNSResp(0x1234, 0x8180, "www.example.com", dnsTypeA, [][]byte{
+		cnameRecord("www.example.com", "host.cdn.net"),
+		aRecord("host.cdn.net", [4]byte{1, 2, 3, 4}),
+	})
+	got, err := parseDNSAnswers(resp, 0x1234, dnsTypeA, "www.example.com")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(got) != 1 || got[0].String() != "1.2.3.4" {
+		t.Fatalf("got %v, want [1.2.3.4] via CNAME chain", got)
+	}
+}
+
+// TestParseDNSAnswersTruncated confirms a TC-flagged response is a transport
+// failure, NOT an authoritative "no records" (which would block fallback).
+func TestParseDNSAnswersTruncated(t *testing.T) {
+	t.Parallel()
+	resp := buildDNSResp(0x1234, 0x8380, "example.com", dnsTypeA, nil) // TC=0x0200
+	_, err := parseDNSAnswers(resp, 0x1234, dnsTypeA, "example.com")
+	if err == nil {
+		t.Fatal("expected error for truncated (TC) response")
+	}
+	if errorsIsAuthoritativeNoData(err) {
+		t.Fatalf("TC response misclassified as authoritative no-data: %v", err)
+	}
 }

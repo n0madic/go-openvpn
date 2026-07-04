@@ -134,15 +134,15 @@ type udpRelayMgr struct {
 	s       *socks5Server
 	udpConn *net.UDPConn
 	mu      sync.Mutex
-	relays  map[string]*udpRelay
-	// inflight tracks in-flight DialContext calls keyed by targetAddr so a
-	// burst of datagrams to the same target only spawns one dial (and one
-	// relay), eliminating the leak where a losing-race conn was orphaned.
-	inflight map[string]*sync.WaitGroup
+	// relays is keyed by the client-visible destination (host:port as the
+	// client addressed it), NOT the resolved IP:port — so two names that
+	// resolve to the same address stay distinct flows and each reply's
+	// DST.ADDR echoes the name the client actually sent.
+	relays map[string]*udpRelay
 	// closed gates new map writes after closeAll has begun shutdown.
 	// Without it, a pumpClientToTunnel currently sleeping inside
 	// getOrCreate's DialContext could re-acquire mu *after* closeAll
-	// nilled m.relays and panic on `m.relays[targetAddr] = r`.
+	// nilled m.relays and panic on `m.relays[relayKey] = r`.
 	closed bool
 	// wg tracks every goroutine the manager spawns (pumpClientToTunnel
 	// and per-target pumpTunnelToClient) so closeAll can wait for them
@@ -166,7 +166,6 @@ func newUDPRelayMgr(s *socks5Server, udpConn *net.UDPConn, expectedIP netip.Addr
 		s:            s,
 		udpConn:      udpConn,
 		relays:       map[string]*udpRelay{},
-		inflight:     map[string]*sync.WaitGroup{},
 		expectedIP:   expectedIP,
 		expectedPort: expectedPort,
 	}
@@ -201,7 +200,6 @@ func (m *udpRelayMgr) closeAll() {
 
 	m.mu.Lock()
 	m.relays = nil
-	m.inflight = nil
 	m.mu.Unlock()
 }
 
@@ -285,6 +283,10 @@ func (m *udpRelayMgr) pumpClientToTunnel(ctx context.Context) {
 			continue
 		}
 		targetAddr := net.JoinHostPort(ips[0].String(), strconv.Itoa(int(port)))
+		// Key the relay by what the client asked for, not the resolved IP:port,
+		// so two names sharing an IP don't collapse into one flow (which would
+		// echo the wrong DST.ADDR back to the client).
+		relayKey := net.JoinHostPort(host, strconv.Itoa(int(port)))
 
 		// Per-target token bucket — symmetric to TCP CONNECT — consumed
 		// only on the FIRST datagram to a target. Otherwise a legitimate
@@ -296,7 +298,7 @@ func (m *udpRelayMgr) pumpClientToTunnel(ctx context.Context) {
 		// UDP burst can starve TCP CONNECTs to the same IP for several
 		// seconds. We charge per new flow, matching how TCP CONNECT
 		// charges per connection establishment.
-		if m.s.connRate != nil && !m.hasRelay(targetAddr) {
+		if m.s.connRate != nil && !m.hasRelay(relayKey) {
 			if !m.s.connRate.allow(ips[0]) {
 				m.s.log.Debug("UDP relay: per-host rate limit",
 					"target", ips[0], "port", port, "host", host)
@@ -304,7 +306,7 @@ func (m *udpRelayMgr) pumpClientToTunnel(ctx context.Context) {
 			}
 		}
 
-		relay, err := m.getOrCreate(ctx, host, port, targetAddr, client)
+		relay, err := m.getOrCreate(ctx, relayKey, host, port, targetAddr, client)
 		if err != nil {
 			if errors.Is(err, errRelayMgrClosed) {
 				return
@@ -320,89 +322,74 @@ func (m *udpRelayMgr) pumpClientToTunnel(ctx context.Context) {
 	}
 }
 
-// getOrCreate looks up (or creates) a relay keyed by target address. When
-// creating, spawns a tunnel→client reader goroutine for that target.
+// getOrCreate looks up (or creates) a relay keyed by relayKey (the client's
+// requested host:port), dialing the resolved targetAddr when creating and
+// spawning a tunnel→client reader goroutine for it.
 //
-// Concurrency: dialing the netstack can take milliseconds. We hold m.mu for
-// the cheap lookup; if not present, we register a sync.WaitGroup as an
-// "in-flight" marker so concurrent calls block on it instead of racing to
-// dial duplicate conns (the previous design leaked one *gonet.UDPConn +
-// one pumpTunnelToClient goroutine per losing race).
-func (m *udpRelayMgr) getOrCreate(ctx context.Context, dstHost string, dstPort uint16, targetAddr string, client *net.UDPAddr) (*udpRelay, error) {
-	for {
-		m.mu.Lock()
-		if m.closed {
-			m.mu.Unlock()
-			return nil, errRelayMgrClosed
-		}
-		if r, ok := m.relays[targetAddr]; ok {
-			m.mu.Unlock()
-			return r, nil
-		}
-		if wg, ok := m.inflight[targetAddr]; ok {
-			m.mu.Unlock()
-			wg.Wait() // another goroutine is dialing; spin and re-check.
-			continue
-		}
-		wg := &sync.WaitGroup{}
-		wg.Add(1)
-		m.inflight[targetAddr] = wg
+// Only ever called from the single pumpClientToTunnel goroutine, so no
+// dial-dedup synchronisation is needed: nothing else inserts into m.relays,
+// and dropping m.mu across the (millisecond) DialContext can't race a
+// concurrent create for the same key.
+func (m *udpRelayMgr) getOrCreate(ctx context.Context, relayKey, dstHost string, dstPort uint16, targetAddr string, client *net.UDPAddr) (*udpRelay, error) {
+	m.mu.Lock()
+	if m.closed {
 		m.mu.Unlock()
-
-		conn, err := m.s.ns.DialContext(ctx, "udp", targetAddr)
-		m.mu.Lock()
-		delete(m.inflight, targetAddr)
-		if err != nil {
-			m.mu.Unlock()
-			wg.Done()
-			return nil, err
-		}
-		// Manager was shut down while we were dialing — drop the
-		// freshly-dialed conn instead of leaking it into a nilled map.
-		if m.closed {
-			m.mu.Unlock()
-			wg.Done()
-			_ = conn.Close()
-			return nil, errRelayMgrClosed
-		}
-		r := &udpRelay{
-			target:     conn,
-			clientAddr: client,
-			dstHost:    dstHost,
-			dstPort:    dstPort,
-		}
-		r.touch()
-		m.relays[targetAddr] = r
-		// Add must happen under mu so closeAll's snapshot+Wait either
-		// sees this goroutine in the WaitGroup or sees closed=true above.
-		m.wg.Add(1)
+		return nil, errRelayMgrClosed
+	}
+	if r, ok := m.relays[relayKey]; ok {
 		m.mu.Unlock()
-		wg.Done()
-
-		go func() {
-			defer m.wg.Done()
-			m.pumpTunnelToClient(ctx, targetAddr, r)
-		}()
 		return r, nil
 	}
+	m.mu.Unlock()
+
+	conn, err := m.s.ns.DialContext(ctx, "udp", targetAddr)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	// Manager was shut down while we were dialing — drop the freshly-dialed
+	// conn instead of leaking it into a nilled map.
+	if m.closed {
+		m.mu.Unlock()
+		_ = conn.Close()
+		return nil, errRelayMgrClosed
+	}
+	r := &udpRelay{
+		target:     conn,
+		clientAddr: client,
+		dstHost:    dstHost,
+		dstPort:    dstPort,
+	}
+	r.touch()
+	m.relays[relayKey] = r
+	// Add must happen under mu so closeAll's snapshot+Wait either sees this
+	// goroutine in the WaitGroup or sees closed=true above.
+	m.wg.Add(1)
+	m.mu.Unlock()
+
+	go func() {
+		defer m.wg.Done()
+		m.pumpTunnelToClient(ctx, relayKey, r)
+	}()
+	return r, nil
 }
 
-// hasRelay reports whether a relay for the given targetAddr already exists.
+// hasRelay reports whether a relay for the given relayKey already exists.
 // Used by the inbound UDP loop to skip per-host rate-limit consumption on
 // subsequent datagrams in an established flow.
-func (m *udpRelayMgr) hasRelay(targetAddr string) bool {
+func (m *udpRelayMgr) hasRelay(relayKey string) bool {
 	m.mu.Lock()
-	_, ok := m.relays[targetAddr]
+	_, ok := m.relays[relayKey]
 	m.mu.Unlock()
 	return ok
 }
 
 // removeRelay deletes r from the registry, closing the target conn.
-func (m *udpRelayMgr) removeRelay(targetAddr string) {
+func (m *udpRelayMgr) removeRelay(relayKey string) {
 	m.mu.Lock()
-	r, ok := m.relays[targetAddr]
+	r, ok := m.relays[relayKey]
 	if ok {
-		delete(m.relays, targetAddr)
+		delete(m.relays, relayKey)
 	}
 	m.mu.Unlock()
 	if ok && r != nil {
@@ -414,8 +401,8 @@ func (m *udpRelayMgr) removeRelay(targetAddr string) {
 // back to the client wrapped in a SOCKS5 UDP header. On read error / idle
 // timeout the relay is removed from the registry so the next client
 // datagram can spawn a fresh one.
-func (m *udpRelayMgr) pumpTunnelToClient(ctx context.Context, targetAddr string, r *udpRelay) {
-	defer m.removeRelay(targetAddr)
+func (m *udpRelayMgr) pumpTunnelToClient(ctx context.Context, relayKey string, r *udpRelay) {
+	defer m.removeRelay(relayKey)
 	buf := make([]byte, udpMaxPayload)
 	for {
 		if ctx.Err() != nil {

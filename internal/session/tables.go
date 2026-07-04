@@ -34,6 +34,18 @@ func (t *slotTable) Install(s *data.Slot, makeActive bool) {
 	}
 }
 
+// RetireIf removes the slot for kid only if it is still the exact object the
+// caller installed. Guards the fast-rekey wrap-around case: after 7 rekeys
+// key-id values recycle, so a transition-window timer scheduled for an old
+// slot must not evict a freshly-installed slot that happens to share the kid.
+func (t *slotTable) RetireIf(kid uint8, want *data.Slot) {
+	t.mu.Lock()
+	if t.byKID[kid] == want {
+		delete(t.byKID, kid)
+	}
+	t.mu.Unlock()
+}
+
 // Get returns the slot for the given key-id (nil if absent).
 func (t *slotTable) Get(kid uint8) *data.Slot {
 	t.mu.RLock()
@@ -66,11 +78,31 @@ func newLayerTable() *layerTable {
 	return &layerTable{byKID: make(map[uint8]*reliable.Layer)}
 }
 
-// Install registers a layer.
-func (t *layerTable) Install(kid uint8, l *reliable.Layer) {
+// Install registers a layer, returning any different layer it displaced under
+// the same key-id (nil if none) so the caller can Close it. A displacement
+// only happens in the fast-rekey wrap-around case (key-id recycled before the
+// previous holder's transition window elapsed); leaving the old layer in place
+// would leak its write/tick goroutines.
+func (t *layerTable) Install(kid uint8, l *reliable.Layer) (displaced *reliable.Layer) {
 	t.mu.Lock()
+	if prev, ok := t.byKID[kid]; ok && prev != l {
+		displaced = prev
+	}
 	t.byKID[kid] = l
 	t.mu.Unlock()
+	return displaced
+}
+
+// RetireIf removes and returns the layer for kid only if it is still the exact
+// object the caller installed (nil otherwise). See slotTable.RetireIf.
+func (t *layerTable) RetireIf(kid uint8, want *reliable.Layer) *reliable.Layer {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if l, ok := t.byKID[kid]; ok && l == want {
+		delete(t.byKID, kid)
+		return l
+	}
+	return nil
 }
 
 // Get returns the layer for the given key-id (nil if absent).

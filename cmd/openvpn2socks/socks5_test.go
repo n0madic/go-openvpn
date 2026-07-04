@@ -227,7 +227,7 @@ func TestParseDNSQueryAndAnswer(t *testing.T) {
 	resp.Write([]byte{0xC0, 0x0C})
 	resp.Write([]byte{0, 1, 0, 1, 0, 0, 1, 0x2C, 0, 4, 93, 184, 216, 34})
 
-	got, err := parseDNSAnswers(resp.Bytes(), 0x4242, dnsTypeA)
+	got, err := parseDNSAnswers(resp.Bytes(), 0x4242, dnsTypeA, "example.com")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestParseDNSWrongID(t *testing.T) {
 	resp := make([]byte, 12)
 	binary.BigEndian.PutUint16(resp[0:2], 0xDEAD)
 	binary.BigEndian.PutUint16(resp[2:4], 0x8000)
-	if _, err := parseDNSAnswers(resp, 0xBEEF, dnsTypeA); err == nil {
+	if _, err := parseDNSAnswers(resp, 0xBEEF, dnsTypeA, "example.com"); err == nil {
 		t.Fatal("expected id mismatch error")
 	}
 }
@@ -371,7 +371,7 @@ func TestServeShutdownReleasesStuckHandler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	if _, err := client.Write([]byte{0x05, 0x01, 0x00}); err != nil {
 		t.Fatalf("write greet: %v", err)
 	}

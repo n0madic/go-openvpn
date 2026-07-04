@@ -12,6 +12,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -127,10 +128,16 @@ const dnsStatsLogPeriod = 30 * time.Second
 // CONNECTs to `random-${i}.example.com`.
 const dnsCacheGCPeriod = 5 * time.Minute
 
+// dnsSharedResolveTimeout bounds a singleflight-shared resolution once it is
+// detached from the leader caller's context. Generous enough to cover the full
+// override → pushed → public-fallback chain (each qtype capped at ~3s) without
+// running unbounded if every waiter has already given up.
+const dnsSharedResolveTimeout = 30 * time.Second
+
 // dnsCacheMaxEntries caps the cache to prevent unbounded growth between
-// GC sweeps. When the cap is reached cacheSet evicts the entry that
-// expires soonest — a cheap O(n) walk that is acceptable because we only
-// pay it on insertion-while-full, not on every Set.
+// GC sweeps. When the cap is reached cacheSet evicts the soonest-expiring
+// entry from a small random sample (O(1) amortised) rather than scanning the
+// whole map, so a sustained unique-host stream can't pin the shared cache lock.
 const dnsCacheMaxEntries = 8192
 
 // Stats returns lifetime cumulative cache-hit and cache-miss counters.
@@ -236,11 +243,24 @@ func (r *resolver) cacheSet(host string, ips []netip.Addr) {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
 	if _, exists := r.cache[host]; !exists && len(r.cache) >= dnsCacheMaxEntries {
+		// Evict from a small random sample rather than scanning the whole
+		// map. Under a sustained stream of unique hosts the cache stays pinned
+		// at the cap, so a full O(n) walk on every insert — under the global
+		// lock that every cacheGet/cacheSet shares — would degrade resolve
+		// latency for ALL clients, not just the one generating load. Sampling
+		// K entries (Go map iteration is randomised) and evicting the
+		// soonest-expiring among them is O(1) amortised and keeps eviction
+		// quality close to true soonest-expiry.
+		const evictSample = 8
 		var evictKey string
 		var evictAt time.Time
+		seen := 0
 		for k, e := range r.cache {
 			if evictKey == "" || e.expires.Before(evictAt) {
 				evictKey, evictAt = k, e.expires
+			}
+			if seen++; seen >= evictSample {
+				break
 			}
 		}
 		if evictKey != "" {
@@ -314,24 +334,34 @@ func (r *resolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, err
 	}
 	r.statsCacheMiss.Add(1)
 
-	// Deduplicate concurrent misses for the same host. singleflight
-	// returns the leader's result to every waiter — if the leader writes
-	// to the cache, followers' subsequent cacheGet (re-checked after Do
-	// returns) hits. We do not re-check the cache inside Do because the
-	// leader unconditionally runs the resolution path; followers receive
-	// the leader's value directly. Use a defensive copy: x/sync returns
-	// the same shared value to all waiters, and downstream code may
-	// mutate the slice (e.g. filterUsableIPs).
-	v, err, _ := r.inflight.Do(host, func() (any, error) {
-		return r.lookupIPUncached(ctx, host)
+	// Deduplicate concurrent misses for the same host. The shared resolution
+	// is detached from the singleflight leader's context: whichever caller
+	// became leader may have a shorter deadline than the followers waiting on
+	// it, and they must not inherit the leader's (possibly imminent)
+	// cancellation — otherwise a second browser tab resolving the same domain
+	// spuriously fails just because the first tab's request started earlier.
+	// context.WithoutCancel preserves ctx values; a fresh timeout bounds the
+	// work. Each caller still waits via its OWN ctx in the select below, so a
+	// caller with a tight deadline bails without poisoning the others.
+	resCh := r.inflight.DoChan(host, func() (any, error) {
+		shared, cancel := context.WithTimeout(context.WithoutCancel(ctx), dnsSharedResolveTimeout)
+		defer cancel()
+		return r.lookupIPUncached(shared, host)
 	})
-	if err != nil {
-		return nil, err
+	select {
+	case res := <-resCh:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		// Defensive copy: x/sync returns the same shared value to all
+		// waiters, and downstream code may mutate the slice (filterUsableIPs).
+		src := res.Val.([]netip.Addr)
+		out := make([]netip.Addr, len(src))
+		copy(out, src)
+		return out, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	src := v.([]netip.Addr)
-	out := make([]netip.Addr, len(src))
-	copy(out, src)
-	return out, nil
 }
 
 // lookupIPUncached runs the full resolution chain (tunneled resolvers →
@@ -601,7 +631,7 @@ func (r *resolver) queryOne(conn net.Conn, host string, qtype uint16) ([]netip.A
 	if err != nil {
 		return nil, err
 	}
-	return parseDNSAnswers(buf[:n], id, qtype)
+	return parseDNSAnswers(buf[:n], id, qtype, host)
 }
 
 // newDNSTxID returns a cryptographically-random DNS transaction ID. Using
@@ -619,8 +649,9 @@ func newDNSTxID() (uint16, error) {
 // --- minimal RFC 1035 codec (only what we need: single QNAME, A/AAAA) ---
 
 const (
-	dnsTypeA    uint16 = 1
-	dnsTypeAAAA uint16 = 28
+	dnsTypeA     uint16 = 1
+	dnsTypeCNAME uint16 = 5
+	dnsTypeAAAA  uint16 = 28
 )
 
 // buildDNSQuery encodes a recursion-desired query for one QNAME / QTYPE.
@@ -668,10 +699,12 @@ func labels(name string) func(yield func(string) bool) {
 	}
 }
 
-// parseDNSAnswers extracts A or AAAA records from a response. Validates the
-// header (ID/QR/RCODE) but does not strictly validate the question section —
-// just skips past it to reach answers.
-func parseDNSAnswers(resp []byte, wantID uint16, wantType uint16) ([]netip.Addr, error) {
+// parseDNSAnswers extracts A or AAAA records from a response for qname.
+// Validates the header (ID/QR/TC/RCODE) and the owner name of every answer RR
+// against qname and any CNAME chain it establishes, so records injected under
+// a different name (off-path spoofing, a compromised resolver padding an
+// otherwise-valid reply) are dropped.
+func parseDNSAnswers(resp []byte, wantID uint16, wantType uint16, qname string) ([]netip.Addr, error) {
 	if len(resp) < 12 {
 		return nil, errors.New("dns: response too short")
 	}
@@ -682,6 +715,15 @@ func parseDNSAnswers(resp []byte, wantID uint16, wantType uint16) ([]netip.Addr,
 	flags := binary.BigEndian.Uint16(resp[2:4])
 	if flags&0x8000 == 0 {
 		return nil, errors.New("dns: not a response")
+	}
+	if flags&0x0200 != 0 {
+		// TC (truncated): the answer didn't fit the UDP datagram. Do NOT let a
+		// partial parse masquerade as an authoritative "no records" (which
+		// would wrongly block the system-resolver fallback). Report a
+		// transport-class failure so the caller tries another resolver. (A
+		// full fix retries over TCP; A/AAAA rarely truncate, so we settle for
+		// classifying it correctly rather than silently dropping records.)
+		return nil, errors.New("dns: truncated response (TC set)")
 	}
 	rcode := flags & 0x000F
 	switch rcode {
@@ -711,10 +753,15 @@ func parseDNSAnswers(resp []byte, wantID uint16, wantType uint16) ([]netip.Addr,
 		pos += 4 // QTYPE+QCLASS
 	}
 
+	// Names we trust as answer owners: the queried name plus any CNAME target
+	// reached from an already-trusted name.
+	accepted := map[string]bool{canonicalDNSName(qname): true}
+
 	var out []netip.Addr
 	for i := 0; i < int(ancount); i++ {
+		var owner string
 		var err error
-		pos, err = skipName(resp, pos)
+		owner, pos, err = decodeName(resp, pos)
 		if err != nil {
 			return nil, err
 		}
@@ -728,9 +775,27 @@ func parseDNSAnswers(resp []byte, wantID uint16, wantType uint16) ([]netip.Addr,
 		if pos+rdlen > len(resp) {
 			return nil, errors.New("dns: truncated rdata")
 		}
+		rdataStart := pos
 		rdata := resp[pos : pos+rdlen]
 		pos += rdlen
+
+		if typ == dnsTypeCNAME {
+			// Extend the trusted-name chain, but only from a name we already
+			// trust — an attacker can't bootstrap trust with a CNAME whose
+			// owner we never asked for.
+			if accepted[owner] {
+				if target, _, derr := decodeName(resp, rdataStart); derr == nil {
+					accepted[target] = true
+				}
+			}
+			continue
+		}
 		if typ != wantType {
+			continue
+		}
+		// Drop A/AAAA records whose owner name is neither the queried name nor
+		// a CNAME target we followed — i.e. injected under an unrelated name.
+		if !accepted[owner] {
 			continue
 		}
 		switch typ {
@@ -776,4 +841,82 @@ func skipName(buf []byte, pos int) (int, error) {
 		}
 		pos += 1 + int(c)
 	}
+}
+
+// decodeName decodes a (possibly compressed) DNS name at pos into a canonical
+// lowercase dotted string, and returns the position just past the name in the
+// linear record stream (past the first compression pointer, if any).
+// Compression pointers must point strictly backwards, which — together with a
+// hard jump cap — prevents pointer loops.
+func decodeName(buf []byte, pos int) (string, int, error) {
+	var sb strings.Builder
+	next := -1
+	jumps := 0
+	p := pos
+	for {
+		if p >= len(buf) {
+			return "", 0, errors.New("dns: name overruns buffer")
+		}
+		c := buf[p]
+		if c == 0 {
+			if next < 0 {
+				next = p + 1
+			}
+			break
+		}
+		if c&0xC0 == 0xC0 {
+			if p+1 >= len(buf) {
+				return "", 0, errors.New("dns: truncated compression pointer")
+			}
+			ptr := (int(c&0x3F) << 8) | int(buf[p+1])
+			if next < 0 {
+				next = p + 2
+			}
+			if ptr >= p {
+				return "", 0, errors.New("dns: non-backward compression pointer")
+			}
+			p = ptr
+			if jumps++; jumps > 32 {
+				return "", 0, errors.New("dns: too many compression pointers")
+			}
+			continue
+		}
+		if c&0xC0 != 0 {
+			return "", 0, errors.New("dns: bad label length")
+		}
+		ll := int(c)
+		p++
+		if p+ll > len(buf) {
+			return "", 0, errors.New("dns: label overruns buffer")
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte('.')
+		}
+		for _, b := range buf[p : p+ll] {
+			sb.WriteByte(asciiLower(b))
+		}
+		p += ll
+		if sb.Len() > 253 {
+			return "", 0, errors.New("dns: name too long")
+		}
+	}
+	return sb.String(), next, nil
+}
+
+// canonicalDNSName lowercases a hostname and strips any trailing dot so it
+// compares equal to the names decodeName returns.
+func canonicalDNSName(name string) string {
+	name = strings.TrimSuffix(name, ".")
+	b := []byte(name)
+	for i, c := range b {
+		b[i] = asciiLower(c)
+	}
+	return string(b)
+}
+
+func asciiLower(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
 }

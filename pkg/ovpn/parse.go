@@ -230,6 +230,12 @@ func (s *parseState) run(r io.Reader) error {
 	for sc.Scan() {
 		lineNo++
 		raw := sc.Text()
+		if lineNo == 1 {
+			// Strip a leading UTF-8 BOM (EF BB BF) that Windows editors often
+			// prepend. Without this the first directive — or an opening inline
+			// tag like <ca> — fails to match and produces a confusing error.
+			raw = strings.TrimPrefix(raw, "\ufeff")
+		}
 		line := stripComment(raw)
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -338,30 +344,49 @@ func readInlineBlock(sc *bufio.Scanner, name string, startLine int) ([]byte, int
 	return nil, line, fmt.Errorf("unterminated <%s> block (started at line %d)", name, startLine)
 }
 
-// tokenize splits a line into whitespace-separated tokens, with support for
-// double-quoted strings.
+// tokenize splits a line into whitespace-separated tokens, mirroring OpenVPN's
+// options.c::parse_line: double quotes, single quotes, and backslash escaping.
+// Inside single quotes backslash is literal; elsewhere it escapes the next
+// byte. Empty quoted strings ("" or ”) produce an empty token, matching
+// OpenVPN (a quoted empty arg is a real, distinct argument).
 func tokenize(s string) ([]string, error) {
 	var out []string
 	var cur strings.Builder
-	inQuote := false
+	started := false // a token is in progress (possibly empty, e.g. from "")
+	inDouble := false
+	inSingle := false
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
-		case c == '"':
-			inQuote = !inQuote
-		case !inQuote && (c == ' ' || c == '\t'):
-			if cur.Len() > 0 {
+		case c == '\\' && !inSingle:
+			// Backslash escapes the next byte outside single quotes.
+			i++
+			if i >= len(s) {
+				return nil, errors.New("trailing backslash escape")
+			}
+			cur.WriteByte(s[i])
+			started = true
+		case c == '"' && !inSingle:
+			inDouble = !inDouble
+			started = true
+		case c == '\'' && !inDouble:
+			inSingle = !inSingle
+			started = true
+		case !inDouble && !inSingle && (c == ' ' || c == '\t'):
+			if started {
 				out = append(out, cur.String())
 				cur.Reset()
+				started = false
 			}
 		default:
 			cur.WriteByte(c)
+			started = true
 		}
 	}
-	if inQuote {
+	if inDouble || inSingle {
 		return nil, errors.New("unterminated quoted string")
 	}
-	if cur.Len() > 0 {
+	if started {
 		out = append(out, cur.String())
 	}
 	return out, nil
@@ -728,6 +753,9 @@ func (s *parseState) loadTLSCryptFile(args []string, v2 bool) error {
 	if err != nil {
 		return fmt.Errorf("tls-crypt: %w", err)
 	}
+	if len(b) == 0 {
+		return fmt.Errorf("tls-crypt: key file %q is empty", args[0])
+	}
 	if v2 {
 		s.tlsCV2 = b
 	} else {
@@ -746,6 +774,9 @@ func (s *parseState) loadTLSAuthFile(args []string) error {
 	b, err := os.ReadFile(s.resolvePath(args[0]))
 	if err != nil {
 		return fmt.Errorf("tls-auth: %w", err)
+	}
+	if len(b) == 0 {
+		return fmt.Errorf("tls-auth: key file %q is empty", args[0])
 	}
 	s.tlsAuth = b
 	if len(args) >= 2 {
@@ -829,7 +860,11 @@ func (s *parseState) finalize() (*Parsed, error) {
 		s.proto = "udp"
 	}
 	ctrlKeys := 0
-	for _, set := range []bool{s.tlsCrypt != nil, s.tlsCV2 != nil, s.tlsAuth != nil} {
+	// Match openvpn.validateControlChannel's len>0 test (not != nil): an empty
+	// but non-nil key file (os.ReadFile of a 0-byte file returns a non-nil,
+	// zero-length slice) must count as "not provided" so the failure surfaces
+	// here with a clear message rather than deep inside Dial.
+	for _, set := range []bool{len(s.tlsCrypt) > 0, len(s.tlsCV2) > 0, len(s.tlsAuth) > 0} {
 		if set {
 			ctrlKeys++
 		}

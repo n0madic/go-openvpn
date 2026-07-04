@@ -166,20 +166,27 @@ func (t *tunnel) Close() error { return nil }
 // each call so reconnect-driven IP changes surface naturally.
 func (t *tunnel) LocalAddr() net.Addr {
 	pr := t.c.session().PushReply()
-	if !pr.LocalIP.IsValid() {
-		return nil
+	if pr.LocalIP.IsValid() {
+		return &ipAddr{ip: pr.LocalIP.AsSlice()}
 	}
-	return &ipAddr{ip: pr.LocalIP.AsSlice()}
+	// IPv6-only tunnel: the server sent ifconfig-ipv6 but no ifconfig, so
+	// LocalIP stays invalid. Fall back to the v6 address instead of returning
+	// a nil net.Addr — stdlib net.Conn implementations never return nil here,
+	// and generic callers routinely call .String() on the result without a
+	// nil check, which would panic on a nil interface.
+	if pr.LocalIP6.IsValid() {
+		return &ipAddr{ip: pr.LocalIP6.Addr().AsSlice()}
+	}
+	return &ipAddr{} // non-nil; String() renders "<nil>"
 }
 
 // RemoteAddr returns the gateway (or peer) tunnel IP from PUSH_REPLY.
 func (t *tunnel) RemoteAddr() net.Addr {
 	pr := t.c.session().PushReply()
-	peer := peerForRemote(pr)
-	if !peer.IsValid() {
-		return nil
+	if peer := peerForRemote(pr); peer.IsValid() {
+		return &ipAddr{ip: peer.AsSlice()}
 	}
-	return &ipAddr{ip: peer.AsSlice()}
+	return &ipAddr{} // non-nil; never a nil net.Addr (see LocalAddr)
 }
 
 // SetDeadline sets the deadline for both Read and Write. A zero value
@@ -231,7 +238,12 @@ func peerForRemote(pr proto.PushReply) netip.Addr {
 	if pr.RemoteIP.IsValid() {
 		return pr.RemoteIP
 	}
-	return pr.LocalIP
+	if pr.LocalIP.IsValid() {
+		return pr.LocalIP
+	}
+	// IPv6-only tunnel: fall back to the v6 peer (default gateway). May still
+	// be invalid, which RemoteAddr handles by returning a non-nil zero addr.
+	return pr.RemoteIP6
 }
 
 // Compile-time guard: tunnel and session.RestartError used together.

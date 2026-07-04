@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/n0madic/go-openvpn/internal/proto"
 	"github.com/n0madic/go-openvpn/internal/session"
 )
 
@@ -256,5 +257,37 @@ func TestDecideStallSurrender(t *testing.T) {
 					got, surrender, tc.wantCounter, tc.wantSurrender)
 			}
 		})
+	}
+}
+
+// TestPeerForRemoteIPv6Fallback verifies that on an IPv6-only PUSH_REPLY (no
+// ifconfig, only ifconfig-ipv6) peerForRemote falls back to the v6 peer
+// instead of an invalid address — the input to RemoteAddr's non-nil guarantee.
+func TestPeerForRemoteIPv6Fallback(t *testing.T) {
+	t.Parallel()
+	v6 := netip.MustParseAddr("2001:db8::1")
+	pr := proto.PushReply{RemoteIP6: v6} // no Gateway / RemoteIP / LocalIP
+	if got := peerForRemote(pr); got != v6 {
+		t.Fatalf("peerForRemote v6-only = %v, want %v", got, v6)
+	}
+
+	// IPv4 gateway still wins when present.
+	gw := netip.MustParseAddr("10.8.0.1")
+	pr4 := proto.PushReply{Gateway: gw, RemoteIP6: v6}
+	if got := peerForRemote(pr4); got != gw {
+		t.Fatalf("peerForRemote = %v, want gateway %v", got, gw)
+	}
+}
+
+// TestIPAddrZeroRenders confirms a zero ipAddr — the non-nil net.Addr that
+// LocalAddr/RemoteAddr return as a last resort instead of a nil interface —
+// renders without panicking (a nil interface would panic in generic callers
+// that call .String()).
+func TestIPAddrZeroRenders(t *testing.T) {
+	t.Parallel()
+	a := &ipAddr{}
+	_ = a.String() // must not panic
+	if a.Network() != "ovpn-tun" {
+		t.Errorf("Network()=%q, want ovpn-tun", a.Network())
 	}
 }

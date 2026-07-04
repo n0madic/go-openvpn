@@ -448,7 +448,9 @@ type reconnectHook struct {
 //
 // fn runs synchronously inside the reconnect path; keep it short. Multiple
 // hooks are invoked in registration order. Hooks registered after the
-// session is closed will never fire.
+// session is closed will never fire. fn is invoked after reconnectMu is
+// released, so it may safely call back into the Client (including Close or
+// Tunnel Read/Write) without deadlocking.
 //
 // OnReconnect returns a detach func that removes the registration. Always
 // call it when the hook's target lifetime ends earlier than the Client
@@ -825,6 +827,18 @@ func (c *Client) session() *session.Session {
 // reconnected" without relying on CloseErr (which is only set for
 // protocol-level closures like RESTART, not generic Close).
 func (c *Client) reconnect(callCtx context.Context, failed *session.Session, initialDelay time.Duration) error {
+	// Fire OnReconnect hooks only AFTER reconnectMu is released. defer runs
+	// LIFO, so registering this fire BEFORE the Unlock defer below means it
+	// executes once the lock is already gone. A user hook that re-enters the
+	// Client — Close(), or Tunnel.Read/Write that itself triggers reconnect on
+	// a born-broken session — would otherwise deadlock on this non-reentrant
+	// mutex and wedge the Client permanently.
+	var firePR *PushReply
+	defer func() {
+		if firePR != nil {
+			c.FireOnReconnect(*firePR)
+		}
+	}()
 	c.reconnectMu.Lock()
 	defer c.reconnectMu.Unlock()
 
@@ -994,9 +1008,12 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 			c.sessionUp.Store(&now)
 			c.log.Info("reconnect successful", "attempt", attempt)
 			// Notify subscribers (e.g. pkg/netstack updating the gVisor NIC
-			// to the new tunnel IP). Fire AFTER publishing the new session
-			// so c.PushedOptions() inside a hook sees the fresh values.
-			c.FireOnReconnect(c.PushedOptions())
+			// to the new tunnel IP) AFTER publishing the new session so
+			// c.PushedOptions() inside a hook sees the fresh values. The
+			// actual FireOnReconnect runs from the deferred fire above, once
+			// reconnectMu is released — see the note at the top of reconnect.
+			pr := c.PushedOptions()
+			firePR = &pr
 			return nil
 		}
 		c.log.Warn("reconnect failed", "attempt", attempt, "err", err)

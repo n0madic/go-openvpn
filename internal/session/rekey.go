@@ -87,6 +87,12 @@ func (s *Session) rekeyWatch(ctx context.Context, state *rekeyState) {
 			cancel()
 			if err != nil {
 				s.log.Error("auto-rekey failed, closing session", "err", err)
+				// Record a RestartError so CloseErr() is non-nil and
+				// AutoReconnect (Client.sessionWatcher / maybeReconnect,
+				// which key off *RestartError) re-dials — matching every
+				// other watchdog close path. Without this a failed
+				// scheduled rekey would be a silent death with no recovery.
+				s.setCloseErr(&RestartError{Reason: "auto-rekey failed: " + err.Error()})
 				_ = s.Close()
 				return
 			}
@@ -157,7 +163,12 @@ func (m *rekeyManager) PerformSoftReset(ctx context.Context) error {
 			newLayer.SetRemoteSessionID(sid)
 		}
 	}
-	s.layers.Install(newKID, newLayer)
+	if displaced := s.layers.Install(newKID, newLayer); displaced != nil {
+		// Fast-rekey wrap-around reused this kid before the previous
+		// holder's transition window elapsed — close the orphan so its
+		// write/tick goroutines don't leak.
+		_ = displaced.Close()
+	}
 	s.startLayerPumps(newLayer)
 
 	// 2. Send the initial packet on the new layer: P_CONTROL_SOFT_RESET_V1.
@@ -253,11 +264,16 @@ func (m *rekeyManager) PerformSoftReset(ctx context.Context) error {
 	// user goroutines (Client.Rekey, Write-driven forced rekey) that are
 	// not part of s.workers, so registering this here could race with
 	// shutdown's Wait. retireAfter self-terminates on s.ctx.Done().
-	go m.retireAfter(oldKID)
+	// Capture the exact old slot/layer objects so retirement is identity-
+	// checked: after a key-id wrap-around a later rekey may reinstall this
+	// same kid, and the timer must not evict that fresh holder.
+	oldSlot := s.slots.Get(oldKID)
+	oldLayer := s.layers.Get(oldKID)
+	go m.retireAfter(oldKID, oldSlot, oldLayer)
 	return nil
 }
 
-func (m *rekeyManager) retireAfter(kid uint8) {
+func (m *rekeyManager) retireAfter(kid uint8, slot *data.Slot, layer *reliable.Layer) {
 	timer := time.NewTimer(m.transitionWindow)
 	defer timer.Stop()
 	select {
@@ -265,13 +281,21 @@ func (m *rekeyManager) retireAfter(kid uint8) {
 		return
 	case <-timer.C:
 	}
-	m.s.slots.Retire(kid)
-	m.s.retireLayer(kid)
+	m.s.slots.RetireIf(kid, slot)
+	m.s.retireLayerIf(kid, layer)
 }
 
 // retireLayer closes and removes a layer (no-op if absent).
 func (s *Session) retireLayer(kid uint8) {
 	if l := s.layers.Retire(kid); l != nil {
+		_ = l.Close()
+	}
+}
+
+// retireLayerIf closes and removes a layer only if the current holder is still
+// the expected object (no-op otherwise). Used by the transition-window timer.
+func (s *Session) retireLayerIf(kid uint8, want *reliable.Layer) {
+	if l := s.layers.RetireIf(kid, want); l != nil {
 		_ = l.Close()
 	}
 }

@@ -49,6 +49,7 @@ type memoryConn struct {
 	peer                  *memoryConn
 	q                     chan []byte
 	closed                atomic.Bool
+	done                  chan struct{} // closed by Close; never send into q after
 
 	shouldDrop func() bool
 	shouldSwap func() bool
@@ -63,16 +64,22 @@ func newMemoryConn(local, remote string) *memoryConn {
 		localName:  local,
 		remoteName: remote,
 		q:          make(chan []byte, 256),
+		done:       make(chan struct{}),
 	}
 }
 
 func (m *memoryConn) ReadPacket(ctx context.Context) ([]byte, error) {
 	select {
-	case p, ok := <-m.q:
-		if !ok {
+	case p := <-m.q:
+		return p, nil
+	case <-m.done:
+		// Closed — drain anything already buffered before reporting closed.
+		select {
+		case p := <-m.q:
+			return p, nil
+		default:
 			return nil, ErrClosed
 		}
-		return p, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -128,6 +135,11 @@ func (m *memoryConn) deliver(ctx context.Context, p []byte) error {
 	select {
 	case m.peer.q <- p:
 		return nil
+	case <-m.peer.done:
+		// Peer's read side is gone; nothing will consume this.
+		return ErrClosed
+	case <-m.done:
+		return ErrClosed
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -151,7 +163,10 @@ func (m *memoryConn) Close() error {
 		default:
 		}
 	}
-	close(m.q)
+	// Signal readers via done rather than closing q: q is written by the peer
+	// goroutine, so closing it here would race that send into a panic. Readers
+	// select on done and drain any buffered packets first.
+	close(m.done)
 	return nil
 }
 

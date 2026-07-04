@@ -28,6 +28,13 @@ const (
 	MaxAcksPerPacket = 8
 	// MaxQueueSize caps the outbound unacked queue (RELIABLE_CAPACITY).
 	MaxQueueSize = 12
+	// MaxRxBuffer caps the number of out-of-order "future" control packets
+	// buffered while waiting for their in-order predecessors. Without a cap
+	// an authenticated but misbehaving/buggy peer could stream packets with
+	// ever-increasing msgPIDs and grow rxBuffer without bound. 64 is well
+	// above any legitimate control-channel reorder window (OpenVPN's own
+	// RELIABLE_CAPACITY is 12) yet keeps worst-case memory bounded.
+	MaxRxBuffer = 64
 	// MaxRetransmits limits how many times we retransmit before giving up.
 	MaxRetransmits = 8
 	// InitialRetransmit is the base backoff for retransmits.
@@ -424,7 +431,13 @@ func (l *Layer) HandleInbound(in InPacket) error {
 			l.nextRxPID++
 		}
 	} else {
-		// Future packet — buffer until predecessors arrive.
+		// Future packet — buffer until predecessors arrive. Bound the buffer
+		// so a peer streaming ever-higher msgPIDs can't grow it without
+		// limit; beyond the cap we drop-and-don't-ack, so the peer keeps
+		// retransmitting and we absorb it once the window catches up.
+		if len(l.rxBuffer) >= MaxRxBuffer {
+			return nil
+		}
 		l.rxBuffer[msgPID] = append([]byte(nil), in.Payload.Body...)
 	}
 	l.addPendingAckLocked(msgPID)
