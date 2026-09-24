@@ -99,7 +99,7 @@ func TestRealHandshakeTLSAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial (tls-auth): %v", err)
 	}
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
 	pr := cli.PushedOptions()
 	t.Logf("tls-auth session up: local=%s gw=%s cipher=%s peer_id=%d",
@@ -140,7 +140,7 @@ func TestRealHandshakeUDP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
 	pr := cli.PushedOptions()
 	t.Logf("session up: local=%s gw=%s cipher=%s peer_id=%d mtu=%d topology=%s",
@@ -177,7 +177,7 @@ func TestRealPingGateway(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
 	pr := cli.PushedOptions()
 	if !pr.LocalIP.Is4() || !pr.Gateway.Is4() {
@@ -218,7 +218,7 @@ func TestRealCipherNegotiation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Dial: %v", err)
 			}
-			defer cli.Close()
+			defer func() { _ = cli.Close() }()
 
 			if got := cli.PushedOptions().Cipher; got != tc.name {
 				t.Errorf("negotiated cipher = %q, want %q", got, tc.name)
@@ -285,7 +285,7 @@ func TestRealCustomTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial over custom transport: %v", err)
 	}
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
 	if dials != 1 {
 		t.Errorf("DialTransport called %d times, want 1", dials)
@@ -344,7 +344,7 @@ func TestRealRekey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
 	pr := cli.PushedOptions()
 	conn := cli.Tunnel()

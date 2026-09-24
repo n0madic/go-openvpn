@@ -319,7 +319,7 @@ func TestRealSOCKS5UDPAssociate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial proxy: %v", err)
 	}
-	defer ctrl.Close()
+	defer func() { _ = ctrl.Close() }()
 	_ = ctrl.SetDeadline(time.Now().Add(15 * time.Second))
 
 	if _, err := ctrl.Write([]byte{socksVer, 0x01, authNone}); err != nil {
@@ -368,7 +368,7 @@ func TestRealSOCKS5UDPAssociate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("local udp: %v", err)
 	}
-	defer udp.Close()
+	defer func() { _ = udp.Close() }()
 
 	payload := []byte("udp-via-socks5-proxy")
 	dg := buildClientUDP("10.8.0.1", 8080, payload)

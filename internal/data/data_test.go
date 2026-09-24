@@ -21,10 +21,10 @@ func makeKeyPair(t *testing.T, cipher string) (cKey, sKey []byte, cIV, sIV [Impl
 	}
 	cKey = make([]byte, keyLen)
 	sKey = make([]byte, keyLen)
-	rand.Read(cKey)
-	rand.Read(sKey)
-	rand.Read(cIV[:])
-	rand.Read(sIV[:])
+	_, _ = rand.Read(cKey)
+	_, _ = rand.Read(sKey)
+	_, _ = rand.Read(cIV[:])
+	_, _ = rand.Read(sIV[:])
 	return
 }
 

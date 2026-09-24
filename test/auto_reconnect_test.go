@@ -36,7 +36,7 @@ func TestAutoReconnectRESTART(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	cert, pool := genSelfSignedCert(t)
 
 	// Listen on a real UDP socket so the client can reconnect to the same
@@ -117,7 +117,7 @@ func TestRestartErrorPropagatedWithoutAutoReconnect(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	cert, pool := genSelfSignedCert(t)
 
 	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -370,8 +370,8 @@ func runOneSession(
 		Options:  "V4,cipher AES-256-GCM,tls-server",
 		PeerInfo: "IV_VER=2.6.0\n",
 	}
-	rand.Read(serverKM.Random1[:])
-	rand.Read(serverKM.Random2[:])
+	_, _ = rand.Read(serverKM.Random1[:])
+	_, _ = rand.Read(serverKM.Random2[:])
 	b, _ := proto.MarshalKeyMethod2(serverKM)
 	if _, err := tlsConn.Write(b); err != nil {
 		return err

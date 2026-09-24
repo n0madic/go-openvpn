@@ -120,7 +120,7 @@ func TestServerRESTART(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 
 	cTr, sTr := transport.MemoryPair()
@@ -176,7 +176,7 @@ func TestExitNotifySent(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 
 	cTr, sTr := transport.MemoryPair()
@@ -226,10 +226,10 @@ func TestFirstPingTLSCryptV2(t *testing.T) {
 
 	// Server master keys + a fresh Kc + minimal metadata (timestamp type).
 	var ka, ke [32]byte
-	rand.Read(ka[:])
-	rand.Read(ke[:])
+	_, _ = rand.Read(ka[:])
+	_, _ = rand.Read(ke[:])
 	var kc [tlscrypt.StaticKeyLen]byte
-	rand.Read(kc[:])
+	_, _ = rand.Read(kc[:])
 	wkc, err := tlscrypt.WrapWKc(kc, []byte{0x01, 0, 0, 0, 0, 0, 0, 0, 1}, ka, ke)
 	if err != nil {
 		t.Fatal(err)
@@ -627,8 +627,8 @@ func runServerWithDataEcho(
 		Options:  "V4,dev-type tun,link-mtu 1559,tun-mtu 1500,proto UDPv4,cipher " + cipher + ",auth SHA256,keysize 256,key-method 2,tls-server",
 		PeerInfo: "IV_VER=2.6.0\n",
 	}
-	rand.Read(serverKM.Random1[:])
-	rand.Read(serverKM.Random2[:])
+	_, _ = rand.Read(serverKM.Random1[:])
+	_, _ = rand.Read(serverKM.Random2[:])
 	serverKMBytes, _ := proto.MarshalKeyMethod2(serverKM)
 	if _, err := tlsConn.Write(serverKMBytes); err != nil {
 		return err
@@ -895,8 +895,8 @@ func continueServerSim(
 		Options:  "V4,dev-type tun,link-mtu 1559,tun-mtu 1500,proto UDPv4,cipher " + cipher + ",auth SHA256,keysize 256,key-method 2,tls-server",
 		PeerInfo: "IV_VER=2.6.0\n",
 	}
-	rand.Read(serverKM.Random1[:])
-	rand.Read(serverKM.Random2[:])
+	_, _ = rand.Read(serverKM.Random1[:])
+	_, _ = rand.Read(serverKM.Random2[:])
 	skBytes, _ := proto.MarshalKeyMethod2(serverKM)
 	if _, err := tlsConn.Write(skBytes); err != nil {
 		return err
@@ -951,7 +951,7 @@ func TestRekeyMultipleCycles(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 
 	cTr, sTr := transport.MemoryPair()
@@ -1011,7 +1011,7 @@ func TestRekeySoftReset(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 
 	cTr, sTr := transport.MemoryPair()
@@ -1204,8 +1204,8 @@ func runRekeyAwareServer(
 			Options:  "V4,dev-type tun,link-mtu 1559,tun-mtu 1500,proto UDPv4,cipher " + cipher + ",auth SHA256,keysize 256,key-method 2,tls-server",
 			PeerInfo: "IV_VER=2.6.0\n",
 		}
-		rand.Read(serverKM.Random1[:])
-		rand.Read(serverKM.Random2[:])
+		_, _ = rand.Read(serverKM.Random1[:])
+		_, _ = rand.Read(serverKM.Random2[:])
 		skBytes, _ := proto.MarshalKeyMethod2(serverKM)
 		if _, err := tlsConn.Write(skBytes); err != nil {
 			return err
@@ -1501,8 +1501,8 @@ func minimalServerHandshake(
 		Options:  "V4,dev-type tun,cipher AES-256-GCM,auth SHA256,key-method 2,tls-server",
 		PeerInfo: "IV_VER=2.6.0\n",
 	}
-	rand.Read(serverKM.Random1[:])
-	rand.Read(serverKM.Random2[:])
+	_, _ = rand.Read(serverKM.Random1[:])
+	_, _ = rand.Read(serverKM.Random2[:])
 	b, _ := proto.MarshalKeyMethod2(serverKM)
 	if _, err := tlsConn.Write(b); err != nil {
 		return nil, err

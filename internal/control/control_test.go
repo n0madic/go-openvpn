@@ -273,7 +273,7 @@ func TestRunRejectsAuthFailed(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	clientWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionInverse)
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 

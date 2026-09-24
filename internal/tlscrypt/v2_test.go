@@ -9,7 +9,7 @@ import (
 )
 
 func makeRandomKey() (k [32]byte) {
-	rand.Read(k[:])
+	_, _ = rand.Read(k[:])
 	return
 }
 
@@ -18,7 +18,7 @@ func TestWKcWrapUnwrapRoundTrip(t *testing.T) {
 	ka := makeRandomKey()
 	ke := makeRandomKey()
 	var kc [StaticKeyLen]byte
-	rand.Read(kc[:])
+	_, _ = rand.Read(kc[:])
 	metadata := []byte{0x01, 0x00, 0x00, 0x00, 0x00, 0x66, 0x14, 0x0F, 0xAB} // type=0x01 + 8B time
 
 	wkc, err := WrapWKc(kc, metadata, ka, ke)
@@ -45,7 +45,7 @@ func TestUnwrapWKcRejectsTampered(t *testing.T) {
 	ka := makeRandomKey()
 	ke := makeRandomKey()
 	var kc [StaticKeyLen]byte
-	rand.Read(kc[:])
+	_, _ = rand.Read(kc[:])
 	wkc, _ := WrapWKc(kc, nil, ka, ke)
 
 	// Tamper a ciphertext byte.
@@ -60,7 +60,7 @@ func TestUnwrapWKcRejectsWrongMasterKey(t *testing.T) {
 	ka := makeRandomKey()
 	ke := makeRandomKey()
 	var kc [StaticKeyLen]byte
-	rand.Read(kc[:])
+	_, _ = rand.Read(kc[:])
 	wkc, _ := WrapWKc(kc, nil, ka, ke)
 
 	// Different ka.
@@ -75,7 +75,7 @@ func TestClientBundleRoundTrip(t *testing.T) {
 	ka := makeRandomKey()
 	ke := makeRandomKey()
 	var kc [StaticKeyLen]byte
-	rand.Read(kc[:])
+	_, _ = rand.Read(kc[:])
 	metadata := []byte{0x00, 0xDE, 0xAD, 0xBE, 0xEF}
 
 	wkc, err := WrapWKc(kc, metadata, ka, ke)

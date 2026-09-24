@@ -189,8 +189,8 @@ func (ks *keepaliveServer) run(
 		Options:  "V4,dev-type tun,link-mtu 1559,tun-mtu 1500,proto UDPv4,cipher " + cipher + ",auth SHA256,keysize 256,key-method 2,tls-server",
 		PeerInfo: "IV_VER=2.6.0\n",
 	}
-	rand.Read(serverKM.Random1[:])
-	rand.Read(serverKM.Random2[:])
+	_, _ = rand.Read(serverKM.Random1[:])
+	_, _ = rand.Read(serverKM.Random2[:])
 	skBytes, _ := proto.MarshalKeyMethod2(serverKM)
 	if _, err := tlsConn.Write(skBytes); err != nil {
 		return err
@@ -266,7 +266,7 @@ func TestKeepalivePingSent(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 	cert, pool := genSelfSignedCert(t)
 	cTr, sTr := transport.MemoryPair()
@@ -318,7 +318,7 @@ func TestKeepaliveIncomingFiltered(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 	cert, pool := genSelfSignedCert(t)
 	cTr, sTr := transport.MemoryPair()
@@ -391,7 +391,7 @@ func TestKeepaliveDefaultsApplied(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 	cert, pool := genSelfSignedCert(t)
 	cTr, sTr := transport.MemoryPair()
@@ -438,7 +438,7 @@ func TestRequestRestartTriggersRestartError(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 	cert, pool := genSelfSignedCert(t)
 	cTr, sTr := transport.MemoryPair()
@@ -505,7 +505,7 @@ func TestKeepalivePingSkippedDuringOutbound(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 	cert, pool := genSelfSignedCert(t)
 	cTr, sTr := transport.MemoryPair()
@@ -585,7 +585,7 @@ func TestDataActivityWatchTriggersRestartWhenStuck(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 	cert, pool := genSelfSignedCert(t)
 	cTr, sTr := transport.MemoryPair()
@@ -667,7 +667,7 @@ func TestDataActivityWatchSurvivesIdle(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 	cert, pool := genSelfSignedCert(t)
 	cTr, sTr := transport.MemoryPair()
@@ -730,7 +730,7 @@ func TestDataActivityWatchFastPhaseFiresBeforeSteady(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 	cert, pool := genSelfSignedCert(t)
 	cTr, sTr := transport.MemoryPair()
@@ -815,7 +815,7 @@ func TestHandleDataInDropsWhenIngressFull(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 	cert, pool := genSelfSignedCert(t)
 	cTr, sTr := transport.MemoryPair()
@@ -888,7 +888,7 @@ func TestPingRestartTriggersRestart(t *testing.T) {
 	defer cancel()
 
 	var staticKey [tlscrypt.StaticKeyLen]byte
-	rand.Read(staticKey[:])
+	_, _ = rand.Read(staticKey[:])
 	serverWrap, _ := tlscrypt.New(staticKey, tlscrypt.DirectionNormal)
 	cert, pool := genSelfSignedCert(t)
 	cTr, sTr := transport.MemoryPair()

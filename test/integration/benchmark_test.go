@@ -65,7 +65,7 @@ func dialBenchClient(b *testing.B) *openvpn.Client {
 // for true on-wire bytes.
 func BenchmarkTunnelUDPEchoRoundtrip(b *testing.B) {
 	cli := dialBenchClient(b)
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
 	pr := cli.PushedOptions()
 	if !pr.LocalIP.Is4() || !pr.Gateway.Is4() {
@@ -119,7 +119,7 @@ func BenchmarkTunnelUDPEchoRoundtrip(b *testing.B) {
 // to keep the receive queue from filling.
 func BenchmarkTunnelUDPWriteOnly(b *testing.B) {
 	cli := dialBenchClient(b)
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
 	pr := cli.PushedOptions()
 	if !pr.LocalIP.Is4() || !pr.Gateway.Is4() {
