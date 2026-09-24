@@ -291,3 +291,31 @@ func TestIPAddrZeroRenders(t *testing.T) {
 		t.Errorf("Network()=%q, want ovpn-tun", a.Network())
 	}
 }
+
+// TestFireHooksForSkipsSupersededAndClosed verifies that the internal
+// reconnect dispatch only delivers a session's PushReply while that
+// session is still the active one and the Client is open — so a slow
+// dispatch for an already-superseded session can never overwrite the
+// fresher values delivered by the reconnect that replaced it.
+func TestFireHooksForSkipsSupersededAndClosed(t *testing.T) {
+	t.Parallel()
+
+	oldS, newS := &session.Session{}, &session.Session{}
+	c := &Client{s: newS}
+	var calls int
+	c.OnReconnect(func(PushReply) { calls++ })
+
+	c.fireHooksFor(oldS)
+	if calls != 0 {
+		t.Fatalf("superseded session dispatched hooks: calls=%d, want 0", calls)
+	}
+	c.fireHooksFor(newS)
+	if calls != 1 {
+		t.Fatalf("active session: calls=%d, want 1", calls)
+	}
+	c.closed.Store(true)
+	c.fireHooksFor(newS)
+	if calls != 1 {
+		t.Fatalf("closed client dispatched hooks: calls=%d, want 1", calls)
+	}
+}

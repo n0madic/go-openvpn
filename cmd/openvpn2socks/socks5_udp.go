@@ -118,6 +118,11 @@ func tcpRemoteIP(c net.Conn) netip.Addr {
 // relays.
 var errRelayMgrClosed = errors.New("udp relay manager closed")
 
+// errUDPDatagramDropped is returned by createRelay when the first datagram
+// of a flow is dropped (resolve failure, unusable address family, rate
+// limit, dial failure); the cause is already logged.
+var errUDPDatagramDropped = errors.New("udp relay: datagram dropped")
+
 // udpRelay tracks one client ↔ target UDP flow.
 type udpRelay struct {
 	target     net.Conn // gonet.UDPConn via netstack
@@ -268,58 +273,76 @@ func (m *udpRelayMgr) pumpClientToTunnel(ctx context.Context) {
 			continue
 		}
 
-		// Resolve domain if needed.
-		ips, err := m.s.resolver.LookupIP(ctx, host)
-		if err != nil || len(ips) == 0 {
-			m.s.log.Debug("UDP relay: resolve failed", "host", host, "err", err)
-			continue
-		}
-		// Drop entries the tunnel can't carry (e.g. v6 when the server
-		// pushed only IPv4). Same rationale as handleConnect's filter.
-		ips = filterUsableIPs(ips, m.s.ns.HasIPv4(), m.s.ns.HasIPv6())
-		if len(ips) == 0 {
-			m.s.log.Debug("UDP relay: no usable address family",
-				"host", host, "have_v4", m.s.ns.HasIPv4(), "have_v6", m.s.ns.HasIPv6())
-			continue
-		}
-		targetAddr := net.JoinHostPort(ips[0].String(), strconv.Itoa(int(port)))
 		// Key the relay by what the client asked for, not the resolved IP:port,
 		// so two names sharing an IP don't collapse into one flow (which would
-		// echo the wrong DST.ADDR back to the client).
+		// echo the wrong DST.ADDR back to the client). Because the key needs
+		// no resolution, an established flow (QUIC, games — thousands of
+		// datagrams/s to one name) skips the resolver, the address-family
+		// filter and the rate limiter entirely: only the first datagram of a
+		// flow pays for them.
 		relayKey := net.JoinHostPort(host, strconv.Itoa(int(port)))
-
-		// Per-target token bucket — symmetric to TCP CONNECT — consumed
-		// only on the FIRST datagram to a target. Otherwise a legitimate
-		// DNS-over-UDP burst (browser fanning out 6 parallel A+AAAA
-		// queries to one resolver in <100ms) repeatedly hits the same
-		// (ip, anyport) bucket and drains it within a second — refilling
-		// at 2/s, subsequent legitimate queries get dropped and break
-		// name resolution; worse, the bucket is shared with TCP so a
-		// UDP burst can starve TCP CONNECTs to the same IP for several
-		// seconds. We charge per new flow, matching how TCP CONNECT
-		// charges per connection establishment.
-		if m.s.connRate != nil && !m.hasRelay(relayKey) {
-			if !m.s.connRate.allow(ips[0]) {
-				m.s.log.Debug("UDP relay: per-host rate limit",
-					"target", ips[0], "port", port, "host", host)
+		relay, ok := m.lookupRelay(relayKey)
+		if !ok {
+			relay, err = m.createRelay(ctx, relayKey, host, port, client)
+			if err != nil {
+				if errors.Is(err, errRelayMgrClosed) {
+					return
+				}
 				continue
 			}
 		}
-
-		relay, err := m.getOrCreate(ctx, relayKey, host, port, targetAddr, client)
-		if err != nil {
-			if errors.Is(err, errRelayMgrClosed) {
-				return
-			}
-			m.s.log.Debug("UDP relay: dial failed", "target", targetAddr, "err", err)
-			continue
-		}
 		_ = relay.target.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, err := relay.target.Write(payload); err != nil {
-			m.s.log.Debug("UDP relay: target write failed", "target", targetAddr, "err", err)
+			m.s.log.Debug("UDP relay: target write failed", "target", relay.target.RemoteAddr(), "err", err)
 		}
 		relay.touch()
 	}
+}
+
+// createRelay handles the first datagram of a new flow: resolves host,
+// filters for address families the tunnel can carry, charges the per-host
+// rate limiter and dials the relay. Failures other than errRelayMgrClosed
+// are logged here and mean "drop this datagram".
+func (m *udpRelayMgr) createRelay(ctx context.Context, relayKey, host string, port uint16, client *net.UDPAddr) (*udpRelay, error) {
+	ips, err := m.s.resolver.LookupIP(ctx, host)
+	if err != nil || len(ips) == 0 {
+		m.s.log.Debug("UDP relay: resolve failed", "host", host, "err", err)
+		return nil, errUDPDatagramDropped
+	}
+	// Drop entries the tunnel can't carry (e.g. v6 when the server
+	// pushed only IPv4). Same rationale as handleConnect's filter.
+	ips = filterUsableIPs(ips, m.s.ns.HasIPv4(), m.s.ns.HasIPv6())
+	if len(ips) == 0 {
+		m.s.log.Debug("UDP relay: no usable address family",
+			"host", host, "have_v4", m.s.ns.HasIPv4(), "have_v6", m.s.ns.HasIPv6())
+		return nil, errUDPDatagramDropped
+	}
+	targetAddr := net.JoinHostPort(ips[0].String(), strconv.Itoa(int(port)))
+
+	// Per-target token bucket — symmetric to TCP CONNECT — consumed
+	// only on the FIRST datagram to a target. Otherwise a legitimate
+	// DNS-over-UDP burst (browser fanning out 6 parallel A+AAAA
+	// queries to one resolver in <100ms) repeatedly hits the same
+	// (ip, anyport) bucket and drains it within a second — refilling
+	// at 2/s, subsequent legitimate queries get dropped and break
+	// name resolution; worse, the bucket is shared with TCP so a
+	// UDP burst can starve TCP CONNECTs to the same IP for several
+	// seconds. We charge per new flow, matching how TCP CONNECT
+	// charges per connection establishment.
+	if m.s.connRate != nil && !m.s.connRate.allow(ips[0]) {
+		m.s.log.Debug("UDP relay: per-host rate limit",
+			"target", ips[0], "port", port, "host", host)
+		return nil, errUDPDatagramDropped
+	}
+
+	relay, err := m.getOrCreate(ctx, relayKey, host, port, targetAddr, client)
+	if err != nil {
+		if !errors.Is(err, errRelayMgrClosed) {
+			m.s.log.Debug("UDP relay: dial failed", "target", targetAddr, "err", err)
+		}
+		return nil, err
+	}
+	return relay, nil
 }
 
 // getOrCreate looks up (or creates) a relay keyed by relayKey (the client's
@@ -374,14 +397,14 @@ func (m *udpRelayMgr) getOrCreate(ctx context.Context, relayKey, dstHost string,
 	return r, nil
 }
 
-// hasRelay reports whether a relay for the given relayKey already exists.
-// Used by the inbound UDP loop to skip per-host rate-limit consumption on
-// subsequent datagrams in an established flow.
-func (m *udpRelayMgr) hasRelay(relayKey string) bool {
+// lookupRelay returns the existing relay for relayKey, if any. Used by the
+// inbound UDP loop to forward datagrams of an established flow without
+// re-resolving or charging the per-host rate limiter again.
+func (m *udpRelayMgr) lookupRelay(relayKey string) (*udpRelay, bool) {
 	m.mu.Lock()
-	_, ok := m.relays[relayKey]
+	r, ok := m.relays[relayKey]
 	m.mu.Unlock()
-	return ok
+	return r, ok
 }
 
 // removeRelay deletes r from the registry, closing the target conn.

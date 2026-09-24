@@ -753,11 +753,16 @@ func parseDNSAnswers(resp []byte, wantID uint16, wantType uint16, qname string) 
 		pos += 4 // QTYPE+QCLASS
 	}
 
-	// Names we trust as answer owners: the queried name plus any CNAME target
-	// reached from an already-trusted name.
-	accepted := map[string]bool{canonicalDNSName(qname): true}
-
-	var out []netip.Addr
+	// First pass: decode every answer RR. Owner validation needs the whole
+	// CNAME set up front — RR order within the answer section is not
+	// mandated, so a CNAME may legitimately follow the A/AAAA it explains.
+	type answerRR struct {
+		owner  string
+		typ    uint16
+		rdata  []byte
+		target string // CNAME target (typ == dnsTypeCNAME only)
+	}
+	rrs := make([]answerRR, 0, ancount)
 	for i := 0; i < int(ancount); i++ {
 		var owner string
 		var err error
@@ -775,41 +780,65 @@ func parseDNSAnswers(resp []byte, wantID uint16, wantType uint16, qname string) 
 		if pos+rdlen > len(resp) {
 			return nil, errors.New("dns: truncated rdata")
 		}
-		rdataStart := pos
-		rdata := resp[pos : pos+rdlen]
-		pos += rdlen
-
+		rr := answerRR{owner: owner, typ: typ, rdata: resp[pos : pos+rdlen]}
 		if typ == dnsTypeCNAME {
-			// Extend the trusted-name chain, but only from a name we already
-			// trust — an attacker can't bootstrap trust with a CNAME whose
-			// owner we never asked for.
-			if accepted[owner] {
-				if target, _, derr := decodeName(resp, rdataStart); derr == nil {
-					accepted[target] = true
-				}
+			if target, _, derr := decodeName(resp, pos); derr == nil {
+				rr.target = target
 			}
-			continue
 		}
-		if typ != wantType {
+		pos += rdlen
+		rrs = append(rrs, rr)
+	}
+
+	// Names we trust as answer owners: the queried name plus any CNAME target
+	// reachable from it. Iterate to a fixpoint so the result is independent of
+	// RR order; trust only ever extends from an already-trusted name, so an
+	// attacker can't bootstrap it with a CNAME whose owner we never asked for.
+	// Each productive round trusts at least one new name, so this terminates
+	// within len(rrs)+1 rounds.
+	accepted := map[string]bool{canonicalDNSName(qname): true}
+	for grew := true; grew; {
+		grew = false
+		for _, rr := range rrs {
+			if rr.typ == dnsTypeCNAME && rr.target != "" && accepted[rr.owner] && !accepted[rr.target] {
+				accepted[rr.target] = true
+				grew = true
+			}
+		}
+	}
+
+	var out []netip.Addr
+	droppedOwner := false
+	for _, rr := range rrs {
+		if rr.typ != wantType {
 			continue
 		}
 		// Drop A/AAAA records whose owner name is neither the queried name nor
 		// a CNAME target we followed — i.e. injected under an unrelated name.
-		if !accepted[owner] {
+		if !accepted[rr.owner] {
+			droppedOwner = true
 			continue
 		}
-		switch typ {
+		switch rr.typ {
 		case dnsTypeA:
-			if len(rdata) != 4 {
+			if len(rr.rdata) != 4 {
 				continue
 			}
-			out = append(out, netip.AddrFrom4([4]byte(rdata)))
+			out = append(out, netip.AddrFrom4([4]byte(rr.rdata)))
 		case dnsTypeAAAA:
-			if len(rdata) != 16 {
+			if len(rr.rdata) != 16 {
 				continue
 			}
-			out = append(out, netip.AddrFrom16([16]byte(rdata)))
+			out = append(out, netip.AddrFrom16([16]byte(rr.rdata)))
 		}
+	}
+	if len(out) == 0 && droppedOwner {
+		// The reply DID carry records of the requested type, just under
+		// owner names we couldn't tie to qname (spoofing, or a DNAME/odd
+		// chain we don't follow). That is not an authoritative "no records":
+		// report a transport-class failure so the caller tries the next
+		// resolver instead of caching/propagating a false negative.
+		return nil, errors.New("dns: answer owner names do not match the query")
 	}
 	// NOERROR with zero answers of the requested type is an authoritative
 	// "this host has no record of this family" — signal it explicitly so

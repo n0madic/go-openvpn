@@ -1226,11 +1226,15 @@ func (s *Session) handleControlIn(pkt []byte, opcode proto.Opcode, kid uint8) {
 			if kid == nextKeyID(active) {
 				s.log.Info("server-initiated rekey detected, kicking off our side",
 					"server_kid", kid, "active_kid", active)
-				// Run under s.workers so shutdown() (which Shutdowns workers
-				// BEFORE its retire-all-layers loop) waits for this to finish:
-				// otherwise a Close racing between PerformSoftReset's closed
-				// check and its layers.Install could leave the new layer never
-				// retired. If Go returns false, shutdown already began — skip.
+				// Run under s.workers so the rekey is cancelled with the
+				// session's ctx and shutdown()'s final workers.Wait accounts
+				// for it. That wait happens AFTER the retire-all-layers loop,
+				// so it does not by itself stop a racing Close from missing a
+				// layer installed after that loop; PerformSoftReset closes
+				// that gap itself by retiring its new layer when
+				// startLayerPumps is rejected (workers.Shutdown runs before
+				// the retire loop). If Go returns false, shutdown already
+				// began — skip.
 				started := s.workers.Go("serverRekey", func(ctx context.Context) {
 					rkCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 					defer cancel()
@@ -1301,11 +1305,14 @@ func (s *Session) handleControlIn(pkt []byte, opcode proto.Opcode, kid uint8) {
 
 // startLayerPumps spawns the writer and ticker goroutines for one
 // reliable.Layer. They exit when the layer's Outbound chan closes (i.e.
-// when the layer is Close()d).
-func (s *Session) startLayerPumps(layer *reliable.Layer) {
+// when the layer is Close()d). Returns false when either pump was
+// rejected because the worker manager has already shut down — the layer
+// is then half-attached and the caller must retire it.
+func (s *Session) startLayerPumps(layer *reliable.Layer) bool {
 	kid := layer.KeyID()
-	s.workers.Go(fmt.Sprintf("writeLoop[kid=%d]", kid), func(context.Context) { s.writeLoop(layer) })
-	s.workers.Go(fmt.Sprintf("tickLoop[kid=%d]", kid), func(context.Context) { s.tickLoop(layer) })
+	okW := s.workers.Go(fmt.Sprintf("writeLoop[kid=%d]", kid), func(context.Context) { s.writeLoop(layer) })
+	okT := s.workers.Go(fmt.Sprintf("tickLoop[kid=%d]", kid), func(context.Context) { s.tickLoop(layer) })
+	return okW && okT
 }
 
 func (s *Session) writeLoop(layer *reliable.Layer) {

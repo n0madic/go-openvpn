@@ -148,11 +148,17 @@ func (s *socks5Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
+// socksHandshakeTimeout bounds each handshake phase (greet+auth, then
+// request parsing) so a client that connects and stalls can't slow-loris
+// the daemon. Each phase gets a fresh budget.
+const socksHandshakeTimeout = 30 * time.Second
+
 // handle is one accepted-conn lifetime: greet, auth, dispatch request.
 //
 // A ctx-watcher goroutine closes conn on shutdown so any in-flight Read
-// (greet, readRequest with cleared deadline, or io.Copy(io.Discard, ctrl)
-// inside handleAssociate) unblocks promptly. Without this, a SOCKS5
+// (greet and readRequest, each bounded by socksHandshakeTimeout, or the
+// deadline-free io.Copy(io.Discard, ctrl) inside handleAssociate) unblocks
+// promptly. Without this, a SOCKS5
 // client that connects and stalls — or a long-running UDP ASSOCIATE
 // session — would pin Serve's wg.Wait() forever after ctx cancellation,
 // which in turn would block the deferred cli.Close() in main and leave
@@ -168,7 +174,7 @@ func (s *socks5Server) handle(ctx context.Context, conn net.Conn) {
 		case <-done:
 		}
 	}()
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(socksHandshakeTimeout))
 	br := bufio.NewReader(conn)
 
 	if err := s.greet(br, conn); err != nil {
@@ -180,7 +186,7 @@ func (s *socks5Server) handle(ctx context.Context, conn net.Conn) {
 	// block io.ReadFull in readRequest forever, pinning this goroutine + fd
 	// (a slow-loris that can exhaust the daemon's budget). Handlers clear the
 	// deadline below once the request is parsed.
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(socksHandshakeTimeout))
 
 	req, err := readRequest(br)
 	if err != nil {

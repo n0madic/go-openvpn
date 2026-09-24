@@ -187,6 +187,12 @@ internal/session         Orchestrator. Goroutines per active session
   target alive and may deref dead fields. `pkg/netstack`'s adapter forwards
   this hook to go-tun2net (via `clientTunnel.OnReconfigure`) so the gVisor NIC
   stays in sync; the stack's `Close` invokes the detach.
+  Hooks fire after `reconnectMu` is released (so they may call `Close` or
+  Tunnel I/O), serialised by `fireMu`; a dispatch is skipped if its session
+  was already superseded or the Client closed, so a stale PushReply never
+  lands after a fresher one. The `sessionWatcher` runs its dispatch on a
+  helper goroutine it abandons on `c.ctx.Done()` — otherwise a hook calling
+  `Close()` would deadlock on `watcherWG.Wait()`.
 
 ### Key protocol nuances (caught against real OpenVPN — preserve when editing)
 

@@ -3,6 +3,9 @@
 package session
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -82,5 +85,31 @@ func TestRekeyState_ManualTrigger(t *testing.T) {
 	r.Trigger()
 	if !r.Check(nil, time.Now()) {
 		t.Fatal("expected trigger after manual Trigger")
+	}
+}
+
+// TestClassifyAutoRekey verifies that a scheduled rekey colliding with a
+// concurrent one, or with session shutdown, is not treated as a fatal
+// failure that would restart a healthy session.
+func TestClassifyAutoRekey(t *testing.T) {
+	t.Parallel()
+	genuine := errors.New("tls handshake timeout")
+	cases := []struct {
+		name     string
+		err      error
+		shutdown bool
+		want     autoRekeyOutcome
+	}{
+		{"success", nil, false, autoRekeyDone},
+		{"concurrent", ErrRekeyInProgress, false, autoRekeyConcurrent},
+		{"concurrent wrapped", fmt.Errorf("x: %w", ErrRekeyInProgress), false, autoRekeyConcurrent},
+		{"closed", ErrClosed, false, autoRekeyShutdown},
+		{"ctx cancelled during shutdown", context.Canceled, true, autoRekeyShutdown},
+		{"genuine failure", genuine, false, autoRekeyFailed},
+	}
+	for _, tc := range cases {
+		if got := classifyAutoRekey(tc.err, tc.shutdown); got != tc.want {
+			t.Errorf("%s: got %d, want %d", tc.name, got, tc.want)
+		}
 	}
 }

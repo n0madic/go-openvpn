@@ -28,12 +28,16 @@ const (
 	MaxAcksPerPacket = 8
 	// MaxQueueSize caps the outbound unacked queue (RELIABLE_CAPACITY).
 	MaxQueueSize = 12
-	// MaxRxBuffer caps the number of out-of-order "future" control packets
-	// buffered while waiting for their in-order predecessors. Without a cap
-	// an authenticated but misbehaving/buggy peer could stream packets with
-	// ever-increasing msgPIDs and grow rxBuffer without bound. 64 is well
-	// above any legitimate control-channel reorder window (OpenVPN's own
-	// RELIABLE_CAPACITY is 12) yet keeps worst-case memory bounded.
+	// MaxRxBuffer is the receive window for out-of-order "future" control
+	// packets: only msgPIDs in [nextRxPID, nextRxPID+MaxRxBuffer) are
+	// buffered while waiting for their in-order predecessors. Bounding the
+	// msgPID distance (not just the entry count) keeps memory bounded
+	// against a misbehaving/buggy peer streaming ever-increasing msgPIDs
+	// AND guarantees every buffered packet is eventually drained as
+	// nextRxPID advances — far-future PIDs can never pin the buffer full
+	// and starve legitimate reorders. 64 is well above any legitimate
+	// control-channel reorder window (OpenVPN's own RELIABLE_CAPACITY is
+	// 12).
 	MaxRxBuffer = 64
 	// MaxRetransmits limits how many times we retransmit before giving up.
 	MaxRetransmits = 8
@@ -431,11 +435,13 @@ func (l *Layer) HandleInbound(in InPacket) error {
 			l.nextRxPID++
 		}
 	} else {
-		// Future packet — buffer until predecessors arrive. Bound the buffer
-		// so a peer streaming ever-higher msgPIDs can't grow it without
-		// limit; beyond the cap we drop-and-don't-ack, so the peer keeps
-		// retransmitting and we absorb it once the window catches up.
-		if len(l.rxBuffer) >= MaxRxBuffer {
+		// Future packet — buffer until predecessors arrive, but only inside
+		// the receive window. Beyond it we drop-and-don't-ack, so the peer
+		// keeps retransmitting and we absorb it once the window catches up.
+		// Since every buffered msgPID lies within the window, the buffer
+		// holds at most MaxRxBuffer-1 entries and always drains as
+		// nextRxPID advances.
+		if msgPID-l.nextRxPID >= MaxRxBuffer {
 			return nil
 		}
 		l.rxBuffer[msgPID] = append([]byte(nil), in.Payload.Body...)

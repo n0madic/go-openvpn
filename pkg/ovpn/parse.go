@@ -278,23 +278,43 @@ func (s *parseState) run(r io.Reader) error {
 }
 
 // stripComment removes anything after the first unquoted # or ; that starts
-// a comment. OpenVPN treats both `;` and `#` as comment leaders.
+// a comment. OpenVPN treats both `;` and `#` as comment leaders. Quoting and
+// escaping follow exactly the same rules as tokenize (double quotes, single
+// quotes, backslash escapes via isEscapable), so both passes always agree on
+// what is quoted: a `#` inside '...' or after an escaped quote is data, and a
+// `"` inside '...' does not open a double-quoted string.
 func stripComment(s string) string {
-	inQuote := false
+	inDouble, inSingle := false, false
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if c == '"' {
-			inQuote = !inQuote
-			continue
-		}
-		if inQuote {
-			continue
-		}
-		if c == '#' || c == ';' {
+		switch {
+		case c == '\\' && !inSingle && i+1 < len(s) && isEscapable(s[i+1]):
+			i++ // escaped byte is literal: never a quote or comment leader
+		case c == '"' && !inSingle:
+			inDouble = !inDouble
+		case c == '\'' && !inDouble:
+			inSingle = !inSingle
+		case !inDouble && !inSingle && (c == '#' || c == ';'):
 			return s[:i]
 		}
 	}
 	return s
+}
+
+// isEscapable reports whether a backslash before c is an escape. Only the
+// bytes that are otherwise syntactically significant — backslash itself,
+// both quote characters, whitespace and the comment leaders — can be
+// escaped. A backslash before anything else stays literal, so unquoted
+// Windows paths such as `ca C:\Users\me\ca.crt` keep parsing as written
+// (OpenVPN itself would eat those single backslashes; accepting them is a
+// backward-compatible superset, while `C:\\Users` and `Program\ Files`
+// still unescape exactly as OpenVPN does).
+func isEscapable(c byte) bool {
+	switch c {
+	case '\\', '"', '\'', ' ', '\t', '#', ';':
+		return true
+	}
+	return false
 }
 
 // openTag matches `<name>` at the start of a line. Returns the bare tag
@@ -347,8 +367,9 @@ func readInlineBlock(sc *bufio.Scanner, name string, startLine int) ([]byte, int
 // tokenize splits a line into whitespace-separated tokens, mirroring OpenVPN's
 // options.c::parse_line: double quotes, single quotes, and backslash escaping.
 // Inside single quotes backslash is literal; elsewhere it escapes the next
-// byte. Empty quoted strings ("" or ”) produce an empty token, matching
-// OpenVPN (a quoted empty arg is a real, distinct argument).
+// byte when that byte isEscapable, and is kept literally otherwise (so is a
+// trailing backslash). Empty quoted strings ("" or ”) produce an empty
+// token, matching OpenVPN (a quoted empty arg is a real, distinct argument).
 func tokenize(s string) ([]string, error) {
 	var out []string
 	var cur strings.Builder
@@ -358,12 +379,9 @@ func tokenize(s string) ([]string, error) {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
-		case c == '\\' && !inSingle:
-			// Backslash escapes the next byte outside single quotes.
+		case c == '\\' && !inSingle && i+1 < len(s) && isEscapable(s[i+1]):
+			// Backslash escapes a significant byte outside single quotes.
 			i++
-			if i >= len(s) {
-				return nil, errors.New("trailing backslash escape")
-			}
 			cur.WriteByte(s[i])
 			started = true
 		case c == '"' && !inSingle:

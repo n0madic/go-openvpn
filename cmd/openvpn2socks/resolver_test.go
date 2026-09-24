@@ -537,3 +537,39 @@ func TestParseDNSAnswersTruncated(t *testing.T) {
 		t.Fatalf("TC response misclassified as authoritative no-data: %v", err)
 	}
 }
+
+// TestParseDNSAnswersCNAMEAfterA confirms owner validation is independent of
+// RR order: a CNAME listed AFTER the A record it explains still validates it.
+func TestParseDNSAnswersCNAMEAfterA(t *testing.T) {
+	t.Parallel()
+	resp := buildDNSResp(0x1234, 0x8180, "www.example.com", dnsTypeA, [][]byte{
+		aRecord("host.cdn.net", [4]byte{1, 2, 3, 4}),
+		cnameRecord("edge.example.net", "host.cdn.net"),
+		cnameRecord("www.example.com", "edge.example.net"),
+	})
+	got, err := parseDNSAnswers(resp, 0x1234, dnsTypeA, "www.example.com")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(got) != 1 || got[0].String() != "1.2.3.4" {
+		t.Fatalf("got %v, want [1.2.3.4] via out-of-order CNAME chain", got)
+	}
+}
+
+// TestParseDNSAnswersOnlyMismatchedOwnerNotAuthoritative confirms that a reply
+// whose only A records were dropped for an unvalidated owner is NOT reported
+// as an authoritative "no records" — that would block every fallback
+// resolver for a name that does exist.
+func TestParseDNSAnswersOnlyMismatchedOwnerNotAuthoritative(t *testing.T) {
+	t.Parallel()
+	resp := buildDNSResp(0x1234, 0x8180, "example.com", dnsTypeA, [][]byte{
+		aRecord("unrelated.example.net", [4]byte{203, 0, 113, 9}),
+	})
+	_, err := parseDNSAnswers(resp, 0x1234, dnsTypeA, "example.com")
+	if err == nil {
+		t.Fatal("expected error when every A record has an unvalidated owner")
+	}
+	if errorsIsAuthoritativeNoData(err) {
+		t.Fatalf("owner-mismatch-only reply misclassified as authoritative no-data: %v", err)
+	}
+}

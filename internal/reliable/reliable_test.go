@@ -609,3 +609,47 @@ func waitFor(t *testing.T, timeout time.Duration, predicate func() bool) {
 	}
 	t.Fatalf("waitFor: condition not met within %v", timeout)
 }
+
+// TestRxWindowRejectsFarFuture proves the out-of-order buffer is bounded
+// by msgPID distance, not just entry count: far-future msgPIDs are dropped
+// unacked instead of pinning the buffer, so a later legitimate one-packet
+// reorder is still buffered, acked, and delivered once its predecessor
+// arrives.
+func TestRxWindowRejectsFarFuture(t *testing.T) {
+	t.Parallel()
+	l := New(Config{LocalSessionID: 1})
+	defer func() { _ = l.Close() }()
+
+	in := func(pid uint32, body string) {
+		t.Helper()
+		if err := l.HandleInbound(InPacket{
+			Opcode:    proto.PControlV1,
+			SessionID: 0xAABB,
+			Payload:   proto.ControlPayload{MessagePID: pid, Body: []byte(body)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for i := range uint32(2 * MaxRxBuffer) {
+		in(1_000_000+i, "junk")
+	}
+	in(MaxRxBuffer, "edge") // first msgPID outside [0, MaxRxBuffer)
+	l.mu.Lock()
+	buffered, acked := len(l.rxBuffer), len(l.pendingAckSet)
+	l.mu.Unlock()
+	if buffered != 0 || acked != 0 {
+		t.Fatalf("out-of-window packets buffered=%d acked=%d, want 0/0", buffered, acked)
+	}
+
+	in(1, "second") // legitimate reorder: msgPID 1 before 0
+	in(0, "first")
+	got := make([]byte, 64)
+	n, err := io.ReadAtLeast(l, got, len("firstsecond"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got[:n]) != "firstsecond" {
+		t.Fatalf("delivered %q, want %q", got[:n], "firstsecond")
+	}
+}

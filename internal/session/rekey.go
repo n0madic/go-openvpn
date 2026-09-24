@@ -69,8 +69,42 @@ func (r *rekeyState) Reset(now time.Time) {
 	r.startTime = now
 }
 
+// autoRekeyOutcome classifies a scheduled PerformSoftReset result.
+type autoRekeyOutcome int
+
+const (
+	// autoRekeyDone: the rekey succeeded; restart the renegotiation timer.
+	autoRekeyDone autoRekeyOutcome = iota
+	// autoRekeyConcurrent: another rekey (server-initiated or Client.Rekey)
+	// was already running and will install fresh keys itself. Benign —
+	// treat it as this interval's rekey instead of killing the session.
+	autoRekeyConcurrent
+	// autoRekeyShutdown: the session is closing (ErrClosed, or the worker
+	// ctx was cancelled). Exit quietly; a deliberate Close must not be
+	// relabelled as a RestartError.
+	autoRekeyShutdown
+	// autoRekeyFailed: a genuine rekey failure on a live session.
+	autoRekeyFailed
+)
+
+// classifyAutoRekey maps PerformSoftReset's error onto the action
+// rekeyWatch must take. shuttingDown reports whether the session (or the
+// watch's own ctx) is already being torn down.
+func classifyAutoRekey(err error, shuttingDown bool) autoRekeyOutcome {
+	switch {
+	case err == nil:
+		return autoRekeyDone
+	case errors.Is(err, ErrRekeyInProgress):
+		return autoRekeyConcurrent
+	case shuttingDown || errors.Is(err, ErrClosed):
+		return autoRekeyShutdown
+	default:
+		return autoRekeyFailed
+	}
+}
+
 // rekeyWatch fires PerformSoftReset when a rekey condition is reached. If
-// the rekey fails, the session is closed.
+// the rekey genuinely fails, the session is closed with a RestartError.
 func (s *Session) rekeyWatch(ctx context.Context, state *rekeyState) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -85,7 +119,19 @@ func (s *Session) rekeyWatch(ctx context.Context, state *rekeyState) {
 			rekeyCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			err := s.rekeyMgr.PerformSoftReset(rekeyCtx)
 			cancel()
-			if err != nil {
+			switch classifyAutoRekey(err, ctx.Err() != nil || s.closed.Load()) {
+			case autoRekeyDone:
+				state.Reset(time.Now())
+			case autoRekeyConcurrent:
+				// The concurrent rekey installs the new keys; restart the
+				// renegotiation timer rather than stacking a second rekey
+				// right behind it. The SendPID threshold in Check still
+				// guards the key if that concurrent rekey fails.
+				s.log.Debug("auto-rekey skipped: another rekey is in progress")
+				state.Reset(time.Now())
+			case autoRekeyShutdown:
+				return
+			case autoRekeyFailed:
 				s.log.Error("auto-rekey failed, closing session", "err", err)
 				// Record a RestartError so CloseErr() is non-nil and
 				// AutoReconnect (Client.sessionWatcher / maybeReconnect,
@@ -96,7 +142,6 @@ func (s *Session) rekeyWatch(ctx context.Context, state *rekeyState) {
 				_ = s.Close()
 				return
 			}
-			state.Reset(time.Now())
 		}
 	}
 }
@@ -169,7 +214,14 @@ func (m *rekeyManager) PerformSoftReset(ctx context.Context) error {
 		// write/tick goroutines don't leak.
 		_ = displaced.Close()
 	}
-	s.startLayerPumps(newLayer)
+	if !s.startLayerPumps(newLayer) {
+		// Close raced us: shutdown() calls workers.Shutdown before its
+		// retire-all-layers loop, so a rejected pump means that loop may
+		// already have run and missed newLayer. Retire it ourselves so the
+		// half-attached layer (and any pump that did start) is torn down.
+		s.retireLayerIf(newKID, newLayer)
+		return ErrClosed
+	}
 
 	// 2. Send the initial packet on the new layer: P_CONTROL_SOFT_RESET_V1.
 	// This carries msg_pid 0 of the new reliable channel and signals the

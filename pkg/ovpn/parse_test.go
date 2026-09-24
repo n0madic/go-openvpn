@@ -251,6 +251,14 @@ func TestTokenize(t *testing.T) {
 		{`arg 'a\b'`, []string{"arg", `a\b`}},
 		// Empty quoted string is a real, distinct argument.
 		{`push ""`, []string{"push", ""}},
+		// Unquoted single-backslash Windows path stays literal: a backslash
+		// before a non-special byte is not an escape.
+		{`ca C:\Users\me\ca.crt`, []string{"ca", `C:\Users\me\ca.crt`}},
+		{`ca "C:\Users\me\ca.crt"`, []string{"ca", `C:\Users\me\ca.crt`}},
+		// A trailing backslash is literal too.
+		{`path C:\dir\`, []string{"path", `C:\dir\`}},
+		// Escaped comment leader is data.
+		{`x a\#b`, []string{"x", "a#b"}},
 	}
 	for _, tc := range tests {
 		got, err := tokenize(tc.in)
@@ -267,9 +275,6 @@ func TestTokenize(t *testing.T) {
 	}
 	if _, err := tokenize(`bad 'unterminated`); err == nil {
 		t.Error("expected error on unterminated single quote")
-	}
-	if _, err := tokenize(`trailing\`); err == nil {
-		t.Error("expected error on trailing backslash escape")
 	}
 }
 
@@ -319,6 +324,31 @@ tls-crypt empty.key
 	}
 }
 
+// TestStripCommentTokenizeAgree runs the full two-pass pipeline on lines
+// where quoting/escaping decides whether a `#` is a comment, so the
+// comment stripper and the tokenizer can never disagree.
+func TestStripCommentTokenizeAgree(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		in   string
+		want []string
+	}{
+		{`auth-user-pass 'creds#1.txt'`, []string{"auth-user-pass", "creds#1.txt"}},
+		{`setenv FOO 'a"b' # note`, []string{"setenv", "FOO", `a"b`}},
+		{`x "a\"b#c"`, []string{"x", `a"b#c`}},
+		{`ca C:\Users\me\ca.crt ; comment`, []string{"ca", `C:\Users\me\ca.crt`}},
+	} {
+		got, err := tokenize(stripComment(tc.in))
+		if err != nil {
+			t.Errorf("%q: %v", tc.in, err)
+			continue
+		}
+		if !slicesEqual(got, tc.want) {
+			t.Errorf("%q: got %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestStripComment(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -329,6 +359,14 @@ func TestStripComment(t *testing.T) {
 		{`name "has # inside"`, `name "has # inside"`},
 		{"# pure comment", ""},
 		{"", ""},
+		// Single quotes protect comment leaders, exactly as in tokenize.
+		{`auth-user-pass 'creds#1.txt'`, `auth-user-pass 'creds#1.txt'`},
+		// A double quote inside single quotes does not open a string.
+		{`setenv FOO 'a"b' # note`, `setenv FOO 'a"b' `},
+		// An escaped quote does not close the double-quoted string.
+		{`x "a\"b#c"`, `x "a\"b#c"`},
+		// An escaped comment leader is data.
+		{`x a\#b # c`, `x a\#b `},
 	} {
 		if got := stripComment(tc.in); got != tc.want {
 			t.Errorf("stripComment(%q)=%q, want %q", tc.in, got, tc.want)

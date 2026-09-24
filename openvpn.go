@@ -375,6 +375,14 @@ type Client struct {
 	hooksMu     sync.Mutex
 	onReconnect []*reconnectHook
 
+	// fireMu serialises internal OnReconnect dispatches (fireHooksFor).
+	// Hooks run after reconnectMu is released, so two back-to-back
+	// reconnects could otherwise dispatch concurrently or out of order;
+	// under fireMu each dispatch re-checks that its session is still the
+	// active one, so a superseded session's (stale) PushReply is never
+	// delivered after a newer one.
+	fireMu sync.Mutex
+
 	// ingressHandler is the latest handler installed via SetIngressHandler.
 	// Stored at the Client level so AutoReconnect can re-apply it to every
 	// freshly-dialled session before that session's first packet arrives.
@@ -451,6 +459,12 @@ type reconnectHook struct {
 // session is closed will never fire. fn is invoked after reconnectMu is
 // released, so it may safely call back into the Client (including Close or
 // Tunnel Read/Write) without deadlocking.
+//
+// Dispatches are serialised: hooks never run concurrently with each other,
+// and a dispatch is skipped when its session has already been superseded
+// by a newer reconnect (that newer reconnect delivers the fresh values
+// instead) or when the Client has been closed. Hooks therefore always see
+// PushReplys in session order and never a stale one after a newer one.
 //
 // OnReconnect returns a detach func that removes the registration. Always
 // call it when the hook's target lifetime ends earlier than the Client
@@ -616,6 +630,20 @@ func (c *Client) FireOnReconnect(pr PushReply) {
 			h(pr)
 		}()
 	}
+}
+
+// fireHooksFor dispatches OnReconnect hooks for s, the session a reconnect
+// just installed. Serialised by fireMu; skipped when the Client is closed
+// or s is no longer the active session (a newer reconnect superseded it
+// and will dispatch its own, fresher PushReply). Must be called without
+// reconnectMu held so hooks can re-enter the Client.
+func (c *Client) fireHooksFor(s *session.Session) {
+	c.fireMu.Lock()
+	defer c.fireMu.Unlock()
+	if c.closed.Load() || c.session() != s {
+		return
+	}
+	c.FireOnReconnect(pushReplyFrom(s))
 }
 
 // Dial brings up the session. ctx scopes the handshake only — once Dial
@@ -827,30 +855,35 @@ func (c *Client) session() *session.Session {
 // reconnected" without relying on CloseErr (which is only set for
 // protocol-level closures like RESTART, not generic Close).
 func (c *Client) reconnect(callCtx context.Context, failed *session.Session, initialDelay time.Duration) error {
-	// Fire OnReconnect hooks only AFTER reconnectMu is released. defer runs
-	// LIFO, so registering this fire BEFORE the Unlock defer below means it
-	// executes once the lock is already gone. A user hook that re-enters the
-	// Client — Close(), or Tunnel.Read/Write that itself triggers reconnect on
-	// a born-broken session — would otherwise deadlock on this non-reentrant
-	// mutex and wedge the Client permanently.
-	var firePR *PushReply
-	defer func() {
-		if firePR != nil {
-			c.FireOnReconnect(*firePR)
-		}
-	}()
+	installed, err := c.reconnectInstall(callCtx, failed, initialDelay)
+	if installed != nil {
+		// Fire OnReconnect hooks only AFTER reconnectMu is released. A user
+		// hook that re-enters the Client — Close(), or Tunnel.Read/Write that
+		// itself triggers reconnect on a born-broken session — would
+		// otherwise deadlock on that non-reentrant mutex.
+		c.fireHooksFor(installed)
+	}
+	return err
+}
+
+// reconnectInstall performs the reconnect under reconnectMu and returns
+// the session it installed (nil when this call installed none — another
+// goroutine already reconnected, or it failed). It does NOT fire the
+// OnReconnect hooks: callers dispatch them via fireHooksFor once the lock
+// is released.
+func (c *Client) reconnectInstall(callCtx context.Context, failed *session.Session, initialDelay time.Duration) (*session.Session, error) {
 	c.reconnectMu.Lock()
 	defer c.reconnectMu.Unlock()
 
 	if c.closed.Load() {
-		return ErrClosed
+		return nil, ErrClosed
 	}
 
 	// Did another goroutine already reconnect on this failure? Compare
 	// session pointers — a successful reconnect replaces c.s atomically
 	// under c.mu.
 	if cur := c.session(); cur != nil && cur != failed {
-		return nil
+		return nil, nil
 	}
 
 	// Consecutive-stall surrender: when the freshly-installed session
@@ -865,7 +898,7 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 	// process-supervisor's restart delay is what lets the upstream
 	// state expire by time.
 	if c.gaveUp.Load() {
-		return fmt.Errorf("%w: previous surrender latched", ErrReconnectGaveUp)
+		return nil, fmt.Errorf("%w: previous surrender latched", ErrReconnectGaveUp)
 	}
 	if c.cfg.MaxConsecutiveStalls > 0 && failed != nil {
 		var lifetime time.Duration
@@ -888,7 +921,7 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 				"max", c.cfg.MaxConsecutiveStalls,
 				"last_session_lifetime", lifetime,
 			)
-			return fmt.Errorf("%w: %d consecutive short-lived activity-stall sessions",
+			return nil, fmt.Errorf("%w: %d consecutive short-lived activity-stall sessions",
 				ErrReconnectGaveUp, newCounter)
 		}
 	}
@@ -906,10 +939,10 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 	wait := initialDelay
 	for attempt := 1; ; attempt++ {
 		if c.closed.Load() {
-			return ErrClosed
+			return nil, ErrClosed
 		}
 		if err := callCtx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		if wait > 0 {
 			t := time.NewTimer(wait)
@@ -917,14 +950,14 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 			case <-t.C:
 			case <-callCtx.Done():
 				t.Stop()
-				return callCtx.Err()
+				return nil, callCtx.Err()
 			case <-c.ctx.Done():
 				t.Stop()
-				return c.ctx.Err()
+				return nil, c.ctx.Err()
 			}
 		}
 		if c.closed.Load() {
-			return ErrClosed
+			return nil, ErrClosed
 		}
 
 		// Dial under c.ctx (so the resulting session outlives callCtx) but
@@ -963,7 +996,7 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 			// the server, which on many providers (ProtonVPN, etc.) leads to
 			// an IP ban.
 			c.log.Warn("auth failed during reconnect; giving up", "attempt", attempt, "err", err)
-			return fmt.Errorf("openvpn: authentication failed on reconnect: %w", err)
+			return nil, fmt.Errorf("openvpn: authentication failed on reconnect: %w", err)
 		}
 
 		if err == nil {
@@ -971,12 +1004,12 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 				// User called Close during the dial — discard the freshly
 				// created session so its goroutines tear down cleanly.
 				_ = s.Close()
-				return ErrClosed
+				return nil, ErrClosed
 			}
 			if callCtx.Err() != nil {
 				// Caller bailed (deadline) mid-dial. Don't leak the session.
 				_ = s.Close()
-				return callCtx.Err()
+				return nil, callCtx.Err()
 			}
 			// Absorb the failed session's lifetime counters into cumStats
 			// before we lose visibility of it. Hold statsMu across the
@@ -1007,21 +1040,18 @@ func (c *Client) reconnect(callCtx context.Context, failed *session.Session, ini
 			now := time.Now().Round(0)
 			c.sessionUp.Store(&now)
 			c.log.Info("reconnect successful", "attempt", attempt)
-			// Notify subscribers (e.g. pkg/netstack updating the gVisor NIC
-			// to the new tunnel IP) AFTER publishing the new session so
-			// c.PushedOptions() inside a hook sees the fresh values. The
-			// actual FireOnReconnect runs from the deferred fire above, once
-			// reconnectMu is released — see the note at the top of reconnect.
-			pr := c.PushedOptions()
-			firePR = &pr
-			return nil
+			// The caller notifies subscribers (e.g. pkg/netstack updating
+			// the gVisor NIC to the new tunnel IP) via fireHooksFor once
+			// reconnectMu is released — AFTER the new session is published
+			// so c.PushedOptions() inside a hook sees the fresh values.
+			return s, nil
 		}
 		c.log.Warn("reconnect failed", "attempt", attempt, "err", err)
 		if err := callCtx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		if maxAttempts > 0 && attempt >= maxAttempts {
-			return fmt.Errorf("%w: last error: %v", ErrReconnectGaveUp, err)
+			return nil, fmt.Errorf("%w: last error: %v", ErrReconnectGaveUp, err)
 		}
 		wait = backoffDelay(attempt, maxInterval)
 	}
@@ -1060,10 +1090,10 @@ const sessionWatchWakeGapThreshold = 10 * time.Second
 // session" early return makes the second caller a no-op.
 func (c *Client) sessionWatcher() {
 	defer c.watcherWG.Done()
-	// Top-level panic guard so a buggy OnReconnect hook (invoked
-	// transitively via c.reconnect → FireOnReconnect) or any other
-	// unexpected panic in the reconnect path is contained to the
-	// watcher rather than killing the whole process.
+	// Top-level panic guard so any unexpected panic in the reconnect
+	// path is contained to the watcher rather than killing the whole
+	// process. (OnReconnect hooks run on a helper goroutine and are
+	// individually recovered by FireOnReconnect.)
 	defer func() {
 		if r := recover(); r != nil {
 			c.log.Error("session watcher: recovered panic",
@@ -1129,7 +1159,24 @@ func (c *Client) sessionWatcher() {
 		}
 		c.log.Info("session watcher: RestartError observed; initiating reconnect",
 			"reason", re.Reason, "delay", re.Delay)
-		rcErr := c.reconnect(c.ctx, s, re.Delay)
+		installed, rcErr := c.reconnectInstall(c.ctx, s, re.Delay)
+		if installed != nil {
+			// Dispatch hooks on a helper goroutine and abandon it if the
+			// Client is closed meanwhile. A hook that calls Close() from
+			// here would otherwise deadlock: Close waits on watcherWG,
+			// which this very goroutine holds until the hook returns.
+			// fireMu still serialises the dispatch with every other one.
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				c.fireHooksFor(installed)
+			}()
+			select {
+			case <-done:
+			case <-c.ctx.Done():
+				return
+			}
+		}
 		if rcErr == nil {
 			// Reconnect installed a fresh session; loop continues to
 			// monitor the new one.
@@ -1260,7 +1307,12 @@ func (c *Client) Unrecoverable() <-chan struct{} { return c.unrecoverable }
 // PushedOptions returns the parsed PUSH_REPLY from the current session.
 // After AutoReconnect, the values reflect the latest session's reply.
 func (c *Client) PushedOptions() PushReply {
-	pr := c.session().PushReply()
+	return pushReplyFrom(c.session())
+}
+
+// pushReplyFrom projects s's parsed PUSH_REPLY onto the public type.
+func pushReplyFrom(s *session.Session) PushReply {
+	pr := s.PushReply()
 	return PushReply{
 		LocalIP:      pr.LocalIP,
 		Netmask:      pr.Netmask,
@@ -1329,6 +1381,11 @@ func (c *Client) RequestRestart(reason string) {
 // until the background sessionWatcher (when AutoReconnect is on) has
 // returned so callers see deterministic teardown rather than a stale
 // goroutine that may fire one more reconnect tick after Close completes.
+//
+// Close may be called from an OnReconnect hook. No new hook dispatch
+// starts once Close has begun, but a dispatch already in progress (e.g.
+// the one whose hook called Close) runs to completion on its own
+// goroutine and may still be executing when Close returns.
 func (c *Client) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
