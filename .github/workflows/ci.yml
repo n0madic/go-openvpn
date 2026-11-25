@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  module-tests:
+    name: Test ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - module: .
+            race: true
+          - module: cmd/openvpn2socks
+            race: false
+          - module: pkg/netstack
+            race: false
+          - module: examples/netstack-http
+            race: false
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            cmd/openvpn2socks/go.sum
+            pkg/netstack/go.sum
+            examples/netstack-http/go.sum
+
+      - name: Download dependencies
+        run: go mod download
+        working-directory: ${{ matrix.module }}
+
+      - name: Verify module checksums
+        run: go mod verify
+        working-directory: ${{ matrix.module }}
+
+      - name: Run tests with race detector
+        if: matrix.race
+        run: go test -race -count=1 -timeout 10m ./...
+        working-directory: ${{ matrix.module }}
+
+      - name: Run tests
+        if: ${{ !matrix.race }}
+        run: go test -count=1 -timeout 10m ./...
+        working-directory: ${{ matrix.module }}
+
+      - name: Run go vet
+        run: go vet ./...
+        working-directory: ${{ matrix.module }}
+
+  formatting:
+    name: Go formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+
+      - name: Check gofmt on changed Go files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        shell: bash
+        run: |
+          base="$BASE_SHA"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="$(git rev-parse HEAD^)"
+          fi
+          changed="$(git diff --name-only "$base" "$GITHUB_SHA" -- '*.go')"
+          if [ -z "$changed" ]; then
+            echo "No Go files changed."
+            exit 0
+          fi
+          failed=0
+          while IFS= read -r file; do
+            if [ -f "$file" ] && [ -n "$(gofmt -l "$file")" ]; then
+              echo "Not gofmt-formatted: $file"
+              failed=1
+            fi
+          done <<< "$changed"
+          exit "$failed"
+
+  integration:
+    name: OpenVPN server integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [module-tests, formatting]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            cmd/openvpn2socks/go.sum
+            pkg/netstack/go.sum
+
+      - name: Build and start OpenVPN test servers
+        run: make -C test/integration up
+
+      - name: Run real-server integration tests
+        run: make -C test/integration test
+
+      - name: Collect OpenVPN logs on failure
+        if: failure()
+        run: docker compose -f test/integration/compose.yaml logs --no-color
+
+      - name: Always stop and remove test servers
+        if: always()
+        run: docker compose -f test/integration/compose.yaml down --remove-orphans --volumes
