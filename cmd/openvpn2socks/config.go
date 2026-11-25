@@ -72,8 +72,9 @@ func loadFromOvpnFile(opts *cliOpts, logger *slog.Logger) (*openvpn.Config, erro
 		parsed.Config.TLSAuth = b
 		parsed.Config.TLSCryptV1 = nil
 		parsed.Config.TLSCryptV2 = nil
-		if parsed.Config.KeyDirection == 0 {
+		if !parsed.Config.KeyDirectionSet {
 			parsed.Config.KeyDirection = 1
+			parsed.Config.KeyDirectionSet = true
 		}
 	}
 	return parsed.Config, nil
@@ -150,6 +151,7 @@ func loadFromFlags(opts *cliOpts, _ *slog.Logger) (*openvpn.Config, error) {
 		cfg.TLSAuth = b
 		cfg.Auth = opts.auth
 		cfg.KeyDirection = 1 // standard client (Inverse) orientation
+		cfg.KeyDirectionSet = true
 	}
 	if opts.ciphers != "" {
 		cfg.Ciphers = strings.Split(opts.ciphers, ":")

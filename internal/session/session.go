@@ -74,14 +74,11 @@ type Config struct {
 	// which always use HMAC-SHA256.
 	Auth string
 
-	// KeyDirection selects the tls-auth key orientation. In every real-world
-	// client profile this is `key-direction 1` (Inverse), mirroring the
-	// tls-crypt client; we therefore use the Inverse orientation regardless,
-	// and this field is informational/reserved. 0 and 1 both yield the client
-	// Inverse orientation today.
-	// TODO: honour a client-side `key-direction 0` (Normal) if a profile ever
-	// needs it.
-	KeyDirection int
+	// KeyDirection selects the tls-auth key orientation when KeyDirectionSet is true.
+	// 0 = Normal and 1 = Inverse. An unset value keeps the historical client
+	// default (Inverse).
+	KeyDirection    int
+	KeyDirectionSet bool
 
 	// PeerInfoExtra carries additional peer-info fields (e.g. UV_* tokens)
 	// merged over the default IV_* set on the initial handshake.
@@ -1423,11 +1420,20 @@ func buildWrapper(cfg Config) (controlWrapper, proto.Opcode, error) {
 		if err != nil {
 			return nil, 0, fmt.Errorf("session: parse tls-auth key: %w", err)
 		}
-		// tls-auth clients use the Inverse orientation in every real-world
-		// profile (`key-direction 1`), mirroring the tls-crypt client. We do
-		// not yet distinguish a client-side `key-direction 0` (Normal); see
-		// Config.KeyDirection.
-		auth, err := tlsauth.New(rawKey, tlscrypt.DirectionInverse, cfg.Auth)
+		// OpenVPN clients default to Inverse when no direction is explicitly
+		// configured; an explicit key-direction 0 selects Normal.
+		direction := tlscrypt.DirectionInverse
+		if cfg.KeyDirectionSet {
+			switch cfg.KeyDirection {
+			case 0:
+				direction = tlscrypt.DirectionNormal
+			case 1:
+				direction = tlscrypt.DirectionInverse
+			default:
+				return nil, 0, fmt.Errorf("session: invalid tls-auth key direction %d (want 0 or 1)", cfg.KeyDirection)
+			}
+		}
+		auth, err := tlsauth.New(rawKey, direction, cfg.Auth)
 		if err != nil {
 			return nil, 0, fmt.Errorf("session: init tls-auth: %w", err)
 		}

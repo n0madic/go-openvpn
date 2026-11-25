@@ -106,7 +106,7 @@ cli, err := openvpn.Dial(ctx, p.Config)
 Supports inline blocks (`<ca>`, `<cert>`, `<key>`, `<tls-crypt>`,
 `<tls-crypt-v2>`, `<tls-auth>`) and external file references resolved relative
 to the profile's directory. `key-direction`, the `auth` digest (for tls-auth),
-and `setenv UV_* <value>` peer-info tokens are honored. Multiple `remote` lines
+and `setenv UV_* <value>` peer-info tokens are honored. For tls-auth, key-direction 0 selects Normal and 1 selects Inverse; omission keeps the historical Inverse client default. The public Config API uses KeyDirectionSet to distinguish an explicit zero from its zero-value default. Multiple `remote` lines
 are exposed via `p.Remotes` (`remote-random` is honored; pass
 `ParseOptions.PickRemote` for custom selection). Legacy directives that conflict
 with the library's policy — `comp-lzo`, `compress lz4`, `dev tap`, non-AEAD
