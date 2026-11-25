@@ -23,11 +23,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/n0madic/go-openvpn/internal/control"
+	"github.com/n0madic/go-openvpn/internal/proto"
 	"github.com/n0madic/go-openvpn/internal/session"
 	"github.com/n0madic/go-openvpn/internal/trace"
 	"github.com/n0madic/go-openvpn/internal/transport"
@@ -1310,18 +1312,25 @@ func (c *Client) PushedOptions() PushReply {
 	return pushReplyFrom(c.session())
 }
 
-// pushReplyFrom projects s's parsed PUSH_REPLY onto the public type.
+// pushReplyFrom projects the current session's parsed PUSH_REPLY onto the
+// public type.
 func pushReplyFrom(s *session.Session) PushReply {
-	pr := s.PushReply()
+	return pushReplyFromProto(s.PushReply())
+}
+
+// pushReplyFromProto returns a complete, caller-owned snapshot of PUSH_REPLY.
+// Slices are cloned so callers cannot mutate the session's retained state.
+func pushReplyFromProto(pr proto.PushReply) PushReply {
 	return PushReply{
 		LocalIP:      pr.LocalIP,
+		RemoteIP:     pr.RemoteIP,
 		Netmask:      pr.Netmask,
 		Gateway:      pr.Gateway,
 		LocalIP6:     pr.LocalIP6,
 		RemoteIP6:    pr.RemoteIP6,
-		Routes:       pr.Routes,
-		Routes6:      pr.Routes6,
-		DNS:          pr.DNS,
+		Routes:       slices.Clone(pr.Routes),
+		Routes6:      slices.Clone(pr.Routes6),
+		DNS:          slices.Clone(pr.DNS),
 		MTU:          pr.MTU,
 		Cipher:       pr.Cipher,
 		PeerID:       pr.PeerID,

@@ -18,6 +18,7 @@ import (
 // PushReply is the public-facing view of the server's PUSH_REPLY.
 type PushReply struct {
 	LocalIP      netip.Addr
+	RemoteIP     netip.Addr // from ifconfig: peer address for IPv4 point-to-point topologies
 	Netmask      netip.Addr
 	Gateway      netip.Addr
 	LocalIP6     netip.Prefix // from "ifconfig-ipv6": local address + prefix length
