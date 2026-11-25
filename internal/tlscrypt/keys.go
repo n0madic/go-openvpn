@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Package tlscrypt implements OpenVPN's tls-crypt (v1) and tls-crypt-v2
 // control-channel encryption layer. It wraps every control packet in

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Package workers provides a small lifecycle manager for the long-running
 // goroutines that pump packets between the OpenVPN protocol layers.

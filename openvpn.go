@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Package openvpn is a pure-Go OpenVPN 2.6+ client library. It is user-space
 // (no TUN), CGo-free, supports tls-crypt v1 / v2, NCP, and rekey, and exposes

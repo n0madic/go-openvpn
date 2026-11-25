@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Package netstack adapts an *openvpn.Client to the github.com/n0madic/go-tun2net
 // userspace gVisor TCP/IP stack.

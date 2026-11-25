@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Package proto contains wire-format primitives for OpenVPN 2.6+ packets.
 // All functions here are pure (no I/O, no goroutines). Crypto-related

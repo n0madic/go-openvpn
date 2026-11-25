@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Package tlsauth implements OpenVPN's tls-auth control-channel
 // authentication layer. Unlike tls-crypt (which both encrypts AND

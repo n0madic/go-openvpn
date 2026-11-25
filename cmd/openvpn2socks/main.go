@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Command openvpn2socks dials an OpenVPN server (using a .ovpn profile or
 // manual flags) and exposes the tunnel as a local SOCKS5 proxy. Any process

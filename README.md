@@ -279,23 +279,25 @@ quirks that the simulator alone could not catch:
 
 ## License
 
-Licensed under the **GNU Affero General Public License v3.0 or later**
-(AGPL-3.0-or-later) — see [`LICENSE`](LICENSE) for the full text.
+Licensed under the **Mozilla Public License 2.0** (`MPL-2.0`) — see
+[`LICENSE`](LICENSE) for the full text. This applies to all modules in this
+repository.
 
 Practical implications:
 
+- **File-level copyleft.** If you modify a file from this repository and
+  distribute the result, the modified files must be made available under
+  MPL-2.0. Code you add in your own separate files can use any license, so
+  the library can be embedded in proprietary or differently-licensed
+  projects (including other MPL-2.0, Apache-2.0, MIT, and GPL projects).
+- **No network clause.** Running the code as part of a network service does
+  not by itself require you to publish source.
+- **Patent grant.** Contributors grant a patent license for their
+  contributions (section 2.1).
 - **No warranty.** The software is provided "AS IS"; the authors are not
-  liable for any damages arising from its use (sections 15–17 of the
-  license).
-- **Copyleft including network use.** Any project that distributes a
-  modified or unmodified version of this code, or runs it as part of a
-  network-accessible service, must make the corresponding source code
-  available to its users under the same license (section 13). This
-  applies to SaaS / managed-VPN scenarios, not just to distributed
-  binaries.
-- **Source files carry an SPDX header** (`AGPL-3.0-or-later`) so license
-  scanners and downstream packagers can identify the terms without
-  reading file-by-file.
+  liable for any damages arising from its use (sections 5–6).
+- **Source files carry an SPDX header** (`MPL-2.0`) so license scanners and
+  downstream packagers can identify the terms without reading file-by-file.
 
-If your project's policy is incompatible with copyleft, this code is not
-for you — consider a permissively-licensed alternative.
+Versions of this project obtained before the switch to MPL-2.0 remain
+available under the AGPL-3.0-or-later terms they were distributed with.

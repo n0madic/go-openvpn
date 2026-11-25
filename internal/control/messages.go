@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Package control implements the OpenVPN 2.6+ client-side control-channel
 // state machine: hard reset → TLS handshake → KEY_METHOD 2 exchange →

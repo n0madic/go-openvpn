@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Command ovpn-ping connects to an OpenVPN server using a standard .ovpn
 // profile and sends one ICMP echo through the tunnel to the pushed gateway.

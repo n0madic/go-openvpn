@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Package data implements the OpenVPN 2.6+ data-channel: AEAD seal/open over
 // P_DATA_V2 framing, per-key-slot replay protection, and atomic key-slot

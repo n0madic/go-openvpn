@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Package reliable implements the OpenVPN control-channel reliability shim
 // between the raw transport (UDP/TCP after tls-crypt unwrap) and crypto/tls.

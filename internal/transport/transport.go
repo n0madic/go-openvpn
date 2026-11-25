@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Package transport provides the wire-level packet I/O abstraction used by
 // the OpenVPN client. A PacketConn delivers one OpenVPN packet per ReadPacket

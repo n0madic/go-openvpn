@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Command netstack-http dials an OpenVPN server, stands up a userspace
 // gVisor TCP/IP stack on top of the tunnel, and issues an HTTP GET through

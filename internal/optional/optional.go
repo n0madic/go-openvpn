@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Package optional provides a small generic Value[T] type for fields
 // whose zero value is indistinguishable from "not set". Inspired by

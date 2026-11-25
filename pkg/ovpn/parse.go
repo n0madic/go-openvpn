@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Package ovpn parses OpenVPN .ovpn configuration files into a ready-to-use
 // openvpn.Config for the go-openvpn client library.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 
 // Package session is the OpenVPN client session orchestrator. It owns the
 // transport, tls-crypt wrapper, per-key-id reliability layers and AEAD data
