@@ -45,6 +45,7 @@ logs:
 
 test: wait
 	cd ../.. && go test -tags=integration -count=1 -timeout=120s -v ./test/integration/...
+	cd ../../pkg/netstack && go test -count=1 -timeout=120s -v ./...
 	cd ../../cmd/openvpn2socks && go test -tags=integration -count=1 -timeout=120s -v ./...
 
 # Run all benchmarks against the live server. Skips regular tests with
@@ -54,7 +55,11 @@ bench: wait
 	cd ../.. && go test -tags=integration -bench=$(BENCH) -benchmem \
 	    -benchtime=$(BENCHTIME) -run=^$$ -timeout=600s ./test/integration/...
 
-all: up wait test down
+all:
+	@set -e; \
+	trap '$(MAKE) down' EXIT; \
+	$(MAKE) up; \
+	$(MAKE) test
 
 clean: down
 	rm -rf ./pki
