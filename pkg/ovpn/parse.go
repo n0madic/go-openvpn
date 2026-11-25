@@ -1027,20 +1027,21 @@ func (s *parseState) finalize() (*Parsed, error) {
 	}
 
 	cfg := &openvpn.Config{
-		Network:       network,
-		RemoteAddr:    picked.Addr(),
-		TLSConfig:     tlsCfg,
-		TLSCryptV1:    s.tlsCrypt,
-		TLSCryptV2:    s.tlsCV2,
-		TLSAuth:       s.tlsAuth,
-		Auth:          s.authDigest,
-		KeyDirection:  keyDir,
-		PeerInfoExtra: s.peerInfoExtra,
-		Ciphers:       ciphers,
-		Reneg:         s.reneg,
-		Username:      s.opt.Username,
-		Password:      s.opt.Password,
-		Scramble:      s.scramble,
+		Network:         network,
+		RemoteAddr:      picked.Addr(),
+		TLSConfig:       tlsCfg,
+		TLSCryptV1:      s.tlsCrypt,
+		TLSCryptV2:      s.tlsCV2,
+		TLSAuth:         s.tlsAuth,
+		Auth:            s.authDigest,
+		KeyDirection:    keyDir,
+		KeyDirectionSet: s.tlsAuthKeyDir >= 0,
+		PeerInfoExtra:   s.peerInfoExtra,
+		Ciphers:         ciphers,
+		Reneg:           s.reneg,
+		Username:        s.opt.Username,
+		Password:        s.opt.Password,
+		Scramble:        s.scramble,
 	}
 
 	return &Parsed{

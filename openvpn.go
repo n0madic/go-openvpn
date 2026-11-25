@@ -216,12 +216,13 @@ type Config struct {
 	// tls-crypt v1/v2 (which always use HMAC-SHA256).
 	Auth string
 
-	// KeyDirection mirrors OpenVPN's `key-direction` for tls-auth. The .ovpn
-	// parser fills it from the directive (absent ⇒ 1). The standard client
-	// profile uses `key-direction 1` (Inverse), which is the orientation the
-	// library uses; 0 and 1 are currently treated identically. Only meaningful
-	// alongside TLSAuth.
+	// KeyDirection selects the tls-auth key orientation when KeyDirectionSet is true.
+	// 0 = Normal and 1 = Inverse. When unset, the standard client orientation
+	// (Inverse) is used for backward compatibility. Only meaningful with TLSAuth.
 	KeyDirection int
+	// KeyDirectionSet distinguishes an explicit key-direction 0 from the zero
+	// value of Config, which keeps the historical Inverse client orientation.
+	KeyDirectionSet bool
 
 	// PeerInfoExtra carries additional peer-info fields merged over the default
 	// IV_* set (e.g. a provider's `setenv UV_LOCAL_ID_0 <token>`). Applied on
@@ -728,6 +729,7 @@ func sessionCfg(cfg *Config) session.Config {
 		TLSAuth:          cfg.TLSAuth,
 		Auth:             cfg.Auth,
 		KeyDirection:     cfg.KeyDirection,
+		KeyDirectionSet:  cfg.KeyDirectionSet,
 		PeerInfoExtra:    cfg.PeerInfoExtra,
 		Ciphers:          cfg.Ciphers,
 		HandshakeTimeout: cfg.HandshakeTimeout,

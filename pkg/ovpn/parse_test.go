@@ -723,6 +723,9 @@ func TestParseKeyDirectionValues(t *testing.T) {
 		if p.Config.KeyDirection != kd {
 			t.Errorf("KeyDirection=%d, want %d", p.Config.KeyDirection, kd)
 		}
+		if !p.Config.KeyDirectionSet {
+			t.Errorf("KeyDirectionSet=false for explicit key-direction %d", kd)
+		}
 	}
 	// Absent key-direction in a tls-auth profile defaults to 1.
 	p, err := Parse(strings.NewReader(tlsAuthConfigSrc("auth SHA256")), nil)
@@ -731,6 +734,9 @@ func TestParseKeyDirectionValues(t *testing.T) {
 	}
 	if p.Config.KeyDirection != 1 {
 		t.Errorf("default KeyDirection=%d, want 1", p.Config.KeyDirection)
+	}
+	if p.Config.KeyDirectionSet {
+		t.Error("KeyDirectionSet=true when key-direction is absent")
 	}
 	if p.Config.Auth != "SHA256" {
 		t.Errorf("Auth=%q, want SHA256", p.Config.Auth)
