@@ -671,6 +671,55 @@ func TestParseScrambleErrors(t *testing.T) {
 	}
 }
 
+func TestInlineOnlyRejectsExternalFileReferences(t *testing.T) {
+	fileDirectives := []string{
+		"auth-user-pass",
+		"ca",
+		"cert",
+		"key",
+		"tls-auth",
+		"tls-crypt",
+	}
+	paths := []string{
+		"../../outside.key",
+		"C:\\Windows\\win.ini",
+		"\\\\server\\share\\secret.key",
+	}
+
+	for _, directive := range fileDirectives {
+		for _, path := range paths {
+			t.Run(directive+"/"+path, func(t *testing.T) {
+				_, err := Parse(
+					strings.NewReader(tlsAuthConfigSrc(directive+" "+path)),
+					&ParseOptions{InlineOnly: true, BaseDir: t.TempDir()},
+				)
+				if err == nil {
+					t.Fatalf("Parse accepted external %s reference %q in inline-only mode", directive, path)
+				}
+				if !strings.Contains(err.Error(), "inline-only mode") {
+					t.Fatalf("error = %q, want inline-only mode rejection", err)
+				}
+			})
+		}
+	}
+}
+
+func TestInlineOnlyAllowsInlineBlocksAndCallerCredentials(t *testing.T) {
+	p, err := Parse(
+		strings.NewReader(tlsAuthConfigSrc("auth-user-pass")),
+		&ParseOptions{InlineOnly: true, Username: "profile-user", Password: "profile-password"},
+	)
+	if err != nil {
+		t.Fatalf("Parse inline-only profile: %v", err)
+	}
+	if p.Config.Username != "profile-user" || p.Config.Password != "profile-password" {
+		t.Fatalf("credentials = %q/%q, want caller-supplied credentials", p.Config.Username, p.Config.Password)
+	}
+	if !p.AuthUserPass {
+		t.Fatal("AuthUserPass=false, want true")
+	}
+}
+
 func TestParseScrambleAbsent(t *testing.T) {
 	t.Parallel()
 	// scrambleConfigSrc with an empty extra line — no scramble directive.

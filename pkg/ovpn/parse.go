@@ -103,6 +103,12 @@ type ParseOptions struct {
 	// containing the source file when ParseFile is used; "." otherwise.
 	BaseDir string
 
+	// InlineOnly rejects all external file references (ca, cert, key, tls-auth,
+	// tls-crypt, and auth-user-pass file arguments). Inline PEM/key blocks and
+	// caller-supplied credentials remain supported. Use this for untrusted
+	// profiles that must not be able to read files from the host.
+	InlineOnly bool
+
 	// Username / Password populate Config.Username/Password when the file
 	// declares `auth-user-pass`. Optional — caller can also set them on
 	// the returned Config after parsing.
@@ -697,7 +703,10 @@ func (s *parseState) setVerifyName(args []string) error {
 
 // readAuthFile reads a 2-line username/password file.
 func (s *parseState) readAuthFile(rel string) error {
-	path := s.resolvePath(rel)
+	path, err := s.resolvePath(rel)
+	if err != nil {
+		return fmt.Errorf("auth-user-pass: %w", err)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("auth-user-pass: %w", err)
@@ -731,7 +740,11 @@ func (s *parseState) loadCAFile(args []string) error {
 	if len(args) != 1 {
 		return errors.New("ca: expected one argument (file path)")
 	}
-	b, err := os.ReadFile(s.resolvePath(args[0]))
+	path, err := s.resolvePath(args[0])
+	if err != nil {
+		return fmt.Errorf("ca: %w", err)
+	}
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("ca: %w", err)
 	}
@@ -743,7 +756,11 @@ func (s *parseState) loadCertFile(args []string) error {
 	if len(args) != 1 {
 		return errors.New("cert: expected one argument (file path)")
 	}
-	b, err := os.ReadFile(s.resolvePath(args[0]))
+	path, err := s.resolvePath(args[0])
+	if err != nil {
+		return fmt.Errorf("cert: %w", err)
+	}
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("cert: %w", err)
 	}
@@ -755,7 +772,11 @@ func (s *parseState) loadKeyFile(args []string) error {
 	if len(args) != 1 {
 		return errors.New("key: expected one argument (file path)")
 	}
-	b, err := os.ReadFile(s.resolvePath(args[0]))
+	path, err := s.resolvePath(args[0])
+	if err != nil {
+		return fmt.Errorf("key: %w", err)
+	}
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("key: %w", err)
 	}
@@ -767,7 +788,11 @@ func (s *parseState) loadTLSCryptFile(args []string, v2 bool) error {
 	if len(args) < 1 {
 		return errors.New("tls-crypt: expected one argument (file path)")
 	}
-	b, err := os.ReadFile(s.resolvePath(args[0]))
+	path, err := s.resolvePath(args[0])
+	if err != nil {
+		return fmt.Errorf("tls-crypt: %w", err)
+	}
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("tls-crypt: %w", err)
 	}
@@ -789,7 +814,11 @@ func (s *parseState) loadTLSAuthFile(args []string) error {
 	if len(args) < 1 {
 		return errors.New("tls-auth: expected a file path (and optional key-direction)")
 	}
-	b, err := os.ReadFile(s.resolvePath(args[0]))
+	path, err := s.resolvePath(args[0])
+	if err != nil {
+		return fmt.Errorf("tls-auth: %w", err)
+	}
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("tls-auth: %w", err)
 	}
@@ -862,11 +891,14 @@ func (s *parseState) setScramble(args []string) error {
 	return nil
 }
 
-func (s *parseState) resolvePath(p string) string {
-	if filepath.IsAbs(p) {
-		return p
+func (s *parseState) resolvePath(p string) (string, error) {
+	if s.opt.InlineOnly {
+		return "", errors.New("external file references are disabled in inline-only mode")
 	}
-	return filepath.Join(s.opt.BaseDir, p)
+	if filepath.IsAbs(p) {
+		return p, nil
+	}
+	return filepath.Join(s.opt.BaseDir, p), nil
 }
 
 // finalize turns the accumulated state into an openvpn.Config + metadata.

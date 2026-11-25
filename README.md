@@ -105,7 +105,7 @@ cli, err := openvpn.Dial(ctx, p.Config)
 
 Supports inline blocks (`<ca>`, `<cert>`, `<key>`, `<tls-crypt>`,
 `<tls-crypt-v2>`, `<tls-auth>`) and external file references resolved relative
-to the profile's directory. `key-direction`, the `auth` digest (for tls-auth),
+to the profile's directory. For untrusted profiles, set ParseOptions.InlineOnly to reject every external file reference; inline blocks and caller-supplied credentials remain supported. `key-direction`, the `auth` digest (for tls-auth),
 and `setenv UV_* <value>` peer-info tokens are honored. Multiple `remote` lines
 are exposed via `p.Remotes` (`remote-random` is honored; pass
 `ParseOptions.PickRemote` for custom selection). Legacy directives that conflict
