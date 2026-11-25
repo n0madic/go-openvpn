@@ -671,6 +671,70 @@ func TestParseScrambleErrors(t *testing.T) {
 	}
 }
 
+func TestStrictDirectivesRejectUnsupportedAndUnknown(t *testing.T) {
+	cases := []struct {
+		name      string
+		directive string
+		want      string
+	}{
+		{name: "unknown option", directive: "vendor-private-option yes", want: "unknown directive"},
+		{name: "local route", directive: "route 10.20.0.0 255.255.0.0", want: "not supported in strict mode"},
+		{name: "redirect gateway", directive: "redirect-gateway def1", want: "not supported in strict mode"},
+		{name: "TLS cipher restriction", directive: "tls-cipher AES256-SHA", want: "not supported in strict mode"},
+		{name: "local socket binding", directive: "local 192.0.2.10", want: "not supported in strict mode"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(strings.NewReader(tlsAuthConfigSrc(tc.directive)), &ParseOptions{StrictDirectives: true})
+			if err == nil {
+				t.Fatalf("Parse accepted unsupported directive %q", tc.directive)
+			}
+			if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "line ") {
+				t.Fatalf("error = %q, want line number and %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestStrictDirectivesAllowExplicitSafeNoOps(t *testing.T) {
+	for _, directive := range []string{
+		"client",
+		"tls-client",
+		"pull",
+		"persist-key",
+		"persist-tun",
+		"script-security 2",
+		"mute 5",
+		"mute-replay-warnings",
+		"verb 3",
+		"auth-nocache",
+		"nobind",
+		"explicit-exit-notify",
+		"auth-retry nointeract",
+		"setenv UV_TEST supported",
+	} {
+		t.Run(strings.ReplaceAll(directive, " ", "_"), func(t *testing.T) {
+			if _, err := Parse(strings.NewReader(tlsAuthConfigSrc(directive)), &ParseOptions{StrictDirectives: true}); err != nil {
+				t.Fatalf("Parse rejected explicitly safe directive %q: %v", directive, err)
+			}
+		})
+	}
+}
+
+func TestStrictDirectivesRejectUnknownInlineBlocks(t *testing.T) {
+	src := strings.Replace(tlsAuthConfigSrc(""), "<tls-auth>", "<custom-option>\nvalue\n</custom-option>\n<tls-auth>", 1)
+	if _, err := Parse(strings.NewReader(src), &ParseOptions{StrictDirectives: true}); err == nil || !strings.Contains(err.Error(), "unsupported inline block") {
+		t.Fatalf("Parse error = %v, want unsupported inline block", err)
+	}
+}
+
+func TestStrictDirectivesRejectConnectionBlocks(t *testing.T) {
+	src := strings.Replace(tlsAuthConfigSrc(""), "<tls-auth>", "<connection>\nremote alt.example 1194\n</connection>\n<tls-auth>", 1)
+	if _, err := Parse(strings.NewReader(src), &ParseOptions{StrictDirectives: true}); err == nil || !strings.Contains(err.Error(), "inline connection") {
+		t.Fatalf("Parse error = %v, want inline connection rejection", err)
+	}
+}
+
 func TestParseScrambleAbsent(t *testing.T) {
 	t.Parallel()
 	// scrambleConfigSrc with an empty extra line — no scramble directive.

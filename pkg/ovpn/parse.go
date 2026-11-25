@@ -103,6 +103,12 @@ type ParseOptions struct {
 	// containing the source file when ParseFile is used; "." otherwise.
 	BaseDir string
 
+	// StrictDirectives rejects unknown directives, unsupported options that
+	// would otherwise be ignored, and unknown inline blocks. Explicitly safe
+	// client-side no-ops remain accepted. The default is permissive for
+	// compatibility with provider-generated profiles.
+	StrictDirectives bool
+
 	// Username / Password populate Config.Username/Password when the file
 	// declares `auth-user-pass`. Optional — caller can also set them on
 	// the returned Config after parsing.
@@ -418,6 +424,16 @@ func (s *parseState) warn(line int, directive, reason string) {
 	}
 }
 
+// ignoreDirective records a permissive-mode warning or rejects an option that
+// the userspace client cannot implement when strict parsing is enabled.
+func (s *parseState) ignoreDirective(name string, line int, reason string) error {
+	if s.opt.StrictDirectives {
+		return fmt.Errorf("line %d: directive %q is not supported in strict mode: %s", line, name, reason)
+	}
+	s.warn(line, name, reason)
+	return nil
+}
+
 // handleInline processes a `<name>...</name>` block.
 func (s *parseState) handleInline(name string, content []byte, line int) error {
 	switch name {
@@ -436,10 +452,16 @@ func (s *parseState) handleInline(name string, content []byte, line int) error {
 	case "secret":
 		return errors.New("static-key mode is not supported (TLS+NCP only)")
 	case "connection":
-		// `<connection>` blocks describe alternative endpoints; we treat
-		// them as inert and rely on `remote` directives in the outer scope.
-		s.warn(line, name, "ignored inline <connection> block")
+		// Connection blocks describe alternative endpoints; we currently rely
+		// on remote directives in the outer scope.
+		if s.opt.StrictDirectives {
+			return fmt.Errorf("line %d: inline connection blocks are not supported in strict mode", line)
+		}
+		s.warn(line, name, "ignored inline connection block")
 	default:
+		if s.opt.StrictDirectives {
+			return fmt.Errorf("line %d: unsupported inline block <%s>", line, name)
+		}
 		s.warn(line, name, "ignored unknown inline block")
 	}
 	return nil
@@ -455,8 +477,10 @@ func (s *parseState) handleDirective(name string, args []string, line int) error
 		return s.addRemote(args)
 	case "remote-random":
 		s.remoteRand = true
-	case "rport", "lport", "local", "nobind":
-		// rport/lport could matter for future use; nobind is a no-op for us.
+	case "rport", "lport", "local":
+		return s.ignoreDirective(name, line, "local/remote socket binding options are not implemented")
+	case "nobind":
+		// The client always uses an ephemeral local port.
 
 	// ---- ciphers / negotiation ----
 	case "cipher":
@@ -475,13 +499,12 @@ func (s *parseState) handleDirective(name string, args []string, line int) error
 			}
 		}
 	case "auth":
-		// The data channel uses AEAD (its own MAC) and tls-crypt fixes
-		// HMAC-SHA256, so `auth` only matters for the tls-auth control
-		// channel: record it as the tls-auth digest. An empty/none value
-		// leaves the tls-auth default (SHA1).
-		if len(args) == 1 {
-			s.authDigest = strings.ToUpper(args[0])
+		// The data channel uses AEAD and tls-crypt fixes its own HMAC.
+		// The auth directive only selects the tls-auth control-channel digest.
+		if len(args) != 1 {
+			return s.ignoreDirective(name, line, "expected one tls-auth digest")
 		}
+		s.authDigest = strings.ToUpper(args[0])
 
 	// ---- TLS / cert ----
 	case "ca":
@@ -503,21 +526,22 @@ func (s *parseState) handleDirective(name string, args []string, line int) error
 	case "verify-x509-name":
 		return s.setVerifyName(args)
 	case "remote-cert-tls":
-		// Equivalent to `--remote-cert-eku "TLS Web Server Authentication"`;
-		// Go's TLS verification already requires server EKU on the server
-		// cert when ServerName is set. Treat as enforced default.
+		if len(args) != 1 || args[0] != "server" {
+			return s.ignoreDirective(name, line, "only remote-cert-tls server is supported")
+		}
+		// Go's TLS verification already requires server EKU when ServerName is set.
 
 	// ---- timing / rekey ----
-	case "reneg-sec", "reneg-bytes", "reneg-pkts":
-		if name == "reneg-sec" {
-			return s.setRenegSec(args)
-		}
-		s.warn(line, name, "ignored (use --reneg-sec)")
+	case "reneg-sec":
+		return s.setRenegSec(args)
+	case "reneg-bytes", "reneg-pkts":
+		return s.ignoreDirective(name, line, "only time-based renegotiation is supported")
+
 	case "keepalive", "ping", "ping-restart", "ping-exit", "hand-window",
-		"tran-window", "explicit-exit-notify":
-		// All accepted silently — explicit-exit-notify is always on; the
-		// rest are handshake-only/keep-alive overrides that the server's
-		// PUSH_REPLY ultimately drives.
+		"tran-window":
+		return s.ignoreDirective(name, line, "keepalive and handshake timing are negotiated by the server")
+	case "explicit-exit-notify":
+		// The client always sends the supported exit notification.
 
 	// ---- non-standard obfuscation (OpenVPN forks: Tunnelblick, OPNsense, ...) ----
 	case "scramble":
@@ -529,6 +553,9 @@ func (s *parseState) handleDirective(name string, args []string, line int) error
 
 	// ---- peer-info passthrough (UV_* tokens) ----
 	case "setenv":
+		if len(args) < 2 || !strings.HasPrefix(args[0], "UV_") {
+			return s.ignoreDirective(name, line, "only UV_* peer-info variables are supported")
+		}
 		s.addSetenv(args)
 
 	// ---- auth ----
@@ -542,8 +569,10 @@ func (s *parseState) handleDirective(name string, args []string, line int) error
 			return errors.New("auth-user-pass: expected 0 or 1 argument")
 		}
 	case "auth-retry":
-		// Modes nointeract|interact|none — not relevant to a non-interactive
-		// library. Accept silently.
+		if len(args) == 1 && (args[0] == "nointeract" || args[0] == "none") {
+			return nil
+		}
+		return s.ignoreDirective(name, line, "interactive authentication retry is not supported")
 
 	// ---- compression (rejected, modern policy) ----
 	case "comp-lzo":
@@ -561,22 +590,38 @@ func (s *parseState) handleDirective(name string, args []string, line int) error
 
 	// ---- topology hints ----
 	case "dev":
-		if len(args) == 1 && strings.HasPrefix(args[0], "tap") {
+		if len(args) != 1 {
+			return s.ignoreDirective(name, line, "expected one TUN device name")
+		}
+		if strings.HasPrefix(args[0], "tap") {
 			return errors.New("dev tap is not supported (tun mode only)")
 		}
-		// dev tun / dev tunN → accepted
+		if !strings.HasPrefix(args[0], "tun") {
+			return s.ignoreDirective(name, line, "only TUN devices are supported")
+		}
 	case "dev-type":
-		if len(args) == 1 && args[0] == "tap" {
+		if len(args) != 1 {
+			return s.ignoreDirective(name, line, "expected tun")
+		}
+		if args[0] == "tap" {
 			return errors.New("dev-type tap is not supported (tun mode only)")
 		}
-	case "topology":
-		// Accepted silently — server's PUSH_REPLY topology is authoritative.
+		if args[0] != "tun" {
+			return s.ignoreDirective(name, line, "only TUN device type is supported")
+		}
 
-	// ---- noise (silently ignored) ----
-	case "client", "tls-client", "pull", "nopull",
-		"persist-key", "persist-tun", "resolv-retry",
-		"script-security", "mute", "mute-replay-warnings",
-		"verb", "auth-nocache",
+	case "topology":
+		return s.ignoreDirective(name, line, "the server PUSH_REPLY determines tunnel topology")
+
+	// ---- explicitly safe client-side no-ops ----
+	case "client", "tls-client", "pull",
+		"persist-key", "persist-tun", "script-security",
+		"mute", "mute-replay-warnings", "verb", "auth-nocache":
+		// The userspace client is always a client, never executes profile
+		// scripts, and does not use OpenVPN command-line logging controls.
+
+	// ---- unsupported options that remain permissive-only ----
+	case "nopull", "resolv-retry",
 		"tun-mtu", "tun-mtu-extra", "link-mtu", "fragment", "mssfix",
 		"route", "route-gateway", "route-metric", "route-delay",
 		"route-noexec", "redirect-gateway", "redirect-private",
@@ -584,10 +629,12 @@ func (s *parseState) handleDirective(name string, args []string, line int) error
 		"sndbuf", "rcvbuf", "fast-io",
 		"connect-retry", "connect-retry-max", "connect-timeout",
 		"replay-window", "key-method", "tls-cipher", "tls-ciphersuites":
-		// no-op — these are either client convenience flags, kernel-tun
-		// concerns, or duplicates of options the server pushes anyway.
+		return s.ignoreDirective(name, line, "option is not implemented by the userspace client")
 
 	default:
+		if s.opt.StrictDirectives {
+			return fmt.Errorf("line %d: unknown directive %q", line, name)
+		}
 		s.warn(line, name, "ignored unknown directive")
 	}
 	return nil
