@@ -301,3 +301,8 @@ Practical implications:
 
 Versions of this project obtained before the switch to MPL-2.0 remain
 available under the AGPL-3.0-or-later terms they were distributed with.
+
+
+## Strict profile parsing
+
+The parser remains permissive by default for compatibility with provider-generated profiles. Applications that need deterministic validation can set ParseOptions.StrictDirectives. Strict mode rejects unknown directives, unsupported options that would otherwise be ignored (including local route, redirect, socket-binding, and TLS-cipher restrictions), and unknown inline blocks. Explicitly classified client-side no-ops remain accepted. Unsupported options are reported with their source line so callers can show actionable validation errors.
